@@ -237,6 +237,22 @@ def audio_playing(peak, smtc_playing=False, *, threshold: float = 0.01) -> bool:
         return False
 
 
+def keeps_followup_extension(playing: bool, voice: str) -> bool:
+    """Whether a turn admitted by the wake-word follow-up window may EXTEND
+    it (core/followup_window.py KNOWN RISK). False while the PC plays audio
+    and the voice was not confirmed as the owner's: UNSURE (live 2026-10-28
+    17:28, a "Yeah." and a video's narration over the YouTube video he had
+    just started, 0.64 and 0.68, held the window open) or NOT_OWNER (a
+    dropped turn). The owner's matched voice, voice-ID unavailable, and no
+    PC audio keep today's behaviour. Never raises."""
+    try:
+        if not playing:
+            return True
+        return voice not in (_lg.UNSURE, _lg.NOT_OWNER)
+    except Exception:
+        return True
+
+
 def decide(playing: bool, voice: str) -> "tuple[bool, str]":
     """(drop, log line) for one mic turn. Drops only a NOT_OWNER voice while the
     PC plays audio; every other case runs, with a line saying why when audio was

@@ -719,6 +719,31 @@ def _tonight_line() -> str:
     return f"Tonight, sir: {', '.join(bits)}."
 
 
+_SIR_WORD_RE = re.compile(r"\bsir\b", re.IGNORECASE)
+_LEAD_SIR_RE = re.compile(r"^\s*sir,\s*", re.IGNORECASE)
+_INNER_SIR_RE = re.compile(r",\s*sir(?=\s*[—\-–.,:;!?])", re.IGNORECASE)
+
+
+def _drop_repeat_sir(earlier: str, later: str) -> str:
+    """The second sentence of a joined answer, minus its own "sir" when the
+    first sentence already said it.
+
+    Live 2026-10-28 17:53: "Currently 78 degrees and clear, sir. Sir, the
+    temperature drops about 10 degrees by 7 PM — you may want a jacket." The
+    alert strings keep their "Sir, ..." because the proactive alert speaks
+    them ALONE; only the join drops the repeat. Pure; never raises."""
+    try:
+        if not later or not _SIR_WORD_RE.search(earlier or ""):
+            return later
+        m = _LEAD_SIR_RE.match(later)
+        if m:
+            rest = later[m.end():]
+            return (rest[:1].upper() + rest[1:]) if rest else later
+        return _INNER_SIR_RE.sub("", later, count=1)
+    except Exception:
+        return later
+
+
 def _current_briefing() -> str:
     """What 'what's the weather' has always answered: the ACTUAL current
     conditions (temp + sky), then any notable upcoming change. Before
@@ -726,6 +751,7 @@ def _current_briefing() -> str:
     never the real temp."""
     current = _current_conditions_line()
     alert = get_umbrella_alert("today") or get_two_hour_alert()
+    alert = _drop_repeat_sir(current, alert)
     parts = [p for p in (current, alert) if p]
     if parts:
         return " ".join(parts)

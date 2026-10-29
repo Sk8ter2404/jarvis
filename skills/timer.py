@@ -587,9 +587,122 @@ def _untimed_task(args: str) -> str:
     return ""
 
 
+# Words a timer label may carry that say nothing about WHAT it is for, so they
+# never count as "he said this" evidence (nor against it).
+_LABEL_FILLER = frozenset("""
+a an the and or but for to of in on at by my me your you his her it its this
+that these those is are was be been am do does did go get got with from up out
+off into now then just please sir jarvis timer reminder remind alarm set some
+minute minutes min mins hour hours second seconds secs day days
+""".split())
+
+
+def _label_content_words(text: str) -> list:
+    return [w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(w) >= 3 and w not in _LABEL_FILLER]
+
+
+def _word_said(word: str, said: set) -> bool:
+    """``word`` is in ``said`` outright, or one is the other plus an ending of
+    up to 3 letters with a 4+ letter stem ("stretch" / "stretching", "pasta" /
+    "pastas"; "bake" / "baking" does not) - a light match so his own wording,
+    re-inflected, still counts."""
+    if word in said:
+        return True
+    for s in said:
+        n = min(len(word), len(s))
+        if n >= 4 and word[:n] == s[:n] and abs(len(word) - len(s)) <= 3:
+            return True
+    return False
+
+
+def grounded_label(label: str, utterance: str) -> str:
+    """``label`` when he could have given it, else "".
+
+    Live 2026-10-28 17:53: "set a timer for three minutes" became
+    ``set_timer 3 minutes | check the oven`` - the model copied the only
+    example in the prompt, and three minutes later JARVIS would have said
+    "Reminder, sir - check the oven" for a timer he never labelled. A label
+    is kept when ANY of its content words is in what he said this turn
+    (stem match), or when there is no turn to judge by (``utterance`` empty:
+    a scheduled / restored / proactive call keeps today's behaviour), or when
+    the label has no content words at all. Pure; never raises."""
+    try:
+        lab = (label or "").strip()
+        said_text = (utterance or "").strip()
+        if not lab or not said_text:
+            return lab
+        words = _label_content_words(lab)
+        if not words:
+            return lab
+        said = set(re.findall(r"[a-z0-9]+", said_text.lower()))
+        if any(_word_said(w, said) for w in words):
+            return lab
+        return ""
+    except Exception:
+        return label or ""
+
+
+def _label_grounding_on() -> bool:
+    """TIMER_LABEL_GROUNDING (core/config.py), read per call. Never raises."""
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, "TIMER_LABEL_GROUNDING", True))
+    except Exception:
+        return True
+
+
+def _owner_utterance() -> str:
+    """What he said this turn, plus JARVIS's own last reply when there is a
+    turn in progress - so an accepted offer ("Shall I set a ten-minute timer
+    to check the bread?" / "yes") keeps the label the offer named. "" outside
+    an owner turn. Never raises."""
+    try:
+        from core.owner_turn import current_owner_utterance
+        said = current_owner_utterance()
+    except Exception:
+        return ""
+    if not said:
+        return ""
+    try:
+        hist = getattr(sys.modules.get("bobert_companion"),
+                       "conversation_history", None)
+        if isinstance(hist, list):
+            # The assistant line BEFORE the latest user entry is the offer he
+            # answered. The line AFTER it is the reply being executed right
+            # now (_call_llm appends it before the action runs) and carries
+            # the brain's own "[ACTION: set_timer, 3 minutes | check the
+            # oven]", so it can never vouch for its own label (live
+            # 2026-10-28 17:53; review).
+            from core import onscreen_refs as _or
+            upto = _or.history_through_latest_user(hist)
+            if (upto and isinstance(upto[-1], dict)
+                    and upto[-1].get("role") == "user"):
+                for turn in reversed(upto[:-1]):
+                    if not isinstance(turn, dict):
+                        continue
+                    if turn.get("role") == "user":
+                        break  # no assistant line between two user lines
+                    if (turn.get("role") == "assistant"
+                            and isinstance(turn.get("content"), str)):
+                        offer = _or.strip_reply_tokens(turn["content"])
+                        if offer:
+                            return said + " " + offer
+                        break
+    except Exception:
+        pass
+    return said
+
+
 def register(actions):
     def set_timer(args: str) -> str:
         secs, msg = _split_timer_args(args)
+        if secs is not None and secs > 0 and msg.strip() and _label_grounding_on():
+            kept = grounded_label(msg, _owner_utterance())
+            if not kept:
+                print(f"  [timer] label {msg.strip()!r} dropped: not in "
+                      "what he said this turn")
+            msg = kept
         if secs is None or secs <= 0:
             task = _untimed_task(args)
             add = actions.get("add_reminder")

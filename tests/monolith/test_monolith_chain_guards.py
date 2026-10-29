@@ -295,6 +295,119 @@ class CloseOutTests(_ChainBase):
         self.assertEqual(self.spoken[-1],
                          "Qwen3 at four-bit looks like your best fit, sir.")
 
+    # v3.0.6 (CHAIN_PROMISE_CHECK): the "ended on a promise" label is true.
+    def _cut_of(self, first, followups):
+        """Dispatch and return (printed, the chain cut note_chain recorded)."""
+        trace = self._p(self.bc, "_turn_trace_call")
+        printed = self._dispatch(first, followups)
+        cuts = [c.args[3] for c in trace.call_args_list
+                if c.args and c.args[0] == "note_chain"]
+        self.assertEqual(len(cuts), 1)
+        return printed, cuts[0]
+
+    def test_an_answer_ending_is_not_labelled_a_promise(self):
+        # Live 10-27 20:40:51 / 10-28 17:27:40: a plain spoken answer after a
+        # screen read was filed as "ended on a promise" (the label asked only
+        # "did the last round run no action?").
+        printed, cut = self._cut_of(_R_205910, [
+            "Qwen3 at four-bit looks like your best fit, sir.",
+        ])
+        self.assertNotIn("[close-out]", printed)
+        self.assertNotEqual(cut, "ended on a promise")
+        self.assertEqual(cut, "")
+
+    def test_a_promise_after_substance_gets_a_close_out(self):
+        # The first reply said something real, the follow-up only promised -
+        # and nothing followed. Before, the earlier substance excused it.
+        first = (f"The search is open, sir. [ACTION: web_search, {_QUERY}]")
+        self.assertTrue(self.bc._says_something("The search is open, sir."))
+        printed, cut = self._cut_of(first, [
+            "[intent:briefing] One moment, sir. I'll have those results "
+            "shortly.",
+        ])
+        self.assertEqual(cut, "ended on a promise")
+        self.assertIn("[close-out]", printed)
+        self.assertTrue(self.spoken[-1].startswith("I'm afraid"))
+        with mock.patch.object(self.bc, "CHAIN_PROMISE_CHECK", False,
+                               create=True):
+            self.spoken.clear()
+            printed = self._dispatch(first, [
+                "[intent:briefing] One moment, sir. I'll have those results "
+                "shortly.",
+            ])
+        self.assertNotIn("[close-out]", printed, "off = the old rule")
+
+    # Live 2026-10-28 review: a courtesy after a chain that ANSWERED was filed
+    # as "ended on a promise" (is_progress_only is True for "Very good, sir.")
+    # and drew "I'm afraid I couldn't get a proper answer out of that".
+    _ANSWERED = ("The top result recommends Qwen3 at four-bit for your card, "
+                 "sir. [ACTION: open_url, huggingface.co/Qwen]")
+
+    def test_a_courtesy_after_a_real_answer_gets_no_close_out(self):
+        first = f"[ACTION: web_search, {_QUERY}]"
+        for last in ("Very good, sir.", "Indeed, sir.", "Enjoy, sir.",
+                     "Understood, sir.", "I'll leave it open for you, sir.",
+                     "I'll keep an eye out for newer benchmarks, sir.",
+                     "I'll remind you in five minutes, sir."):
+            with self.subTest(last=last):
+                self.spoken.clear()
+                printed = self._dispatch(first, [self._ANSWERED, last])
+                self.assertNotIn("[close-out]", printed)
+                self.assertEqual(self.spoken[0], "The top result recommends "
+                                 "Qwen3 at four-bit for your card, sir.")
+                self.assertNotIn("I'm afraid", " ".join(self.spoken))
+
+    def test_a_real_promise_after_an_answer_still_gets_a_close_out(self):
+        first = f"[ACTION: web_search, {_QUERY}]"
+        printed = self._dispatch(first, [
+            self._ANSWERED, "One moment, sir. I'll have those results "
+            "shortly."])
+        self.assertIn("[close-out]", printed)
+        self.assertTrue(self.spoken[-1].startswith("I'm afraid"))
+
+    def test_a_courtesy_after_nothing_real_keeps_the_old_close_out(self):
+        # Nothing of substance was said all turn: the courtesy is not an
+        # answer, so the honest line still speaks (the pre-v3.0.6 rule).
+        printed, cut = self._cut_of(f"On it, sir. [ACTION: web_search, "
+                                    f"{_QUERY}]", ["Very good, sir."])
+        self.assertEqual(cut, "ended on a courtesy")
+        self.assertIn("[close-out]", printed)
+        with mock.patch.object(self.bc, "CHAIN_PROMISE_CHECK", False,
+                               create=True):
+            self.spoken.clear()
+            printed = self._dispatch(f"[ACTION: web_search, {_QUERY}]",
+                                     [self._ANSWERED, "Very good, sir."])
+        self.assertNotIn("[close-out]", printed, "off = the old rule: "
+                         "earlier substance excuses it")
+
+    def test_ended_on_promise_needs_a_result_owed(self):
+        yes = ("[intent:briefing] One moment, sir. I'll have those results "
+               "shortly.",
+               "I'm running the numbers now, sir; I'll have those results "
+               "for you in a moment.",
+               "Let me take a look, sir.")
+        no = ("Very good, sir.", "Indeed, sir.", "Of course, sir.", "",
+              "Understood, sir.", "Enjoy, sir.", "Will do, sir.",
+              "I'll leave it open for you, sir.",
+              "I'll remind you in five minutes, sir.",
+              "Qwen3 at four-bit looks like your best fit, sir.",
+              "I've opened the results; shall I read them to you?")
+        for t in yes:
+            with self.subTest(yes=t):
+                self.assertTrue(self.bc._chain_ended_on_promise(t))
+        for t in no:
+            with self.subTest(no=t):
+                self.assertFalse(self.bc._chain_ended_on_promise(t))
+
+    def test_an_offer_after_an_action_is_not_a_promise(self):
+        # Live 10-28 15:57:59: "... I've opened the search results ... shall
+        # I read them to you?" - an offer is substance, not a dropped promise.
+        printed, cut = self._cut_of(_R_205910, [
+            "I've opened the results; shall I read them to you?",
+        ])
+        self.assertNotIn("[close-out]", printed)
+        self.assertEqual(cut, "")
+
     def test_a_follow_up_whose_action_succeeds_gets_no_close_out(self):
         # "Opening the top result" + an open_url that ran is not a promise
         # left hanging: the action did what the line said.

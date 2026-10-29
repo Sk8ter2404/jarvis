@@ -725,6 +725,104 @@ class TimerListRequestTests(unittest.TestCase):
         # The answer is the live timer store's; match() is pure.
         self.assertIsNone(fp.match("what timers do I have"))
 
+    def test_live_20261028_timer_questions(self):
+        # Live 17:55:44 / 18:03:33: both went through the model.
+        for q in ("How long is left on that timer?",
+                  "Do I have any timers or reminders running?",
+                  "any reminders or timers", "what timers and reminders do I have",
+                  "how much time is left on this timer",
+                  "when does that timer go off"):
+            with self.subTest(q=q):
+                self.assertTrue(fp.is_timer_list_request(q))
+        for q in ("how long is left", "set a timer and a reminder",
+                  "cancel that timer", "how long is left on the print"):
+            with self.subTest(q=q):
+                self.assertFalse(fp.is_timer_list_request(q))
+
+
+class CapabilityQuestionTests(unittest.TestCase):
+    """Live 2026-10-28 18:02 "What can you do for me?" got the model's own
+    improvised list; it is now a fixed overview of the real skills."""
+
+    def test_capability_questions(self):
+        for q in ("What can you do for me?", "Jarvis, what can you do?",
+                  "what else can you do", "what are your capabilities",
+                  "what are you capable of", "what can you help me with",
+                  "what kind of things can you do"):
+            with self.subTest(q=q):
+                self.assertTrue(fp.is_capability_question(q))
+                hit = fp.match(q)
+                self.assertEqual(hit.kind, "capabilities")
+
+    def test_requests_are_not_capability_questions(self):
+        for q in ("what can you do about the noise",
+                  "what can you do with this file", "can you do that",
+                  "what did you do", "what are you doing", "", None):
+            with self.subTest(q=q):
+                self.assertFalse(fp.is_capability_question(q))
+
+    def test_reply_names_only_backed_skills(self):
+        full = fp.capability_reply()
+        self.assertTrue(full.startswith("Quite a bit, sir: I can "))
+        for phrase, _ in fp._CAPABILITY_PARTS:
+            self.assertIn(phrase, full)
+        some = fp.capability_reply({"set_timer", "web_search"})
+        self.assertEqual(some, "Quite a bit, sir: I can set timers and "
+                               "reminders, and search the web and your own "
+                               "files. Ask for any of it by name.")
+        self.assertNotIn("printer", some)
+        self.assertIn("by name", fp.capability_reply(set()))
+
+    def test_review_f9_a_phrase_needs_its_own_backing(self):
+        # server_status is registered on every install (host or not) and
+        # system_pulse alone used to keep "check this PC and the home server";
+        # see_screen alone kept "...or through the cameras".
+        from unittest import mock
+        import core.config as cfg
+        with mock.patch.object(cfg, "SERVER_WATCH_HOST", "", create=True):
+            said = fp.capability_reply({"system_pulse", "see_screen",
+                                        "draft_reply", "server_status"})
+        self.assertIn("check this PC", said)
+        self.assertIn("look at your screen", said)
+        self.assertNotIn("server", said)
+        self.assertNotIn("camera", said)
+        self.assertEqual(said, "Quite a bit, sir: I can sort and draft your "
+                               "email, check this PC, and look at your screen. "
+                               "Ask for any of it by name.")
+
+    def test_review_f9_server_and_cameras_when_set_up(self):
+        from unittest import mock
+        import core.config as cfg
+        names = {"system_pulse", "server_status", "see_screen", "look_around"}
+        with mock.patch.object(cfg, "SERVER_WATCH_HOST", "nas.example",
+                               create=True):
+            said = fp.capability_reply(names)
+            self.assertIn("check on the home server", said)
+            self.assertIn("look through the cameras", said)
+            # ...but the host alone is not enough without the action.
+            self.assertNotIn("home server",
+                             fp.capability_reply({"system_pulse"}))
+
+    def test_every_backing_name_is_a_real_registration(self):
+        # Each phrase must stay true: its action names exist in the source.
+        import glob
+        import os
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        src = ""
+        for path in ([os.path.join(root, "bobert_companion.py")]
+                     + glob.glob(os.path.join(root, "skills", "*.py"))
+                     + glob.glob(os.path.join(root, "core", "*.py"))):
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    src += fh.read()
+            except OSError:
+                pass
+        if "def _run_voice_shortcuts" not in src:
+            self.skipTest("monolith source not present")
+        for phrase, names in fp._CAPABILITY_PARTS:
+            with self.subTest(phrase=phrase):
+                self.assertTrue(any(f'"{n}"' in src for n in names), names)
+
 
 if __name__ == "__main__":
     unittest.main()

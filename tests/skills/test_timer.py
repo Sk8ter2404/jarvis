@@ -672,5 +672,141 @@ class ListTimersIsTheStoreTests(unittest.TestCase):
         self.assertIn("could not", out)
 
 
+class TimerLabelGroundingTests(unittest.TestCase):
+    """F1 (v3.0.6). Live 2026-10-28 17:53: "set a timer for three minutes" ->
+    [ACTION: set_timer, 3 minutes | check the oven] - the model copied the
+    prompt's only example and the timer would have fired "Reminder, sir -
+    check the oven". During an owner turn a label he never said is dropped
+    (current_owner_utterance, core/owner_turn.py); the timer still runs."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("timer")
+        self.mod._timers.clear()
+        self.mod._next_id[0] = 1
+
+    def _turn(self, said):
+        """The monolith's turn cells as main() sets them for a live turn."""
+        bc = mock.MagicMock()
+        bc._turn_in_progress = [True]
+        bc._last_user_text = [said]
+        return mock.patch.dict("sys.modules", {"bobert_companion": bc})
+
+    def _set(self, args, said):
+        with self._turn(said), no_background_threads():
+            return _call_silently(self.actions["set_timer"], args)
+
+    def test_live_invented_label_is_dropped(self):
+        out = self._set("3 minutes | check the oven",
+                        "set a timer for three minutes")
+        self.assertEqual(len(self.mod._timers), 1)      # the timer still runs
+        _, msg, _ = self.mod._timers[1]
+        self.assertEqual(msg, "your timer is up")
+        self.assertNotIn("oven", out)
+        self.assertEqual(out, "timer #1 set — will remind you in 3m")
+
+    def test_a_label_he_said_is_kept(self):
+        for args, said, label in (
+                ("5 minutes | check the oven",
+                 "set a timer for five minutes to check the oven", "check the oven"),
+                ("10 minutes for tea", "tea timer, ten minutes", "tea"),
+                ("20 minutes | pasta", "Jarvis, timer for the pasta's, 20 minutes",
+                 "pasta"),
+                ("half an hour to stretch",
+                 "remind me in half an hour, I need stretching", "stretch")):
+            with self.subTest(said=said):
+                self.mod._timers.clear()
+                self.mod._next_id[0] = 1
+                out = self._set(args, said)
+                _, msg, _ = self.mod._timers[1]
+                self.assertEqual(msg, label)
+                self.assertIn(label, out)
+
+    def test_an_accepted_offer_keeps_the_label_it_named(self):
+        bc = mock.MagicMock()
+        bc._turn_in_progress = [True]
+        bc._last_user_text = ["yes please"]
+        bc.conversation_history = [
+            {"role": "user", "content": "the bread is in"},
+            {"role": "assistant", "content": "Shall I set a ten-minute timer "
+                                             "to check the bread, sir?"},
+            {"role": "user", "content": "yes please"}]
+        with mock.patch.dict("sys.modules", {"bobert_companion": bc}),                 no_background_threads():
+            _call_silently(self.actions["set_timer"],
+                           "10 minutes | check the bread")
+        _, msg, _ = self.mod._timers[1]
+        self.assertEqual(msg, "check the bread")
+
+    def test_the_brains_own_reply_in_history_cannot_ground_its_label(self):
+        # Review of F1: _call_llm appends the brain's reply (with the
+        # [ACTION: set_timer, ... | check the oven] token) to
+        # conversation_history BEFORE the action runs, so the live label
+        # vouched for itself. A REAL list, as the monolith holds it.
+        said = "Jarvis, set a timer for three minutes"
+        bc = mock.MagicMock()
+        bc._turn_in_progress = [True]
+        bc._last_user_text = [said]
+        bc.conversation_history = [
+            {"role": "user", "content": said},
+            {"role": "assistant", "content":
+                "[intent:confirmation] Timer set, sir. "
+                "[ACTION: set_timer, 3 minutes | check the oven]"}]
+        with mock.patch.dict("sys.modules", {"bobert_companion": bc}),                 no_background_threads():
+            out = _call_silently(self.actions["set_timer"],
+                                 "3 minutes | check the oven")
+        _, msg, _ = self.mod._timers[1]
+        self.assertEqual(msg, "your timer is up")
+        self.assertNotIn("oven", out)
+        with mock.patch.dict("sys.modules", {"bobert_companion": bc}):
+            self.assertEqual(self.mod._owner_utterance(), said)
+
+    def test_an_accepted_offer_survives_the_reply_in_history(self):
+        # The offer he answered is the assistant line BEFORE his "yes"; the
+        # reply after it (token and all) is ignored.
+        bc = mock.MagicMock()
+        bc._turn_in_progress = [True]
+        bc._last_user_text = ["yes please"]
+        bc.conversation_history = [
+            {"role": "user", "content": "the bread is in"},
+            {"role": "assistant", "content": "Shall I set a ten-minute timer "
+                                             "to check the bread, sir?"},
+            {"role": "user", "content": "yes please"},
+            {"role": "assistant", "content": "Done, sir. [ACTION: set_timer, "
+                                             "10 minutes | feed the cat]"}]
+        with mock.patch.dict("sys.modules", {"bobert_companion": bc}),                 no_background_threads():
+            _call_silently(self.actions["set_timer"],
+                           "10 minutes | check the bread")
+            _call_silently(self.actions["set_timer"],
+                           "10 minutes | feed the cat")
+        self.assertEqual(self.mod._timers[1][1], "check the bread")
+        self.assertEqual(self.mod._timers[2][1], "your timer is up")
+
+    def test_no_turn_in_progress_keeps_the_label(self):
+        # A scheduled / restored / proactive call has no utterance to judge
+        # by: today's behaviour (the label stands).
+        bc = mock.MagicMock()
+        bc._turn_in_progress = [False]
+        bc._last_user_text = ["set a timer for three minutes"]
+        with mock.patch.dict("sys.modules", {"bobert_companion": bc}),                 no_background_threads():
+            _call_silently(self.actions["set_timer"], "3 minutes | check the oven")
+        _, msg, _ = self.mod._timers[1]
+        self.assertEqual(msg, "check the oven")
+
+    def test_setting_off_keeps_the_old_behaviour(self):
+        from core import config as cfg
+        with mock.patch.object(cfg, "TIMER_LABEL_GROUNDING", False):
+            self._set("3 minutes | check the oven", "set a timer for three minutes")
+        _, msg, _ = self.mod._timers[1]
+        self.assertEqual(msg, "check the oven")
+
+    def test_grounded_label_is_pure_and_never_raises(self):
+        g = self.mod.grounded_label
+        self.assertEqual(g("check the oven", "set a timer for three minutes"), "")
+        self.assertEqual(g("check the oven", ""), "check the oven")
+        self.assertEqual(g("", "anything"), "")
+        self.assertEqual(g("it", "set a timer"), "it")       # no content words
+        self.assertEqual(g(None, None), "")
+        self.assertEqual(g("the 3d print", "timer for my 3d print"), "the 3d print")
+
+
 if __name__ == "__main__":
     unittest.main()

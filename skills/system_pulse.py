@@ -506,7 +506,8 @@ def _fmt_bambu(b: dict) -> str:
 
 
 def _format_report(pulse: dict, lead: str = "", *, lead_key: str = "",
-                   proactive: bool = False, mem_users: list | None = None) -> str:
+                   proactive: bool = False, mem_users: list | None = None,
+                   gpu_mine: bool = False) -> str:
     """Render the JARVIS-cadence pulse sentence. If `lead` is non-empty, it
     replaces the default 'All systems nominal' opener (used when an
     abnormality forced the proactive announcement, and by _on_demand_report
@@ -521,7 +522,12 @@ def _format_report(pulse: dict, lead: str = "", *, lead_key: str = "",
     `mem_users` ([(spoken name, GB)] from _memory_users) adds the sentence
     naming the biggest memory users: straight after a memory lead (it is the
     answer to "why"), else after the readings. None/empty: no sentence (the
-    proactive path never passes it, so its lines are unchanged)."""
+    proactive path never passes it, so its lines are unchanged).
+    `gpu_mine` (asked-for pulse only, see _on_demand_report): the GPU reading
+    is JARVIS's own inference, so it leaves the list of readings and is said
+    as such in its own sentence ("The GPU's busy at 97 percent - that's me
+    thinking.") instead of an unexplained "GPU working hard at 97 percent"
+    behind "All systems nominal"."""
     cpu = pulse.get("cpu_pct", 0.0)
     ram = pulse.get("ram_pct", 0.0)
     gpu_util = pulse.get("gpu_util_pct")
@@ -543,8 +549,13 @@ def _format_report(pulse: dict, lead: str = "", *, lead_key: str = "",
         parts.append(cpu_part)
     if said != "ram":
         parts.append(f"memory {ram:.0f} percent")
+    mine_line = ""
     if said == "gpu":
         pass
+    elif gpu_mine and gpu_util is not None:
+        mine_line = f"The GPU's busy at {gpu_util:.0f} percent - that's me thinking."
+    elif gpu_mine and gpu_temp is not None:
+        mine_line = f"The GPU's warm at {gpu_temp:.0f} degrees - that's me thinking."
     elif gpu_util is not None:
         verb = "working hard at" if gpu_util >= GPU_UTIL_ABNORMAL_PCT else "running at"
         parts.append(f"GPU {verb} {gpu_util:.0f} percent")
@@ -564,6 +575,8 @@ def _format_report(pulse: dict, lead: str = "", *, lead_key: str = "",
     middle = (", ".join(parts) + ".") if parts else ""
     if middle:
         middle = middle[0].upper() + middle[1:]
+    if mine_line:
+        middle = f"{middle} {mine_line}" if middle else mine_line
     tail_pieces = []
     if bambu_line and said != "bambu_fail":
         tail_pieces.append(bambu_line + ".")
@@ -934,7 +947,8 @@ def _memory_users_sentence(users) -> str:
 
 
 def _on_demand_report(pulse: dict, said: str = "", *, procs=None,
-                      own_pid: int | None = None) -> str:
+                      own_pid: int | None = None, own_busy=None,
+                      gpu_procs=None) -> str:
     """The asked-for pulse. With an abnormal reading (by _abnormal_reasons)
     it opens with that reading's own line instead of "All systems nominal" -
     a reading of this PC first, the memory one when he asked about memory -
@@ -947,7 +961,9 @@ def _on_demand_report(pulse: dict, said: str = "", *, procs=None,
         # is by definition busy (transcribing / answering this very turn), and
         # "GPU pinned at 99 percent" is the 09-29/10-02 false alarm below. The
         # body still says "GPU working hard at N percent", as in 3.0.4.
-        reasons = [r for r in _abnormal_reasons(pulse) if r[0] != "gpu"]
+        all_reasons = _abnormal_reasons(pulse)
+        reasons = [r for r in all_reasons if r[0] != "gpu"]
+        gpu_hit = len(reasons) != len(all_reasons)
         asked_memory = _asks_about_memory(said)
         lead_key, lead = "", ""
         if reasons:
@@ -957,13 +973,75 @@ def _on_demand_report(pulse: dict, said: str = "", *, procs=None,
                 lead_key, lead = "ram", by_key["ram"]
             else:
                 lead_key, lead = (pc or reasons)[0]
+        gpu_mine = False
+        if gpu_hit and _gpu_explained():
+            # Live 2026-10-28 17:54:26 "how's the computer doing?" -> "All
+            # systems nominal, sir. ... GPU working hard at 97 percent" (over
+            # GPU_UTIL_ABNORMAL_PCT, said as fine and never explained). Ours
+            # (the local model ran within OWN_INFERENCE_GRACE_S - it just
+            # answered this turn): said as "that's me thinking". Not ours:
+            # "nominal" would be wrong, so the GPU is named as the exception -
+            # in plain words, not the proactive "pinned" alarm (3.0.5: an
+            # asked-for pulse never opens with that).
+            # Review F4: recency alone is always True on a voice turn (the
+            # local brain's own POST ended moments ago), so a game pinning the
+            # card at 97 % was called "me thinking". "Mine" now also needs the
+            # per-process reading (as the proactive path has had since
+            # 2026-10-01): every busy process is the local model server or
+            # JARVIS. A game among them, nobody busy (the POST is over), or no
+            # reading at all -> no cause is claimed; the GPU is just the
+            # exception.
+            if ((own_busy or _own_inference_recent)()
+                    and _gpu_load_is_ours(gpu_procs, own_pid=own_pid)):
+                gpu_mine = True
+            elif not lead:
+                lead_key, lead = "gpu", _gpu_exception_lead(pulse)
         users = None
         if asked_memory or pulse.get("ram_pct", 0.0) >= RAM_ABNORMAL_PCT:
             users = _memory_users(procs, own_pid=own_pid)
         return _format_report(pulse, lead=lead, lead_key=lead_key,
-                              mem_users=users)
+                              mem_users=users, gpu_mine=gpu_mine)
     except Exception:
         return _format_report(pulse)
+
+
+def _gpu_load_is_ours(gpu_procs=None, *, own_pid: int | None = None) -> bool:
+    """True only when the per-process GPU reading (``gpu_procs`` or one
+    _gpu_busy_processes() call) shows busy processes and every one of them is
+    the local model server or JARVIS itself. False for any other busy process
+    (a game), for nobody busy, and for no reading (None). Never raises."""
+    try:
+        rows = (gpu_procs or _gpu_busy_processes)()
+        if not rows:
+            return False
+        own = os.getpid() if own_pid is None else own_pid
+        return all(_is_local_model_server(r[0]) or r[1] == own for r in rows)
+    except Exception:
+        return False
+
+
+def _gpu_explained() -> bool:
+    """core.config.SYSTEM_PULSE_GPU_EXPLAINED, read live (default True)."""
+    try:
+        import core.config as _cfg
+        return bool(getattr(_cfg, "SYSTEM_PULSE_GPU_EXPLAINED", True))
+    except Exception:
+        return True
+
+
+def _gpu_exception_lead(pulse: dict) -> str:
+    """"All nominal apart from the GPU, sir: it's working hard at 97 percent."
+    (or running hot at N degrees, the temperature fallback). Pure; never
+    raises."""
+    try:
+        util = pulse.get("gpu_util_pct")
+        if util is not None:
+            return (f"All nominal apart from the GPU, sir: it's working hard "
+                    f"at {util:.0f} percent.")
+        return (f"All nominal apart from the GPU, sir: it's running hot at "
+                f"{pulse.get('gpu_temp_c', 0.0):.0f} degrees.")
+    except Exception:
+        return "All nominal apart from the GPU, sir."
 
 
 # ─── JARVIS's own GPU load (2026-09-29) ─────────────────────────────────

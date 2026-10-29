@@ -31,8 +31,9 @@ budgets run against it:
     between two tests (tearDown, tearDownModule, and the import of the next test
     module all live in that gap, and any of them can hang), or the initial
     discovery/import sweep before the first test starts.
-  * WHOLE-RUN (``JARVIS_TEST_TOTAL_TIMEOUT_S``, default 900 s) — the backstop
-    for death by a thousand slow tests, which no per-test budget can see.
+  * WHOLE-RUN (``JARVIS_TEST_TOTAL_TIMEOUT_S``, default 1800 s since v3.0.6;
+    900 s before) — the backstop for death by a thousand slow tests, which no
+    per-test budget can see.
 
 When a budget blows, the watchdog does the one thing the exit-124 could not: it
 prints the phase label and elapsed time, then dumps the Python stack of EVERY
@@ -75,10 +76,17 @@ A full ``tools/run_tests_ci_sim.py`` run: 15,361 tests in 136.4 s, and the
 slowest single test in the whole suite was 5.00 s
 (tests.skills.test_web_interface ... test_stop_survives_wedged_shutdown, which
 is itself a deliberate 5 s timebox assertion). So the 120 s per-phase default is
-24x the worst real test, and the 900 s whole-run default is ~6x the whole
+24x the worst real test, and the 900 s whole-run default was ~6x the whole
 measured run and comfortably inside ci.yml's 20-minute job timeout — which is
 the point: this watchdog must always win the race against the opaque CI kill,
 so the failure arrives as a stack dump instead of as a dead job.
+
+RECALIBRATED (v3.0.6, 2026-10-28): the suite outgrew 900 s. The 10-13 work
+order measured a local run at 1,118 s and the 10-28 v3.0.4 gate took 32 min
+at BelowNormal priority (26,343 tests), so the old default killed honest runs
+and every caller worked around it (tools/selfup_runner.py already passes
+1800). The whole-run default is now 1800 s: still inside ci.yml's 40-minute
+job timeout (2400 s, raised 2026-10-14), so the watchdog still reports first.
 
 ``JARVIS_TEST_TIMEOUT_S=0`` (also ``off`` / ``none`` / ``unlimited``) is the
 documented escape hatch, and so is ``JARVIS_TEST_TOTAL_TIMEOUT_S=0``. Anything
@@ -98,7 +106,7 @@ import unittest
 PER_PHASE_ENV = "JARVIS_TEST_TIMEOUT_S"
 TOTAL_ENV = "JARVIS_TEST_TOTAL_TIMEOUT_S"
 DEFAULT_PER_PHASE_S = 120.0
-DEFAULT_TOTAL_S = 900.0
+DEFAULT_TOTAL_S = 1800.0   # 900 -> 1800 in v3.0.6 (see RECALIBRATED above)
 
 # How long after the first dump the second one is taken, and the exit code the
 # process dies with. 3 is distinct from unittest's 1 (test failure) and from the

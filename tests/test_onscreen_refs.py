@@ -460,5 +460,203 @@ class RouterGateTests(unittest.TestCase):
             self.assertLess(n, 16000, t)
 
 
+# Live 2026-10-28 17:26 (session_2026-10-28_17-21-18.log): no "Claude" in the
+# words, so no route claimed them; the brain sent [ACTION: deskbot_speak, I
+# am ready for more dialogue.] and the robot spoke. At 17:57 the same words
+# (typed) got note_for_claude from the brain. The live words used the owner's
+# robot's name (one word spoken, two words typed); "deskbot" / "Desk Bot" are
+# made-up stand-ins of the same shape - public code never names the device.
+LIVE_DEV_TODO = "We need to give the deskbot more voice lines."
+LIVE_DEV_TODO_TYPED = "We need to give the Desk Bot more voice lines."
+
+
+class DevTodoNoteTests(unittest.TestCase):
+    """B1 (v3.0.6): a developer to-do that never says "Claude" is a note,
+    through screen_route (the route the live turn asks before the brain)."""
+    TODOS = (
+        LIVE_DEV_TODO, LIVE_DEV_TODO_TYPED,
+        "Jarvis, we should make him smarter",
+        "we need to teach you more commands",
+        "so we should give the robot more jokes",
+        "we need to make the desk bot able to wave",
+        "The deskbot needs more voice lines",
+        # Generic robot words: "robot", "the bot", a doubled final t from
+        # the recogniser, a hyphenated two-word name.
+        "We need to give the robot more voice lines.",
+        "we need to give the bot more voice lines",
+        "We need to give the deskbott more voice lines.",
+        "we need to give the desk-bot more jokes",
+        "the bot needs more voice lines",
+        "we need to fix the desk bot",
+        "you need to stop saying indeed all the time",
+        "we need to fix you",
+    )
+    # Real requests, questions and other people: still the brain's.
+    NOT_TODOS = (
+        "we need to turn off the lights", "we should make you a playlist",
+        "we need to give him more time", "we need to make him dinner",
+        "we need to update you", "we should upgrade you",
+        "do we need to give the deskbot more voice lines?",
+        "should we make him smarter?",
+        "you need to stop playing music", "you need to stop commenting",
+        "you need to stop", "stop saying that",
+        "we should add a timer to the oven",
+        "we need to give the robot a name",
+        "we need to add a voice lines feature to the dashboard",
+        "we need to buy him more voice lines",
+        "make the deskbot say we need more voice lines",
+        "have the deskbot say hello",
+    )
+
+    def test_the_live_line_is_noted_before_the_brain(self):
+        self.assertEqual(
+            screen_route(LIVE_DEV_TODO, {}),
+            "[ACTION: note_for_claude, We need to give the deskbot more "
+            "voice lines]")
+
+    def test_developer_todos_are_notes(self):
+        for said in self.TODOS:
+            with self.subTest(said=said):
+                note = O.claude_note(said)
+                self.assertTrue(note, said)
+                self.assertTrue(screen_route(said, {}).startswith(
+                    "[ACTION: note_for_claude, "), said)
+
+    def test_real_requests_and_questions_are_not(self):
+        for said in self.NOT_TODOS:
+            with self.subTest(said=said):
+                self.assertIsNone(O.claude_note(said), said)
+                self.assertIsNone(O.dev_todo_note(said), said)
+
+    # Review of B1: "him" / "his" is also a person, and a second clause is a
+    # command the note would swallow.
+    PERSON_TURNS = (
+        "we should give him more time to finish his skills test",
+        "we need to give him a ride to his skills competition",
+        "we should let him know about the settings",
+        "we need to add him to the group chat with more options",
+        "we should make him a sandwich with more options",
+    )
+    COMPOUND_TURNS = (
+        "you need to stop calling me sir and turn on the lights",
+        "we need to make him able to see, and also turn on the lights",
+        "we need to give the deskbot more voice lines, then play some music",
+    )
+
+    def test_a_turn_about_a_person_is_the_brains(self):
+        for said in self.PERSON_TURNS:
+            with self.subTest(said=said):
+                self.assertIsNone(O.claude_note(said), said)
+                self.assertIsNone(screen_route(said, {}), said)
+
+    def test_a_compound_turn_keeps_its_command(self):
+        for said in self.COMPOUND_TURNS:
+            with self.subTest(said=said):
+                self.assertIsNone(O.claude_note(said), said)
+                self.assertIsNone(screen_route(said, {}), said)
+
+    def test_him_with_the_feature_right_after_is_still_a_note(self):
+        for said in ("we need to give him more voice lines",
+                     "we should make him smarter",
+                     "we need to teach him new jokes",
+                     "we need to make him able to see",
+                     "we need to give him more voice lines and make him "
+                     "smarter",
+                     "you need to stop calling me sir and stop saying indeed"):
+            with self.subTest(said=said):
+                self.assertTrue(O.dev_todo_note(said), said)
+
+    def test_the_router_loads_the_developer_note_section(self):
+        self.assertTrue(PR._developer_note_request(LIVE_DEV_TODO))
+
+    def test_setting_off_is_the_old_behaviour(self):
+        from unittest import mock
+        from core import config as cfg
+        with mock.patch.object(cfg, "DEV_TODO_NOTES", False):
+            self.assertIsNone(O.claude_note(LIVE_DEV_TODO))
+            self.assertIsNone(screen_route(LIVE_DEV_TODO, {}))
+            # a Claude note is untouched by the setting
+            self.assertTrue(O.claude_note("tell Claude to fix the clicking"))
+
+    def test_never_raises(self):
+        for bad in (None, 5, "", "   ", object()):
+            self.assertIsNone(O.dev_todo_note(bad))
+
+
+# Live 2026-10-28 17:25:16 (session_2026-10-28_17-21-18.log): the turn before
+# was "how's the server?" -> the server-status line; then this, and the brain
+# sent [ACTION: open_app, PowerShell] -> "launched PowerShell".
+LIVE_OPEN_IT = "Jarvis, can you open it up so I can help you?"
+LIVE_OPEN_IT_RECENT = (
+    "Jarvis, how's the server? I'm not watching a server yet, sir - its "
+    "address isn't in my settings (SERVER_WATCH_HOST). " + LIVE_OPEN_IT)
+
+
+class UnresolvedOpenTests(unittest.TestCase):
+    """B2 (v3.0.6): a bare "open it" whose app nothing named is a question."""
+
+    def test_the_live_turn_asks_open_what(self):
+        self.assertEqual(O.unresolved_open(LIVE_OPEN_IT, "PowerShell",
+                                           LIVE_OPEN_IT_RECENT),
+                         "Open what, sir?")
+
+    def test_bare_pronoun_shapes(self):
+        for said in ("open it", "open it up", "Jarvis, open that up for me",
+                     "could you launch it please", "go ahead and open it",
+                     "pull it up so we can look"):
+            with self.subTest(said=said):
+                self.assertEqual(O.unresolved_open(said, "Notepad", ""),
+                                 O.OPEN_WHAT_LINE)
+
+    def test_a_named_or_recent_app_still_opens(self):
+        for said, name, recent in (
+                ("yes, open it", "Spotify", "Shall I open Spotify, sir?"),
+                ("open it", "PowerShell", "would you like Power Shell?"),
+                ("open that up", "Bambu Studio",
+                 "The print file is open in Bambu Studio, sir."),
+                ("open PowerShell", "PowerShell", ""),
+                ("I'm playing Fortnite, open it up", "Fortnite", ""),
+                ("open it in chrome", "chrome", ""),
+                ("open the settings", "notepad", ""),
+                ("open it", "", "")):
+            with self.subTest(said=said):
+                self.assertIsNone(O.unresolved_open(said, name, recent))
+
+    def test_recent_context_leaves_out_the_reply_in_progress(self):
+        # Review of B2: _call_llm appends the brain's reply BEFORE the
+        # action runs, so it must not name the app it chose.
+        hist = [{"role": "user", "content": "Jarvis, how's the server?"},
+                {"role": "assistant", "content": "[ACTION: server_status]"},
+                {"role": "user", "content": LIVE_OPEN_IT},
+                {"role": "assistant", "content":
+                    "[intent:confirmation] Certainly, sir. "
+                    "[ACTION: open_app, PowerShell]"}]
+        recent = O.recent_context(hist)
+        self.assertNotIn("PowerShell", recent)
+        self.assertNotIn("ACTION", recent)
+        self.assertEqual(O.unresolved_open(LIVE_OPEN_IT, "PowerShell", recent),
+                         "Open what, sir?")
+
+    def test_recent_context_keeps_the_offer_he_answered(self):
+        hist = [{"role": "assistant", "content":
+                 "Shall I open Spotify, sir? [ACTION: noop]"},
+                {"role": "user", "content": "yes, open it"},
+                {"role": "assistant", "content":
+                 "[ACTION: open_app, Spotify]"}]
+        recent = O.recent_context(hist)
+        self.assertIn("Spotify", recent)
+        self.assertNotIn("ACTION", recent)
+        self.assertIsNone(O.unresolved_open("yes, open it", "Spotify", recent))
+
+    def test_recent_context_never_raises(self):
+        for bad in (None, 5, "x", [None, 3, {"role": "user"}], [{}]):
+            self.assertIsInstance(O.recent_context(bad), str)
+        self.assertEqual(O.strip_reply_tokens(None), "")
+
+    def test_never_raises(self):
+        self.assertIsNone(O.unresolved_open(None, None, None))
+        self.assertIsNone(O.unresolved_open(object(), 5, object()))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,7 +14,7 @@ cases):
   * safety-03 "turn it off" -> game_mode_off.
 
 ``check(user_text, name, arg, prior_actions)`` is pure: it returns None when
-the action fits, else a short reason. Five rules only:
+the action fits, else a short reason. Six rules only:
 
   1. A list / status action when the owner gave an on / off / set / dim /
      turn command (and asked for no list or status in the same breath, and
@@ -42,6 +42,14 @@ the action fits, else a short reason. Five rules only:
      ran version_info again 17 s after it had answered. "Check again" and
      "what version again?" still run. The monolith's preemptive-injection
      path applies the same remark test (_preempt_recent_reading, 60 s).
+
+  6. The owner's robot made to speak (a device speak action, named
+     "<...>bot_speak" by its private skill) when the owner's words ask
+     nobody to say, speak, talk, tell, greet ... anything. Live 2026-10-28
+     17:26:20, "We need to give the robot more voice lines." (a developer
+     to-do, said with the robot's name) ran the robot's speak action with
+     "I am ready for more dialogue." and the robot said it. "Make him
+     talk", "have the bot say hi" and "tell the robot I aced my exam" fit.
 
 No owner words (a proactive dispatch) never flags. Never raises: any fault
 reads as "fits".
@@ -211,6 +219,53 @@ _FACE_LOOK_RE = re.compile(
     r"at (?:the|my) desk)\b|\bagain\b|\bre-?check\b", re.I)
 
 
+# ── Rule 6: the robot made to speak, unasked ────────────────────────────────
+# The owner's robot skill lives in a private folder outside the repo, so
+# public code never names the device: a robot speak action is recognised by
+# its NAME SHAPE, any action ending "bot_speak" (one word or with an
+# underscore before "bot", a doubled final t allowed: "deskbot_speak",
+# "desk_bot_speak", "robot_speak"). A name pattern, not a registry, because
+# the private skill already registers its actions under that shape and needs
+# no edit for this rule; the robot's other actions (banter, engage, halt ...)
+# never match. It puts words in the robot's mouth, so it fits only a turn
+# that asks someone to SAY something: a speech verb or greeting anywhere
+# ("make him talk", "have the bot say hi", "tell the robot I aced my exam",
+# "let him introduce himself"). Broad on purpose - the rule flags only a
+# turn with NO speech word at all, like the live developer to-do "We need to
+# give the robot more voice lines." ("voice lines" is a feature, not a
+# request to speak).
+_ROBOT_SPEAK_ACTION_RE = re.compile(r"^[a-z0-9_]*bott?_speak$", re.I)
+
+
+def is_robot_speak_action(name) -> bool:
+    """True for a device speak action of the owner's robot (rule 6): an
+    action name ending "bot_speak". Never raises."""
+    try:
+        return (_ROBOT_SPEAK_ACTION_RE.match(str(name or "").strip())
+                is not None)
+    except Exception:
+        return False
+
+
+_SPEECH_ASK_RE = re.compile(
+    r"\b(?:say|says|saying|said|speak|speaks|speaking|talk|talks|talking|"
+    r"tell|tells|telling|announce|repeat|greet|greeting|introduce|sing|"
+    r"shout|yell|whisper|chat|chatter|ask|asks|read|recite|pronounce|"
+    r"hello|hi|hey|goodbye|bye|good\s+(?:morning|night|evening|afternoon)|"
+    r"thank|thanks|welcome|congratulate|congrats|joke|roast|compliment|"
+    r"insult|respond|reply|answer|words?|quote)\b", re.I)
+
+
+def asks_robot_speech(user_text) -> bool:
+    """True when the owner's words ask someone to say something: any speech
+    verb or greeting (rule 6). "We need to give the robot more voice lines."
+    is not. Never raises."""
+    try:
+        return _SPEECH_ASK_RE.search(_norm(user_text)) is not None
+    except Exception:
+        return False
+
+
 def asks_face_look(user_text) -> bool:
     """True when the owner's words ask for a face look: who someone is, to
     recognise / see / look at a person or face, or whether anyone is there.
@@ -297,6 +352,11 @@ def check(user_text, name, arg="",
             return (f"not run: {nm} looks through the webcam to say who is "
                     f"there, and sir asked nothing about who someone is or "
                     f"a face")
+        # Rule 6: the robot made to speak when nobody was asked to say
+        # anything.
+        if is_robot_speak_action(nm) and not asks_robot_speech(text):
+            return (f"not run: {nm} makes the desk robot say a line, and "
+                    f"sir asked nobody to say anything")
         # Rule 5: the same reading again, for a remark about it.
         if is_informative_action(nm) and is_remark(text):
             a = _norm(arg).lower()

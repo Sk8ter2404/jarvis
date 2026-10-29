@@ -304,6 +304,19 @@ SERVER_WATCH_HOST = ""
 SERVER_WATCH_NAME = "server"
 SERVER_WATCH_SSH = ""
 SERVER_WATCH_POLL_S = 300.0
+# SERVER_WATCH_SSH_KEY (3.0.6) - path of the restricted read-only key (forced
+# command /boot/config/jarvis-ro.sh on the server). When set, ssh gets
+# `-i <key> -o IdentitiesOnly=yes` so it can never fall back to the default
+# full-root key. "" (default) = today's behaviour, so the switch is a
+# settings change only (data/user_settings.json; the path stays out of git).
+SERVER_WATCH_SSH_KEY = ""
+# SERVER_WATCH_HEALTH_READS (3.0.6) - with SERVER_WATCH_SSH set, also read
+# disks.ini, `apcaccess -u` and `docker ps -a` (read-only, fixed commands) and
+# speak only on the Home Lab hub's rules: disk errors rising / temp >= 50 C,
+# UPS on battery and back, a container stopping (silent while a server:unraid
+# board claim is held). Default True: the rules were approved 2026-10-28 and
+# nothing runs unless SERVER_WATCH_HOST + SERVER_WATCH_SSH are set anyway.
+SERVER_WATCH_HEALTH_READS = True
 
 # ─── File moves (skills/file_move.py, v3 W15) ──────────────────────────
 # move_file / undo_last_move: move ONE file between the owner's folders (the
@@ -957,6 +970,15 @@ GUEST_MODE = False
 # wake-word mode at all) steady crosstalk such as a TV can hold it open; see
 # core/followup_window.py. Set via user_settings.json.
 FOLLOWUP_WINDOW_S = 0.0
+# FOLLOWUP_MEDIA_NO_EXTEND (3.0.6) - a no-wake-word follow-up heard while the
+# PC plays audio, whose voice the media gate could not confirm as yours
+# ("unsure", or dropped as not yours), still runs but does NOT extend the
+# follow-up window (live 2026-10-28 17:28: a video's narration was admitted
+# inside a window that a line over the same video had extended). Default True:
+# your own follow-up over media still runs; at worst the window closes on its
+# original deadline and the next line needs "Jarvis". False = the old
+# behaviour (every admitted line extends). Wake-word turns are unchanged.
+FOLLOWUP_MEDIA_NO_EXTEND = True
 
 # Owner speech vocabulary (core/stt_vocab.py). STT_HOTWORDS: comma-separated names
 # Whisper should expect (faster-whisper "hotwords"). STT_REPLACEMENTS: phrases Whisper
@@ -1522,6 +1544,25 @@ CLOUD_BOOST_UNTIL = ""
 # user_settings.json; applies on the next start.
 FAST_PATHS_ENABLED = True
 
+# WHATS_NEW_VERSION_FIRST (bool, v3.0.6, core/actions.py _act_read_changelog):
+# live 2026-10-28 17:58 "what's new with you?" waited 8.3 s for the summariser
+# before a word was said. True (default): "I'm on version X, sir." (from the
+# release history's newest header, no model) is voiced while the summary is
+# written - one short line through the normal speech path, the summary
+# follows as before. Default on: it only moves a line that is said anyway
+# earlier. False: nothing is voiced early; the version line leads the reply.
+WHATS_NEW_VERSION_FIRST = True
+
+# SYSTEM_PULSE_GPU_EXPLAINED (bool, v3.0.6, skills/system_pulse.py
+# _on_demand_report): live 2026-10-28 17:54:26 "how's the computer doing?" ->
+# "All systems nominal, sir. ... GPU working hard at 97 percent" (over the 95 %
+# line, never explained). True (default): an asked-for pulse says JARVIS's own
+# inference load as "that's me thinking", and a high GPU that is not his own
+# makes the opener "All nominal apart from the GPU" instead of "All systems
+# nominal". Default on: wording only, no new reads (the proactive alert is
+# untouched). False: the 3.0.5 wording exactly.
+SYSTEM_PULSE_GPU_EXPLAINED = True
+
 # ─── Two-sentence shutdown asks the overnight question (v3 W08) ─────────
 # "Jarvis, shut down. No overnight protocol." (live 2026-10-19 20:26:04) is
 # two sentences, so the one-request shutdown grammar rejects it on purpose
@@ -1656,6 +1697,68 @@ ACTION_FIT_MODE = "shadow"
 # Any other value reads as 'off'. Never touches confirmation, action_risk or
 # shutdown. Applies on the next start.
 LOOP_GUARD_MODE = "shadow"
+
+# CHAIN_PROMISE_CHECK (bool, v3.0.6) - the "ended on a promise" chain cut.
+# Live 10-27/10-28: 4 of the 5 such cuts were plain spoken answers and the
+# fifth an offer (the label only asked "did the last follow-up run no
+# action?"). True (default): the cut needs the last follow-up's words,
+# tokens and tags removed, to be progress or promises only ("One moment, sir. I'll have those results
+# shortly."), and then the honest close-out is spoken even after an earlier
+# round said something - that promise was never kept. Default on: it only
+# narrows a label and speaks one honest line where a promise hung. False:
+# the old rule exactly. Applies on the next start.
+CHAIN_PROMISE_CHECK = True
+
+# ─── Routing fixes (v3.0.6, 2026-10-28 human test + misroutes report) ─────
+# TIMER_LABEL_GROUNDING (skills/timer.py grounded_label): live 2026-10-28
+# 17:53 "set a timer for three minutes" became "3 minutes | check the oven"
+# (the prompt's only example). True (default): during an owner turn a timer
+# label none of whose content words he said is dropped, so the timer says the
+# generic "your timer is up" instead of an invented task - the drop can only
+# lose a label he never gave. Scheduled / restored calls are untouched.
+# False: any label the model passes is kept (the old behaviour).
+TIMER_LABEL_GROUNDING = True
+# DEV_TODO_NOTES (core/onscreen_refs.dev_todo_note): live 2026-10-28 17:26
+# "We need to give the robot more voice lines." (said with the owner's robot's
+# name) ran the robot's speak action (it said an invented line); at 17:57 the same words got note_for_claude -
+# a coin toss in the brain. True (default): a turn that is WHOLLY a "we need
+# to / we should" plan for JARVIS or the robot to gain a feature (or "you
+# need to stop saying ...") is noted for Claude before the brain, like "tell
+# Claude ...". The rule is narrow on purpose (a question, a real command,
+# "update you", or no JARVIS / robot feature never matches), and the worst
+# miss is a note instead of an action, said aloud as "Noted for Claude".
+# False: only turns naming Claude are claimed (the old behaviour).
+DEV_TODO_NOTES = True
+# UNRESOLVED_OPEN_ASK (core/onscreen_refs.unresolved_open, checked in
+# core/actions._act_launch_app): live 2026-10-28 17:25:16 "can you open it up
+# so I can help you?" launched PowerShell - nothing said had named it. True
+# (default): when his WHOLE turn is "open it / that (up) ..." and the app is
+# named neither in his words nor in the last few lines of the conversation,
+# launch_app says "Open what, sir?" (a terminal line: no retry) and opens
+# nothing. A question back costs one turn; a wrong app costs a window to
+# close. False: launch whatever the brain named (the old behaviour).
+UNRESOLVED_OPEN_ASK = True
+# DECLINE_RECHECK_MODE (core/prompt_router.decline_recheck, applied in
+# bobert_companion._decline_recheck_apply): live 2026-10-28 17:26:00 "How's
+# the master sheet looking?" got a bare "I'm afraid I've no way to check that,
+# sir." and nothing more. 'on' (default): a FLAT decline (no action, <= 20
+# words) of the brain's first reply gets one question - "Shall I try <the
+# nearest action by name> instead, sir?" when exactly one registered action's
+# name matches his words strongly, else "Shall I note that for Claude to
+# add, sir?". Nothing runs until he says yes, so the cost of a poor match
+# is one "no". 'shadow' logs "[decline-recheck] would offer ..." only; 'off'
+# (any other value) is the old behaviour.
+DECLINE_RECHECK_MODE = "on"
+# YOUTUBE_MONITOR_ARG (core/actions.youtube_monitor_arg / _act_youtube_play):
+# live 2026-10-28 17:28:11 [ACTION: youtube_play, vision quest | monitor:left]
+# searched YouTube for "vision quest | monitor:left" and played on the middle
+# monitor. 'honor' (default): the monitor piece comes off the search and,
+# once the video plays, the window JARVIS opened (its recorded handle only,
+# never one of his) is moved to that monitor and maximized - the same
+# SetWindowPos step move_window_to_monitor runs, which is what he asked for.
+# 'strip': the search is cleaned, the window stays where it opened.
+# 'off' (any other value): the whole argument is searched (the old behaviour).
+YOUTUBE_MONITOR_ARG = "honor"
 
 # ─── Prompt v3 core (v3 overhaul W03, 2026-10-27) ────────────────────────
 # PROMPT_DIRECTIVE_V3 (bool): the wording of the prompt rules the local

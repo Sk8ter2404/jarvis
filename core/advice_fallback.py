@@ -394,6 +394,10 @@ _SIGNATURE_BODIES = (
     ("break_anything", r"try\s+not\s+to\s+break\s+anything(?:\s*,?\s*sir)?"),
     ("hope_strategy", r"hope\s+is,?\s+as\s+ever,?\s+not\s+a\s+strategy"),
     ("recovery_image", r"i'll\s+keep\s+the\s+recovery\s+image\s+warm"),
+    # v3.0.6: the line that replaced the retired "for posterity" line in the
+    # persona pool (E5 swap) - it sits in ~5 prompt spots, so without a limit
+    # it can repeat every turn (reviewed 2026-10-28: all 3 calls kept it).
+    ("optimism", r"one\s+does\s+admire\s+the\s+optimism(?:\s*,?\s*sir)?"),
 )
 SIGNATURE_PHRASES = tuple(
     (key, re.compile(r"^" + body + r"\s*[.!?]*$", re.I))

@@ -4,9 +4,9 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 ## Live now
 
-- Version: v3.0.5
+- Version: v3.0.6
 - Live since: 2026-10-28
-- Latest change: v3.0.5 (10-28): 'pass it over to Claude' and the RAM answer, from the afternoon live log.
+- Latest change: v3.0.6 (10-28): honesty, routing and the server, from today's log review and live test.
 
 ## In progress
 
@@ -19,10 +19,6 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 ## Roadmap
 
 Open, planned and idea items. Wording is generic on purpose.
-
-### In progress (1)
-
-- Stop the robot repeating the same jokes. In progress.
 
 ### Ideas (23)
 
@@ -52,6 +48,7 @@ Open, planned and idea items. Wording is generic on purpose.
 
 ## Recent releases
 
+- v3.0.6 (2026-10-28): Honesty, routing and the server, from today's log review and live test. Plain timers no longer get a made-up 'check the oven' label, stock lines that claim work ('I'll note that for posterity') are gone, and when a chain of steps ends on a promise he did not keep, JARVIS now says so. Ideas and suggestions are answered in words instead of opening a web search, and no tool names are spoken. 'Can you open it up?' with nothing to open gets 'Open what, sir?'; developer to-dos ('we need to give the robot more voice lines') become notes for Claude; a flat 'I've no way to check that' offers the nearest read-only action or a note. 'How long is left on that timer?' and 'what can you do?' answer instantly, 'what's new' starts with the version, and his own GPU load while thinking is called that. The server watch also reads disk errors and temperatures, the UPS on-battery status and stopped server apps, read-only with fixed commands. Audio heard while the PC plays media, with an unsure voice, no longer keeps the follow-up window open. YouTube on a named monitor no longer searches for the monitor words.
 - v3.0.5 (2026-10-28): 'Pass it over to Claude' and the RAM answer, from this afternoon's live log. At 15:58 'No, just pass over to Clog for me' was misheard and matched nothing, so a browser robot searched the web for 'Clog' for 47 seconds. The hand-off now needs no 'it', allows 'for me', 'please' or 'now' at the end, and accepts the speech-to-text's own mishearings of Claude (clog, claw, clawed, claud) only inside the hand-off phrase, so nozzle clogs and 'send it to the cloud' keep their meaning. Questions about a hand-off ('what did you send to Claude?') are no longer taken as one, and a bare hand-off that still reaches the browser robot gets a quick question instead of a web search. 'Why is the RAM so high?' no longer answers 'All systems nominal' at 92 percent: an asked-for system report opens with the reading that is out of line and names the biggest memory users (for example: my local brain model at 8 gigabytes, Claude at 6.5 and Chrome at 4.5); JARVIS's own GPU use is not reported as a problem, and the PC check names the memory users too.
 - v3.0.4 (2026-10-28): Morning greeting and printer speech, from today's live log. The morning greeting no longer opens with the Amazon tracker's sign-in command ('Good morning, sir. I need a Google sign-in first, sir. Run python -m ...'); every arrival since 10-13 had. With the mailbox unreadable it says nothing about orders, and any briefing section that reads like setup instructions is left out. The print heads-up no longer says 'past UNKNOWN prints around this size have failed 33% of the time': with neither the material nor the size known there is no heads-up, and materials are said properly ('PLA plus', 'of about 220 layers'). A print failure or a low credit balance is said alone, without 'CPU 38 percent ... 12 windows open' behind it.
 - v3.0.3 (2026-10-28): Smarter and lighter, every change measured on 6 brain-test seeds against v3.0.2. Garbled words ('Enough and awesome') get 'Sorry, sir, I missed that - what would you like?' instead of opening an app (0/6 -> 6/6). 'Is it time to watch <show> yet' / 'is <show> out yet' searches for the release date even when the title has a word like 'Vision' (3/6 -> 6/6). 'Skip this one' plays the next song (0/6 -> 6/6). Overall golden accuracy 92.9% -> 94.4%, unverified claims 1 -> 0, invented actions 9 -> 7. After a screen read, a made-up 'it dropped early' follow-on sentence is dropped along with the claim it continues. Idle CPU: the face detector ran four full passes on every camera frame even with nobody in the room (about 3.5 CPU cores); after 15 s without a face it now checks once a second, and the first face brings back full speed.
@@ -61,6 +58,5 @@ Open, planned and idea items. Wording is generic on purpose.
 - v2.0.231 (2026-10-26): Fixes from tonight's live log: habit offers no longer announce a wrong time ('Around this time on Mondays, sir' instead of 'It's Monday 7 PM' at 8 PM); 'play X on YouTube on the left monitor' plays it and moves it there instead of opening a search page; 'play my song from earlier / play that again' replays your last music or video request instead of searching for a song called 'Earlier'; 'tell Claude to ...', '..., or tell Claude to do it' and 'pass it over to Claude' save a note for Claude instead of 'I can't' and a web search.
 - v2.0.230 (2026-10-20): JARVIS knows he is one copy that moves between your machines. On the desktop right after a day on the Dell he said 'I've never quite made myself at home in the Dell, sir' and then 'a bit of a squeeze in this laptop': his prompt said 'there may be other versions of you running in other rooms' and never named the machine. With a handoff partner he is now told he is ONE JARVIS, which machine he is running on (new machine-local MACHINE_NAME: desktop / Dell laptop), and that 'On the Dell laptop' memories are his own time there.
 - v2.0.229 (2026-10-20): Test-only fix for GitHub CI: v2.0.228's new two-hand test imported a module it never used, which the pyflakes lint step rejects (the local suite does not run pyflakes). No change to JARVIS itself.
-- v2.0.228 (2026-10-20): The webcam hand mouse catches up with the Kinect one: a steady frame pump feeds the hand tracker at the camera's own rate (it was getting clumps between ~6 fps face-detection passes - the lag), the on-screen reticle, fist-drag scrolling, a two-fist grab that moves / resizes the window under your hands (HAND_TWO_HAND_ENABLED, off by default), and no false triggers: minimum tracker score and hand size, a settle time for a new hand, poses confirmed over several frames, no engage right after you type or move the mouse, the cursor locked to your hand. The HUD camera preview runs ~15 fps while the tracker runs and the HUD reads it every 33 ms.
 
 Full history: [RELEASE_HISTORY.md](RELEASE_HISTORY.md).

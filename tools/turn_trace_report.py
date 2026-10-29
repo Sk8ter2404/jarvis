@@ -23,6 +23,11 @@ parts) and prints:
     With --logs the same lines are also counted in that day's session logs
     (``session_<day>_*.log``) as a cross-check; a tag with no line anywhere
     prints 0 (its item may not be in this build yet).
+  * W09's "(ambient fragment)" lines on a row of their own (3.0.6): the
+    ambient-learn path prints them for room / TV audio, not for an owner
+    turn (103 of 116 W09 log lines on 2026-10-28), so they are kept out of
+    the per-turn W09 figure in both the trace and the log counts. Trace
+    records written before 3.0.6 still have them inside learn-prefilter.
 
 READ-ONLY and NUMBERS ONLY: nothing is written and neither the owner's words
 nor any reply text is ever printed (the 2026-09-06 PII near-miss rule that
@@ -48,6 +53,8 @@ STAGES = ("stt", "llm", "actions", "first_play", "audible", "end")
 SHADOW_TAGS = ("head-hold", "learn-prefilter", "action-fit", "loop-guard")
 SHADOW_LABEL = {"head-hold": "W02", "learn-prefilter": "W09",
                 "action-fit": "W11", "loop-guard": "W21"}
+# core.turn_trace.AMBIENT_SHADOW_KEY (kept literal: this tool is stdlib only).
+AMBIENT_KEY = "learn-prefilter-ambient"
 _DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _LOG_LINE = re.compile(r"^\s*(?:\[\d\d:\d\d:\d\d\]\s*)?\[([a-z0-9_-]+)\]\s?(.*)")
 
@@ -102,8 +109,11 @@ def load_day(directory: str, day: str) -> list:
 
 def log_shadow_counts(log_dir: str, day: str) -> dict:
     """{tag: lines} of "would" lines for the four shadow tags in that day's
-    session logs. Counted only; no text is kept."""
+    session logs, with W09's ambient-fragment lines under AMBIENT_KEY (the
+    same split core.turn_trace.observe makes). Counted only; no text is
+    kept."""
     counts = {t: 0 for t in SHADOW_TAGS}
+    counts[AMBIENT_KEY] = 0
     for path in glob.glob(os.path.join(log_dir, f"session_{day}_*.log")):
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
@@ -111,8 +121,11 @@ def log_shadow_counts(log_dir: str, day: str) -> dict:
                     if "would" not in line:
                         continue
                     m = _LOG_LINE.match(line)
-                    if m and m.group(1) in counts and "would" in m.group(2):
-                        counts[m.group(1)] += 1
+                    if m and m.group(1) in SHADOW_TAGS and "would" in m.group(2):
+                        tag = m.group(1)
+                        if tag == "learn-prefilter" and "ambient fragment" in m.group(2):
+                            tag = AMBIENT_KEY
+                        counts[tag] += 1
         except OSError:
             continue
     return counts
@@ -124,7 +137,8 @@ def summarize(recs: list, kind=None) -> dict:
         recs = [r for r in recs if r.get("kind") == kind]
     out = {"turns": len(recs), "by_channel": {}, "by_kind": {},
            "by_outcome": {}, "latency": {}, "pe_state": {}, "actions": {},
-           "cuts": {}, "validators": {}, "shadow": {t: 0 for t in SHADOW_TAGS},
+           "cuts": {}, "validators": {},
+           "shadow": dict({t: 0 for t in SHADOW_TAGS}, **{AMBIENT_KEY: 0}),
            "rounds": 0}
 
     def bump(d, k, n=1):
@@ -228,6 +242,9 @@ def render(day: str, s: dict, log_counts=None) -> str:
         if log_counts is not None:
             extra = f" / {log_counts.get(tag, 0)}"
         L.append(f"    {SHADOW_LABEL[tag]} [{tag}]: {n}{extra}")
+    n = s["shadow"].get(AMBIENT_KEY, 0)
+    extra = f" / {log_counts.get(AMBIENT_KEY, 0)}" if log_counts is not None else ""
+    L.append(f"    W09 ambient fragments (no owner turn): {n}{extra}")
     return "\n".join(L) + "\n"
 
 

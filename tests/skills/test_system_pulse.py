@@ -1744,9 +1744,15 @@ class PulseAskedAtHighRamTests(unittest.TestCase):
     LIVE_USERS = ("The biggest memory users are my local brain model at 8 "
                   "gigabytes, Claude at 6.5 and Chrome at 4.5.")
 
+    # What the per-process GPU reading (nvidia-smi pmon) returns on an
+    # asked-for pulse: None = unavailable. OURS = only the local model server.
+    OURS = [("llama-server.exe", 4242, 90, 0)]
+    GAME = [("fortniteclient-win64-shipping.exe", 9001, 95, 0)]
+
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("system_pulse")
         self.reads = 0
+        self.gpu_rows = None
 
     def _ask(self, pulse, said="", procs=None, arg=""):
         rows = _live_procs_1559(os.getpid()) if procs is None else procs
@@ -1760,7 +1766,8 @@ class PulseAskedAtHighRamTests(unittest.TestCase):
         with mock.patch.object(self.mod, "_turn_words", return_value=said), \
              mock.patch.object(self.mod, "_read_process_memory",
                                side_effect=_read), \
-             mock.patch.object(self.mod, "_gather_pulse",
+             mock.patch.object(self.mod, "_gpu_busy_processes",
+                               side_effect=lambda: self.gpu_rows),              mock.patch.object(self.mod, "_gather_pulse",
                                side_effect=AssertionError("cache is fresh")):
             return self.actions["system_pulse"](arg)
 
@@ -1872,14 +1879,115 @@ class PulseAskedAtHighRamTests(unittest.TestCase):
                 (dict(cpu_pct=22.0, ram_pct=71.0, gpu_temp_c=90.0,
                       disk_free_gb=300.0, active_apps=9), "status report")):
             with self.subTest(pulse=pulse, said=said):
-                out = self._ask(pulse, said)
+                # v3.0.6: the premise (his own model is busy) is now checked,
+                # and the reading is said as his own instead of unexplained.
+                # Review F4: only when the per-process reading agrees.
+                self.gpu_rows = self.OURS
+                with mock.patch.object(self.mod, "_own_inference_recent",
+                                       return_value=True):
+                    out = self._ask(pulse, said)
                 self.assertNotIn("GPU pinned", out)
                 self.assertNotIn("rather hot", out)
-                self.assertTrue(out.startswith("All systems nominal, sir."),
-                                out)
+                self.assertTrue(out.startswith("All systems nominal, sir.")
+                                or out.startswith("Memory at"), out)
                 if "gpu_util_pct" in pulse:
-                    self.assertIn("GPU working hard at 99 percent", out)
+                    self.assertIn("The GPU's busy at 99 percent - that's me "
+                                  "thinking.", out)
+                    self.assertNotIn("working hard", out)
+                else:
+                    self.assertIn("that's me thinking", out)
                 self.assertTrue(out.endswith("Anything further?"), out)
+
+    # ── v3.0.6: the GPU on an asked-for pulse (live 2026-10-28 17:54:26) ──
+    LIVE_1754_QUESTION = "Jarvis, how's the computer doing?"
+    LIVE_1754_PULSE = {"cpu_pct": 28.0, "cpu_temp_c": 65.0, "ram_pct": 73.0,
+                       "gpu_util_pct": 97.0, "disk_free_gb": 500.0,
+                       "active_apps": 8}
+    LIVE_1754_OLD = ("All systems nominal, sir. CPU 28 percent at 65 degrees, "
+                     "memory 73 percent, GPU working hard at 97 percent, 8 "
+                     "windows open.")
+
+    def _ask_own(self, own, pulse=None, said=None):
+        if own:
+            self.gpu_rows = self.OURS
+        with mock.patch.object(self.mod, "_own_inference_recent",
+                               return_value=own):
+            return self._ask(pulse or self.LIVE_1754_PULSE,
+                             self.LIVE_1754_QUESTION if said is None else said)
+
+    def test_live_1754_old_line_is_the_fixture(self):
+        self.assertTrue(self.mod._format_report(dict(self.LIVE_1754_PULSE))
+                        .startswith(self.LIVE_1754_OLD))
+
+    def test_own_inference_gpu_is_me_thinking(self):
+        out = self._ask_own(True)
+        self.assertEqual(
+            out, "All systems nominal, sir. CPU 28 percent at 65 degrees, "
+                 "memory 73 percent, 8 windows open. The GPU's busy at 97 "
+                 "percent - that's me thinking. Anything further?")
+        self.assertEqual(out.count("97 percent"), 1)
+
+    def test_review_f4_a_game_on_the_gpu_is_not_me_thinking(self):
+        # The local brain's POST ended moments ago, so recency is True on the
+        # voice turn - but pmon shows Fortnite on the card. No cause is
+        # claimed (the 3.0.5/3.0.6 exception lead, not "that's me thinking").
+        for rows, label in ((self.GAME, "game"),
+                            (self.GAME + self.OURS, "game + model"),
+                            (None, "no reading"), ([], "nobody busy")):
+            with self.subTest(rows=label):
+                self.gpu_rows = rows
+                with mock.patch.object(self.mod, "_own_inference_recent",
+                                       return_value=True):
+                    out = self._ask(self.LIVE_1754_PULSE,
+                                    self.LIVE_1754_QUESTION)
+                self.assertNotIn("me thinking", out)
+                self.assertTrue(out.startswith(
+                    "All nominal apart from the GPU, sir: it's working hard "
+                    "at 97 percent."), out)
+
+    def test_review_f4_own_pid_alone_counts_as_ours(self):
+        import os as _os
+        self.gpu_rows = [("python.exe", _os.getpid(), 80, 0)]
+        with mock.patch.object(self.mod, "_own_inference_recent",
+                               return_value=True):
+            out = self._ask(self.LIVE_1754_PULSE, self.LIVE_1754_QUESTION)
+        self.assertIn("that's me thinking", out)
+
+    def test_review_f4_model_server_busy_but_not_recent_is_not_mine(self):
+        # Another client of the shared model server (10-01): not JARVIS.
+        self.gpu_rows = self.OURS
+        with mock.patch.object(self.mod, "_own_inference_recent",
+                               return_value=False):
+            out = self._ask(self.LIVE_1754_PULSE, self.LIVE_1754_QUESTION)
+        self.assertNotIn("me thinking", out)
+
+    def test_someone_elses_gpu_is_not_nominal(self):
+        out = self._ask_own(False)
+        self.assertEqual(
+            out, "All nominal apart from the GPU, sir: it's working hard at 97 "
+                 "percent. CPU 28 percent at 65 degrees, memory 73 percent, 8 "
+                 "windows open. Anything further?")
+        self.assertNotIn("All systems nominal", out)
+        self.assertNotIn("pinned", out)
+
+    def test_another_abnormal_reading_still_leads_over_the_gpu(self):
+        out = self._ask_own(False, dict(self.LIVE_1754_PULSE, cpu_pct=97.0),
+                            "status report")
+        self.assertTrue(out.startswith("Slight problem, sir — CPU at 97"), out)
+        self.assertIn("GPU working hard at 97 percent", out)
+
+    def test_flag_off_is_the_305_wording(self):
+        with mock.patch("core.config.SYSTEM_PULSE_GPU_EXPLAINED", False,
+                        create=True):
+            for own in (True, False):
+                with self.subTest(own=own):
+                    self.assertTrue(self._ask_own(own).startswith(
+                        self.LIVE_1754_OLD))
+
+    def test_a_quiet_gpu_is_unchanged(self):
+        out = self._ask_own(True, dict(self.LIVE_1754_PULSE, gpu_util_pct=56.0))
+        self.assertIn("GPU running at 56 percent", out)
+        self.assertNotIn("me thinking", out)
 
     def test_the_proactive_line_is_unchanged_and_reads_no_processes(self):
         key, lead = self.mod._abnormal_reasons(self.LIVE_PULSE)[0]

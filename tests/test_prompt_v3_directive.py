@@ -122,6 +122,9 @@ class SwapTableTests(unittest.TestCase):
     def test_intent_tag_lines(self):
         v3 = self._v3_base()
         self.assertIn("only when sir announces a risky choice", v3)
+        # Reviewed 2026-10-28: the replacement snark line carried no rule.
+        self.assertIn("'One does admire the optimism, sir.' on the same "
+                      "terms: only for a plainly over-hopeful plan", v3)
         self.assertIn("Use ONLY the ten words above", v3)
         self.assertNotIn("Unrecognised tags also fall back", v3)
 

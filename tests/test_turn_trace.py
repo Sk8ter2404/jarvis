@@ -129,6 +129,37 @@ class SchemaTests(_Base):
         tt.begin()
         self.assertNotIn("shadow", tt.commit(LINE, "ok"))
 
+    def test_an_abandoned_collector_keeps_its_shadow_lines(self):
+        # Live 2026-10-28 15:55: the "would skip (command)" line carried into
+        # the 15:55:10 VAD break; that break was dropped as noise (no emit),
+        # and the 15:55:17 VAD break wiped it before the 15:55:21 record.
+        # bobert_companion._turn_trace_hook calls begin() on EVERY
+        # begin_voice (each VAD break) and commit() only on an emit.
+        tt.observe("  [learn-prefilter] would skip (command)")
+        tt.begin()                                   # 15:55:10, dropped as noise
+        tt.observe("  [head-hold] would drop sentence 1/2 (1 word(s)) written")
+        tt.begin()                                   # 15:55:17, no commit between
+        rec = tt.commit(LINE, "ok")                  # 15:55:21
+        self.assertEqual(rec["shadow"], {"learn-prefilter": 1, "head-hold": 1})
+        tt.begin()
+        self.assertNotIn("shadow", tt.commit(LINE, "ok"))   # counted once only
+
+    def test_ambient_fragment_lines_are_counted_apart(self):
+        tt.observe("  [learn-prefilter] would skip (ambient fragment)")
+        tt.begin()
+        tt.observe("  [learn-prefilter] would skip (ambient fragment)")
+        tt.observe("  [learn-prefilter] would skip (thanks)")
+        rec = tt.commit(LINE, "ok")
+        self.assertEqual(rec["shadow"], {"learn-prefilter": 1,
+                                         tt.AMBIENT_SHADOW_KEY: 2})
+        s = rep.summarize([rec])
+        self.assertEqual(s["shadow"]["learn-prefilter"], 1)
+        out = rep.render("2026-10-28", s, {"learn-prefilter": 13,
+                                           rep.AMBIENT_KEY: 103})
+        self.assertIn("W09 [learn-prefilter]: 1 / 13", out)
+        self.assertIn("W09 ambient fragments (no owner turn): 2 / 103", out)
+        self.assertEqual(rep.AMBIENT_KEY, tt.AMBIENT_SHADOW_KEY)
+
     def test_observe_keeps_only_the_tag(self):
         tt.begin()
         tt.observe("  [action-fit] would swap open_app -> open_url for 'secret words'")
@@ -429,6 +460,8 @@ class ReportTests(unittest.TestCase):
             fh.write("[08:00:01]   [head-hold] would drop sentence 1/2\n"
                      "[08:00:02]   [head-hold] not speaking sentence 1/2\n"
                      "[08:00:03]   [learn-prefilter] would skip (command)\n"
+                     "[08:00:03]   [learn-prefilter] would skip (ambient fragment)\n"
+                     "[08:00:03]   [learn-prefilter] would skip (ambient fragment)\n"
                      "[08:00:04]   [loop-guard] would stop (ping-pong a/b)\n"
                      "[08:00:05]   [stt] would be nice\n")
         with open(os.path.join(logs, "session_2026-10-26_08-00-00.log"), "w",
@@ -436,7 +469,8 @@ class ReportTests(unittest.TestCase):
             fh.write("[08:00:01]   [head-hold] would drop sentence 1/2\n")
         c = rep.log_shadow_counts(logs, "2026-10-27")
         self.assertEqual(c, {"head-hold": 1, "learn-prefilter": 1,
-                             "action-fit": 0, "loop-guard": 1})
+                             "action-fit": 0, "loop-guard": 1,
+                             "learn-prefilter-ambient": 2})
         out = rep.render("2026-10-27", rep.summarize([]), c)
         self.assertIn("W02 [head-hold]: 0 / 1", out)
         self.assertIn("W11 [action-fit]: 0 / 0", out)

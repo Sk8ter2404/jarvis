@@ -2502,7 +2502,10 @@ class ReadChangelogTests(unittest.TestCase):
             bc._llm_quick.return_value = "  Added voice cloning and fixed bugs.  "
             with _patch_bc(bc):
                 out = A._act_read_changelog()
-        self.assertEqual(out, "Added voice cloning and fixed bugs.")
+        # A bare Mock's _speak does not return True, so the version line was
+        # NOT voiced early and leads the reply instead.
+        self.assertEqual(out, "I'm on version 1.2.0, sir. "
+                              "Added voice cloning and fixed bugs.")
         # Default: single entry -> 'entry' singular in the system prompt.
         sys_prompt = bc._llm_quick.call_args[0][0]
         self.assertIn("CHANGELOG.md entry", sys_prompt)
@@ -2521,7 +2524,7 @@ class ReadChangelogTests(unittest.TestCase):
             bc._llm_quick.return_value = "Version 3 is out."
             with _patch_bc(bc):
                 out = A._act_read_changelog()
-        self.assertEqual(out, "Version 3 is out.")
+        self.assertEqual(out, "I'm on version 3.0.0, sir. Version 3 is out.")
         user = bc._llm_quick.call_args[0][1]
         self.assertIn("## v3.0.0", user)
         self.assertNotIn("v1.0.17", user)
@@ -2536,7 +2539,7 @@ class ReadChangelogTests(unittest.TestCase):
             bc._llm_quick.return_value = "recent summary"
             with _patch_bc(bc):
                 out = A._act_read_changelog("what changed lately")
-        self.assertEqual(out, "recent summary")
+        self.assertEqual(out, "I'm on version 3, sir. recent summary")
         sys_prompt = bc._llm_quick.call_args[0][0]
         self.assertIn("entries", sys_prompt)  # plural
         user = bc._llm_quick.call_args[0][1]
@@ -2624,6 +2627,90 @@ class ReadChangelogTests(unittest.TestCase):
                 out = A._act_read_changelog()
         self.assertIn("the full", out)
         self.assertIn("changelog is at", out)
+
+
+class WhatsNewVersionFirstTests(unittest.TestCase):
+    """Live 2026-10-28 17:58 "Jarvis, what's new with you?": no version, the
+    v3.0.4 fixes told as features ("I have updated the system to include
+    morning greetings and printer status updates, sir"), first_play 8253 ms
+    because the summariser ran before anything was said."""
+
+    _HISTORY = (
+        "# Release history\n\nEvery tagged release, newest first.\n\n"
+        "## v3.0.5 (2026-10-28)\n\n'Pass it over to Claude' and the RAM "
+        "answer, from this afternoon's live log. 'Why is the RAM so high?' "
+        "no longer answers 'All systems nominal' at 92 percent.\n\n"
+        "## v3.0.4 (2026-10-28)\n\nMorning greeting and printer speech. The "
+        "morning greeting no longer opens with the Amazon tracker's sign-in "
+        "command.\n")
+
+    def _run(self, td, speak_result=True, flag=True):
+        os.makedirs(os.path.join(td, "docs"))
+        with open(os.path.join(td, "docs", "RELEASE_HISTORY.md"), "w",
+                  encoding="utf-8") as f:
+            f.write(self._HISTORY)
+        bc = _base_bc(td)
+        spoke = __import__("threading").Event()
+        seen = {}
+
+        def _speak(line):
+            seen.setdefault("spoken", []).append(line)
+            spoke.set()
+            return speak_result
+
+        def _llm(system, user, **kw):
+            # Waits (bounded) for the version line: on the old order - the
+            # summary first, speech only after the action - it is never set.
+            seen["version_said_first"] = spoke.wait(timeout=2.0)
+            seen["system"] = system
+            return "The RAM question no longer answers 'all systems nominal'."
+
+        bc._speak.side_effect = _speak
+        bc._llm_quick.side_effect = _llm
+        with _patch_bc(bc), \
+                mock.patch("core.config.WHATS_NEW_VERSION_FIRST", flag,
+                           create=True):
+            out = A._act_read_changelog()
+        return out, seen
+
+    def test_version_line_voiced_while_the_summary_is_written(self):
+        with tempfile.TemporaryDirectory() as td:
+            out, seen = self._run(td)
+        self.assertEqual(seen["spoken"], ["I'm on version 3.0.5, sir."])
+        self.assertTrue(seen["version_said_first"])
+        # Voiced already, so the reply is the summary alone (no repeat).
+        self.assertEqual(out, "The RAM question no longer answers "
+                              "'all systems nominal'.")
+
+    def test_fixes_are_said_as_fixes(self):
+        with tempfile.TemporaryDirectory() as td:
+            _, seen = self._run(td)
+        self.assertIn("FIXES", seen["system"])
+        self.assertIn("never describe a fix as a new feature", seen["system"])
+        self.assertIn("do not repeat it", seen["system"])
+        self.assertNotIn("Call out new capabilities by name", seen["system"])
+
+    def test_muted_speech_keeps_the_version_in_the_reply(self):
+        with tempfile.TemporaryDirectory() as td:
+            out, seen = self._run(td, speak_result=None)
+        self.assertTrue(out.startswith("I'm on version 3.0.5, sir. "), out)
+
+    def test_flag_off_speaks_nothing_early(self):
+        with tempfile.TemporaryDirectory() as td:
+            out, seen = self._run(td, flag=False)
+        self.assertNotIn("spoken", seen)
+        self.assertTrue(out.startswith("I'm on version 3.0.5, sir. "), out)
+
+    def test_version_line_helpers(self):
+        self.assertEqual(A._changelog_version_line(self._HISTORY),
+                         "I'm on version 3.0.5, sir.")
+        self.assertEqual(A._changelog_version_line("## v1.0.17 — 2026-05-30"),
+                         "I'm on version 1.0.17, sir.")
+        self.assertEqual(A._changelog_version_line("no headers"), "")
+        self.assertEqual(A._changelog_version_line(None), "")
+        self.assertEqual(A._with_version_line("", "body", False), "body")
+        self.assertEqual(A._with_version_line("V.", "body", True), "body")
+        self.assertEqual(A._with_version_line("V.", "body", False), "V. body")
 
 
 # ===========================================================================

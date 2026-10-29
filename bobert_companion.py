@@ -17878,6 +17878,7 @@ _TURN_FLAG_KEYS = (
     "AGENT_DESK_ENABLED", "AGENT_DESK_ANNOUNCE",
     "TURN_TRACE",
     "LOOP_GUARD_MODE",
+    "CHAIN_PROMISE_CHECK",
 )
 
 
@@ -22933,6 +22934,10 @@ _LOCAL_NEVER_GUESS_GUARD = (
     "sees now (the recognised name, or that no one is in frame).\n"
     "\"What's my name\" is NOT a camera look: no action — say the name you\n"
     "know, or that you don't know it. Never guess a name.\n"
+    # v3.0.6: live 2026-10-28 ~18:00 "how's the master sheet looking?" ran
+    # project_status ("no project list"). No action reads that sheet.
+    "The master sheet: no action reads it - say \"I can't read the master\n"
+    "sheet yet, sir.\" Never project_status for it.\n"
 )
 
 
@@ -23075,11 +23080,14 @@ def _local_cheatsheet() -> str:
 #     rest of the reply is. The prompt's adjacent-fact rule says the same.
 OFFER_TTL_S = 600.0
 _last_web_search_at: list = [0.0]       # time.time() of the last web_search
+# v3.0.6: live 2026-10-28 17:53 ("what's a good quick dinner idea?") the
+# spoken reply said "see_screen" aloud - this guard named the action in the
+# words it asked for. The offer is now in plain words.
 _SEARCH_GUARD_OPEN = (
     "IMPORTANT: a web search was just fired but the results have "
     "not been read. Do NOT fabricate or claim source attributions. "
     "Acknowledge the search was opened in the browser and offer to "
-    "read the results via see_screen.\n\n"
+    "read the results to him (never say an action name aloud).\n\n"
 )
 _SEARCH_GUARD_CLOSED = (
     "IMPORTANT: a web search ran earlier but its results were never read. "
@@ -37844,6 +37852,13 @@ def _should_refuse_background_audio(text: str) -> "tuple[bool, str]":
     try:
         # Taken by whichever mic turn comes first, wake-prefixed or not.
         _greet_reply = _standby_greet_admit_take()
+        # A new decision: an earlier turn's window extension can no longer
+        # be taken back by the media gate (3.0.6, _followup_media_take_back).
+        # Its own try: a window without the method never changes the verdict.
+        try:
+            _followup_window.forget_admit()
+        except Exception:
+            pass
         # The decision itself is _bg_refuse_rule (the one copy, which the R6
         # Parakeet rescue and shadow judge also ask); the side effects —
         # admit() extending the follow-up window, note_addressed() opening
@@ -38233,9 +38248,30 @@ def _media_voice_gate(text: str, injected: bool = False) -> bool:
         if line:
             print(f"  {line} ({meter}, voice {float(score or 0.0):.2f}{how}, "
                   f"{len(text or '')} chars)")
+        _followup_media_take_back(voice)
         return bool(drop)
     except Exception:
         return False
+
+
+def _followup_media_take_back(voice: str) -> None:
+    """FOLLOWUP_MEDIA_NO_EXTEND (3.0.6): a turn the follow-up window admitted
+    while the PC played audio, in a voice not confirmed as the owner's, does
+    not extend the window (core.media_gate.keeps_followup_extension). Live
+    2026-10-28 17:28: a "Yeah." over the YouTube video he had just started
+    (voice 0.64, unsure) extended it, and the video's own narration 18 s
+    later (0.68) was admitted and ran session_memory_recall. A wake-led turn
+    has nothing to take back (note_addressed). Numbers only. Never raises."""
+    try:
+        if not globals().get("FOLLOWUP_MEDIA_NO_EXTEND", True):
+            return
+        if _media_gate.keeps_followup_extension(True, voice):
+            return
+        if _followup_window.take_back_admit():
+            print("  [follow-up] window not extended: PC audio playing and "
+                  f"the voice is not confirmed ({voice})")
+    except Exception:
+        pass
 
 
 # A dropped turn that was addressed to JARVIS gets one short spoken cue, at
@@ -43126,6 +43162,104 @@ _CUT_REPEATED_FAILURE = "repeating failure"
 # repeated failure, the round that tripped it was never read back, so the
 # close-out is spoken even when an earlier round said something.
 _CUT_PING_PONG = "ping-pong"
+# The chain stopped on its own words: the last follow-up ran nothing and said
+# only progress or promises. Live 10-27 20:40:51 / 20:41:23, 10-28 15:59:05 /
+# 17:27:40: the label was set on any last round that ran no action, so plain
+# spoken answers ("can't find any mention ... on your screens") were filed as
+# promises. With CHAIN_PROMISE_CHECK on (v3.0.6) the label needs the words to
+# be a promise (_chain_ended_on_promise), and since that promise was never
+# kept the close-out is spoken even after an earlier round said something.
+_CUT_ENDED_ON_PROMISE = "ended on a promise"
+# The chain's last follow-up ran nothing and said only a courtesy or an
+# open-ended pledge ("Very good, sir.", "I'll leave it open for you, sir.") -
+# no result owed. The close-out speaks only when nothing of substance was said
+# this turn (the pre-v3.0.6 rule), never over a real answer. Live 2026-10-28
+# review: "Very good, sir." after an answer drew "I'm afraid I couldn't get a
+# proper answer".
+_CUT_ENDED_ON_COURTESY = "ended on a courtesy"
+
+
+def _chain_promise_check_on() -> bool:
+    """CHAIN_PROMISE_CHECK as a bool (default True). Never raises."""
+    try:
+        return bool(globals().get("CHAIN_PROMISE_CHECK", True))
+    except Exception:
+        return True
+
+
+# A promise of a RESULT or a further look-up step - the only kind a chain's
+# last word can leave hanging. Live 2026-10-28 review: "Very good, sir.",
+# "I'll leave it open for you, sir." and "I'll keep an eye out for newer
+# benchmarks, sir." closed a chain that had ALREADY answered, were all filed as
+# "ended on a promise" (claim_validator.is_progress_only is True for pure
+# courtesies) and drew "I'm afraid I couldn't get a proper answer ..." over a
+# good answer. Courtesies and open-ended pledges to keep watch are not owed.
+_RESULT_PROMISE_RE = re.compile(
+    r"\b(?:one\s+moment|just\s+a\s+(?:moment|second|sec|tick)|"
+    r"give\s+me\s+(?:a|one)\s+(?:moment|second|sec|minute|tick)|stand\s+by|"
+    r"bear\s+with\s+me|shortly|momentarily|"
+    r"in\s+a\s+(?:moment|second|sec|minute|jiffy|tick)|"
+    r"any\s+(?:moment|second)\s+now|let\s+me(?!\s+know\b)|"
+    r"(?:i'?ll|i\s+will|i'?m\s+going\s+to)\s+(?:now\s+|just\s+|then\s+)?"
+    r"(?:have|get|bring|give\s+you|report|come\s+back|read|pull|find|check|"
+    r"look|run|work|fetch|compile|put\s+together|tell\s+you|let\s+you\s+know|"
+    r"see|try|search|open|share|send))\b")
+# "I'm running the numbers now" - claim_validator's look-up narration, unanchored.
+_RESULT_WORK_RE = re.compile(
+    r"\b" + _claim_validator._WORK_PROGRESS_RE.pattern.lstrip("^"))
+
+
+def _chain_last_prose(last_text) -> str:
+    """The last follow-up reply as spoken text: [ACTION] tokens and [tags]
+    removed, whitespace folded, lower-cased, curly apostrophes straightened.
+    Never raises."""
+    try:
+        prose = re.sub(r"\[[^\]\n]*\]", " ",
+                       _ACTION_RE.sub(" ", str(last_text or "")))
+        return " ".join(prose.split()).lower().replace("’", "'")
+    except Exception:
+        return ""
+
+
+def _says_nothing_more(prose) -> bool:
+    """True when ``prose`` is progress / acknowledgement only (the pre-v3.0.6
+    "ended on a promise" test). Never raises: on a fault, False."""
+    try:
+        return not _says_something(prose)
+    except Exception:
+        return False
+
+
+def _chain_ended_on_promise(last_text) -> bool:
+    """True when ``last_text`` (the last follow-up reply as the model wrote
+    it) says only progress or promises once its [ACTION] tokens and [tags]
+    are removed - "[intent:briefing] One moment, sir. I'll have those results
+    shortly." - AND one of them is a result or look-up step still owed
+    (_RESULT_PROMISE_RE / look-up narration). False for an answer, a refusal,
+    an offer ("... shall I read them to you?") and for a bare courtesy or
+    open-ended pledge ("Very good, sir.", "I'll leave it open for you, sir.";
+    live 2026-10-28 review). Never raises: on a fault, False (no label)."""
+    try:
+        prose = _chain_last_prose(last_text)
+        if not _says_nothing_more(prose):
+            return False
+        return bool(_RESULT_PROMISE_RE.search(prose)
+                    or _RESULT_WORK_RE.search(prose))
+    except Exception:
+        return False
+
+
+def _chain_ended_on_courtesy(last_text) -> bool:
+    """True when the last follow-up said progress or acknowledgement only but
+    owes no result ("Very good, sir.", "Enjoy, sir.", an empty reply). The
+    chain still ended on nothing, so the close-out may speak - but, unlike an
+    unkept promise, never over something real said earlier this turn.
+    Never raises."""
+    try:
+        return (_says_nothing_more(_chain_last_prose(last_text))
+                and not _chain_ended_on_promise(last_text))
+    except Exception:
+        return False
 
 
 def _loop_guard_mode() -> str:
@@ -43172,8 +43306,13 @@ def _chain_close_out_line(*, cut: str, rounds: int, spoke_substance: bool,
     try:
         if barged or not cut or rounds < 1:
             return ""
-        if spoke_substance and cut not in (_CUT_REPEATED_FAILURE,
-                                           _CUT_PING_PONG):
+        always = (_CUT_REPEATED_FAILURE, _CUT_PING_PONG)
+        if _chain_promise_check_on():
+            # v3.0.6: the label now means "the last word was an unkept
+            # promise" (_chain_ended_on_promise), so earlier substance does
+            # not excuse it.
+            always += (_CUT_ENDED_ON_PROMISE,)
+        if spoke_substance and cut not in always:
             return ""
         if any(_once_per_turn_kind(n) for n in _turn_actions_ran()):
             return _CLOSE_OUT_WEB
@@ -51534,6 +51673,44 @@ def _run_llm_dispatch(text: str, *, voice: bool = False) -> str:
         _after_reply_spoken(text, raised=_tt_outcome != "ok")
 
 
+# ── Flat-decline re-check (v3.0.6 B4; core.prompt_router.decline_recheck) ──
+# Live 2026-10-28 17:26:00 "How's the master sheet looking?" -> "I'm afraid
+# I've no way to check that, sir." and the turn dead-ended. DECLINE_RECHECK_MODE
+# 'on' (default) adds ONE question to a flat decline of the brain's first
+# reply: the nearest registered action by name, or a note for Claude - nothing
+# runs until he says yes (the open-offer slot). 'shadow' logs it only; 'off'
+# (or any other value) is the old path.
+def _decline_recheck_apply(reply, user_text):
+    """``reply`` with the decline offer appended (and the history's copy of
+    the reply updated, so a "yes" answers it), or ``reply`` unchanged.
+    Never raises."""
+    try:
+        mode = str(globals().get("DECLINE_RECHECK_MODE", "off")).strip().lower()
+        if mode not in ("shadow", "on") or not isinstance(reply, str):
+            return reply
+        # PC control off: no action could carry out a yes.
+        if not globals().get("PC_CONTROL_ENABLED", True):
+            return reply
+        from core import prompt_router as _pr
+        offer = _pr.decline_recheck(reply, user_text, list(ACTIONS))
+        if not offer:
+            return reply
+        if mode != "on":
+            print(f"  [decline-recheck] would offer: {offer!r}")
+            return reply
+        new = reply.rstrip() + " " + offer
+        for m in reversed(conversation_history):
+            if isinstance(m, dict) and m.get("role") == "assistant":
+                if m.get("content") == reply:
+                    m["content"] = new
+                break
+        print(f"  [decline-recheck] offered: {offer!r}")
+        return new
+    except Exception as _e:
+        print(f"  [decline-recheck] failed: {type(_e).__name__}")
+        return reply
+
+
 def _persona_hygiene_apply(spoken: str, user_text: str, action_ran: bool) -> str:
     """v3.0.1: unearned "A bold choice" out, repeated signature phrases
     limited, an identical reply to a different utterance logged (all in
@@ -51646,6 +51823,9 @@ def _run_llm_dispatch_body(text: str) -> str:
             reply = get_response_with_animation(text)
         finally:
             _accepted_offer[0] = ""
+        # v3.0.6 B4: a flat "no way to check that" gets an offer (the
+        # nearest action by name, or a note for Claude). _decline_recheck_apply.
+        reply = _decline_recheck_apply(reply, text)
     print(f"  JARVIS: {reply}")
     if _offer_yes and not _ACTION_RE.search(str(reply or "")):
         print("  [offer-yes] the reply to the accepted offer named no action")
@@ -52003,10 +52183,17 @@ def _run_llm_dispatch_body(text: str) -> str:
     # A chain can also stop on its own words (2026-10-02 review repair): the
     # last follow-up ran nothing and said only "I'm running the numbers now,
     # sir; I'll have those results for you in a moment." No guard fired, so
-    # nothing followed. _chain_close_out_line still speaks only when NOTHING
-    # of substance was said this turn.
+    # nothing followed. With CHAIN_PROMISE_CHECK off, _chain_close_out_line
+    # speaks only when NOTHING of substance was said this turn. With it on
+    # (v3.0.6) the label needs the last follow-up's words to be a promise -
+    # live 10-27/10-28 it was set on plain spoken answers - and the close-out
+    # then speaks even after earlier substance.
     if not _chain_cut and _followup_rounds and _last_round_ran is False:
-        _chain_cut = "ended on a promise"
+        if (not _chain_promise_check_on()
+                or _chain_ended_on_promise(_chain_texts[-1])):
+            _chain_cut = _CUT_ENDED_ON_PROMISE
+        elif _chain_ended_on_courtesy(_chain_texts[-1]):
+            _chain_cut = _CUT_ENDED_ON_COURTESY
     # Honest close-out (NEW #6, 2026-10-01): a chain that stops while the
     # owner has heard nothing but "On it, sir" and promises must not end in
     # silence - see _chain_close_out_line.

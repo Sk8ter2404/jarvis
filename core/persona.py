@@ -49,7 +49,11 @@ JARVIS_SIGNATURE_PHRASES: list[str] = [
     "Indeed, sir.",
     "Slight problem, sir...",
     "Rather concerning, sir.",
-    "I'll note that for posterity, sir.",
+    # Was "I'll note that for posterity, sir." - a promise of work no action
+    # does, spoken live 2026-10-28 15:57:47 as a lead-in and nothing was
+    # noted (v3.0.6). Same slot, so the count and order hold; this one
+    # claims nothing.
+    "One does admire the optimism, sir.",
     "A bold choice, if I may say so, sir.",
 ]
 

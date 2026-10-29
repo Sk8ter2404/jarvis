@@ -95,10 +95,67 @@ class RepeatAndBudgetTests(unittest.TestCase):
         self.assertEqual(hit[0], 4)
         self.assertTrue(hit[1].startswith("poll budget"))
 
+    def test_looks_between_screen_changing_steps_are_not_a_poll_stream(self):
+        # Investigation 2026-10-28 (W21 latent bug): look, click, look,
+        # click, look, click, look was cut at the fourth look in 'on'.
+        chain = [("see_screen", ""), ("click", "Next"), ("see_screen", ""),
+                 ("click", "Next"), ("see_screen", ""), ("scroll", "down"),
+                 ("see_screen", ""), ("type_text", "abc"), ("see_screen", "")]
+        self.assertIsNone(_run(chain))
+        # The same as screen_read_refusal says for the same calls.
+        for i in range(1, len(chain) + 1):
+            self.assertEqual(loop_guard.screen_read_refusal(chain[i - 1][0],
+                                                            chain[:i - 1]), "")
+
+    def test_listing_windows_does_not_reset_the_look_count(self):
+        hit = _run([("see_screen", "a"), ("list_windows", ""),
+                    ("read_screen", "b"), ("list_windows", "x"),
+                    ("local_describe_screen", "c"), ("see_screen", "d")])
+        self.assertEqual(hit[0], 6)
+        self.assertEqual(hit[1], "poll budget see_screen x4")
+
     def test_three_screen_looks_are_fine(self):
         self.assertIsNone(_run([("see_screen", "a"), ("get_time", ""),
                                 ("see_screen", "b"), ("now_playing", ""),
                                 ("see_screen", "c")]))
+
+    def test_waiting_or_locating_between_looks_is_still_a_poll_stream(self):
+        # Review 2026-10-28: wait / find_on_screen / move_mouse change
+        # nothing on the screen, so they must not start a fresh look count
+        # (the reset fired on ANY non-look call and hid this loop).
+        for neutral in ("wait", "find_on_screen", "move_mouse"):
+            with self.subTest(neutral=neutral):
+                hit = _run([("see_screen", ""), (neutral, "2")] * 6)
+                self.assertEqual(hit, (5, "repeat see_screen x3"))
+        hit = _run([("see_screen", "a"), ("wait", "2"), ("see_screen", "b"),
+                    ("wait", "2"), ("see_screen", "c"), ("wait", "2"),
+                    ("see_screen", "d")])
+        self.assertEqual(hit, (7, "poll budget see_screen x4"))
+
+    def test_the_1019_search_and_look_alternation_is_still_caught(self):
+        # An unrelated action (web_search with a new query each time) is
+        # not a change to the screen being looked at. Live 2026-10-19: the
+        # alternation went on for six rounds.
+        chain = []
+        for q in ("vision quest trailer", "best pizza near me",
+                  "weather tomorrow chicago", "news today", "movie times",
+                  "lunch ideas"):
+            chain += [("web_search", q), ("see_screen", "")]
+        hit = _run(chain)
+        self.assertEqual(hit, (6, "repeat see_screen x3"))
+
+    def test_only_screen_driving_steps_reset_the_look_count(self):
+        for step in ("click", "double_click", "right_click", "type",
+                     "press_key", "hotkey", "scroll_down", "drag",
+                     "open_url", "open_app", "launch_app",
+                     "local_click_target_by_description"):
+            with self.subTest(step=step):
+                self.assertTrue(loop_guard._drives_screen(step))
+        for step in ("wait", "sleep", "find_on_screen", "move_mouse",
+                     "mouse_move", "list_windows", "web_search", "get_time",
+                     "pause_for"):
+            with self.subTest(step=step):
+                self.assertFalse(loop_guard._drives_screen(step))
 
     def test_a_fresh_guard_starts_clean(self):
         g = LoopGuard()

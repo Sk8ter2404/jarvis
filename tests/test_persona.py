@@ -154,5 +154,66 @@ class DeliverWhatWasAskedRuleTests(unittest.TestCase):
         self.assertEqual(self.prompt.count("DELIVER WHAT WAS ASKED"), 1)
 
 
+class NoEmptyPromiseExampleTests(unittest.TestCase):
+    """v3.0.6. Live 2026-10-28 15:57:47: "I'll note that for posterity, sir."
+    was spoken as a lead-in before a web_search and nothing was noted. The
+    line was handed to the model as a stock example in five places of the
+    base prompt, the signature pool and the MCU phrasebook (a stale
+    duplicate), and the few-shot Example 3 also promised to "stand by to
+    restore from backup". Every example the model is SHOWN must claim
+    nothing that no action does."""
+
+    import re as _re
+    PROMISE_RE = _re.compile(
+        r"for\s+posterity|i'?ll\s+note\s+(?:that|it)\b|"
+        r"stand\s+by\s+to\s+restore", _re.IGNORECASE)
+
+    def _shown(self):
+        import mcu_phrases
+        from core import prompts
+        out = {
+            "signature pool": persona.render_signature_phrase_pool(),
+            "BASE_SYSTEM_PROMPT": prompts.BASE_SYSTEM_PROMPT,
+            "BASE_SYSTEM_PROMPT_V2": prompts.BASE_SYSTEM_PROMPT_V2,
+            "v3 swaps": "\n".join(new for _old, new in prompts._BASE_V3_SWAPS),
+            "mcu phrasebook": "\n".join(
+                line for bucket in mcu_phrases.MCU_PHRASES.values()
+                for line in bucket),
+        }
+        # Both PROMPT_DIRECTIVE_V3 / PROMPT_INDEX_CANON states.
+        v3 = prompts._apply_swaps(prompts.BASE_SYSTEM_PROMPT_V2,
+                                  prompts._BASE_V3_SWAPS)
+        out["v3 prompt"] = v3
+        out["v3 canon prompt"] = prompts._strip_signature_block(v3)
+        return out
+
+    def test_no_shown_example_promises_a_note(self):
+        for name, text in self._shown().items():
+            with self.subTest(source=name):
+                self.assertIsNone(self.PROMISE_RE.search(text),
+                                  f"{name}: {self.PROMISE_RE.search(text)}")
+
+    def test_every_v3_swap_still_applies(self):
+        # The Example 3 / dry_wit literals changed with their swaps: a swap
+        # whose old text drifted would be skipped silently.
+        from core import prompts
+        for old, _new in prompts._BASE_V3_SWAPS:
+            with self.subTest(old=old[:50]):
+                self.assertIn(old, prompts.BASE_SYSTEM_PROMPT_V2)
+
+    def test_the_pool_keeps_its_shape(self):
+        self.assertEqual(len(persona.JARVIS_SIGNATURE_PHRASES), 20)
+        self.assertIn("One does admire the optimism, sir.",
+                      persona.JARVIS_SIGNATURE_PHRASES)
+
+    def test_the_retired_line_is_still_caught(self):
+        # A model that learned the old line is still caught when it copies it
+        # into a proactive remark (core/proactive_guard RETIRED_EXAMPLES).
+        from core import proactive_guard as pg
+        pg.persona_pool.cache_clear()
+        self.addCleanup(pg.persona_pool.cache_clear)
+        self.assertTrue(pg.persona_copy("I'll note that for posterity, sir."))
+
+
 if __name__ == "__main__":
     unittest.main()

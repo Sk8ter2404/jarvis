@@ -724,9 +724,146 @@ def _act_spotify(query: str) -> str:
     return _bc()._streaming_auto_play("spotify", query)
 
 
+# ── youtube_play's monitor argument (v3.0.6 B6) ─────────────────────────
+# Live 2026-10-28 17:28:11 "Jarvis play vision quest on the left monitor." ->
+# [ACTION: youtube_play, vision quest | monitor:left]: the WHOLE argument was
+# searched ("opened YouTube search for 'vision quest | monitor:left'") and the
+# player landed on the middle monitor. youtube_play takes a search only; the
+# monitor is the move_window_to_monitor step the prompt documents after it.
+# youtube_monitor_arg splits a "| monitor:left" / "| left monitor" piece (or a
+# trailing "on the left monitor") off the search; YOUTUBE_MONITOR_ARG decides
+# what then happens to it.
+_YT_MON_KEY_RE = re.compile(r"^(?:on\s+)?(?:monitor|screen|display)\s*[:=]\s*"
+                            r"(?P<m>.+)$", re.IGNORECASE)
+_YT_MON_WORD_RE = re.compile(r"\b(?:monitor|screen|display)\b", re.IGNORECASE)
+_YT_MON_TAIL_RE = re.compile(
+    r"\s+on\s+(?:the\s+|my\s+)?(?P<m>[\w-]+)\s+(?:monitor|screen|display)\s*$",
+    re.IGNORECASE)
+
+
+def _yt_monitor_piece(piece: str) -> "str | None":
+    p = " ".join(str(piece or "").split())
+    m = _YT_MON_KEY_RE.match(p)
+    cand = m.group("m") if m else re.sub(r"^on\s+", "", p, flags=re.IGNORECASE)
+    return _resolve_monitor(cand)
+
+
+def youtube_monitor_arg(query) -> "tuple[str, str | None]":
+    """(the search, the MONITORS key) from a youtube_play argument: a piece
+    between '|' that names only a monitor ("monitor:left", "left monitor",
+    "on the left screen") or a trailing "on the left monitor" comes off the
+    search. A word that is not a configured monitor stays in the search
+    ("monitor lizard documentary"). (query, None) when there is none. Pure;
+    never raises."""
+    try:
+        raw = str(query or "")
+        if not raw.strip():
+            return raw.strip(), None
+        pieces = [p.strip() for p in raw.split("|")]
+        monitor = None
+        drop = set()
+        if len(pieces) > 1:
+            # Explicit pieces first ("monitor:left", "left monitor"). A BARE
+            # piece ("left", "middle") counts only when it is the LAST piece
+            # and a search is left: "The Middle | Jimmy Eat World" is a song,
+            # not the middle monitor (v3.0.6 final review).
+            for i, p in enumerate(pieces):
+                s = " ".join(p.split())
+                if not (_YT_MON_KEY_RE.match(s) or _YT_MON_WORD_RE.search(s)):
+                    continue
+                key = _yt_monitor_piece(p)
+                if key is not None and monitor is None:
+                    monitor = key
+                    drop.add(i)
+                elif _YT_MON_KEY_RE.match(s):
+                    drop.add(i)     # "monitor:garage" - never a search word
+            last = len(pieces) - 1
+            if monitor is None and last not in drop:
+                key = _yt_monitor_piece(pieces[last])
+                if key is not None and any(
+                        p for i, p in enumerate(pieces[:last])
+                        if i not in drop):
+                    monitor = key
+                    drop.add(last)
+        kept = [p for i, p in enumerate(pieces) if i not in drop and p]
+        q = " | ".join(kept)
+        if monitor is None:
+            m = _YT_MON_TAIL_RE.search(q)
+            if m:
+                key = _resolve_monitor(m.group("m"))
+                if key is not None and q[:m.start()].strip():
+                    monitor, q = key, q[:m.start()].strip()
+        return q.strip(), monitor
+    except Exception:
+        return str(query or "").strip(), None
+
+
+def _youtube_monitor_mode() -> str:
+    """YOUTUBE_MONITOR_ARG as 'honor' | 'strip' | 'off' (anything else reads
+    'off'). Never raises."""
+    try:
+        from core import config as _cfg
+        mode = str(getattr(_cfg, "YOUTUBE_MONITOR_ARG", "honor")).strip().lower()
+    except Exception:
+        return "off"
+    return mode if mode in ("honor", "strip", "off") else "off"
+
+
+def _move_media_window(bc, service_key: str, monitor: str) -> str:
+    """Move the window JARVIS opened for ``service_key`` (its RECORDED handle
+    only - never a title match, never one of his windows) to ``monitor`` and
+    maximize it there: the same SetWindowPos step move_window_to_monitor
+    does. A short clause for the result. Never raises."""
+    try:
+        from core.config import MONITORS
+        hwnd = getattr(bc, "_JARVIS_MEDIA_WINDOW_HWND", {}).get(service_key)
+        if hwnd is None or monitor not in MONITORS:
+            return (f"I couldn't move it to the {monitor} monitor - I have no "
+                    "window of my own for it")
+        import win32gui
+        import win32con
+        mx, my, mw, mh = MONITORS[monitor]
+        x0, y0, x1, y1 = win32gui.GetWindowRect(hwnd)
+        from core import monitor_geometry as _mg
+        if _mg.monitor_for_rect(x0, y0, x1 - x0, y1 - y0, MONITORS) == monitor:
+            return f"on the {monitor} monitor"
+        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+        time.sleep(0.1)
+        win32gui.SetWindowPos(hwnd, 0, mx, my, mw, mh, 0x0004 | 0x0010)
+        time.sleep(0.1)
+        win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
+        print(f"  [auto-play] moved the {service_key} window to the "
+              f"'{monitor}' monitor (asked in the argument)", flush=True)
+        return f"moved to the {monitor} monitor"
+    except Exception as e:
+        return f"I couldn't move it to the {monitor} monitor ({type(e).__name__})"
+
+
 def _act_youtube_play(query: str) -> str:
-    """Auto-play on YouTube: opens search, clicks the first real video."""
-    return _bc()._streaming_auto_play("youtube", query)
+    """Auto-play on YouTube: opens search, clicks the first real video. A
+    monitor in the argument ("vision quest | monitor:left") is never
+    searched: with YOUTUBE_MONITOR_ARG 'honor' the player is moved there
+    after it plays (see youtube_monitor_arg)."""
+    mode = _youtube_monitor_mode()
+    if mode == "off":
+        return _bc()._streaming_auto_play("youtube", query)
+    q, monitor = youtube_monitor_arg(query)
+    if monitor is None:
+        return _bc()._streaming_auto_play("youtube", query)
+    print(f"  [auto-play] youtube_play: searching {q!r}, monitor "
+          f"{monitor!r} taken out of the search", flush=True)
+    bc = _bc()
+    res = bc._streaming_auto_play("youtube", q)
+    if mode != "honor":
+        return res
+    try:
+        from core.failure_markers import FAILURE_MARKERS
+        low = str(res or "").lower()
+        if not res or any(m in low for m in FAILURE_MARKERS):
+            return res
+    except Exception:
+        return res
+    return f"{res} ({_move_media_window(bc, 'youtube', monitor)})"
 
 
 # ─── HUD visibility toggles (Phase 4B) ─────────────────────────────────
@@ -1205,7 +1342,41 @@ def _apple_music_web_url() -> str:
             or _APPLE_MUSIC_WEB_URL)
 
 
+def _unresolved_open_line(name: str) -> str:
+    """v3.0.6 B2 (core.onscreen_refs.unresolved_open, UNRESOLVED_OPEN_ASK):
+    the terminal "Open what, sir?" when the owner's whole turn was "open it
+    (up)" and nothing he or JARVIS said lately names ``name``; else "".
+    Live 2026-10-28 17:25:16 "can you open it up so I can help you?" launched
+    PowerShell. Never raises."""
+    try:
+        from core import config as _cfg
+        if not bool(getattr(_cfg, "UNRESOLVED_OPEN_ASK", True)):
+            return ""
+        bc = _loaded_bc()
+        said = _turn_said(bc)
+        if not said:
+            return ""
+        hist = getattr(bc, "conversation_history", None)
+        from core import onscreen_refs as _or
+        # Through the latest USER entry, tokens stripped: _call_llm has
+        # already appended THIS turn's reply ("[ACTION: open_app,
+        # PowerShell]") to the history, and it must not vouch for itself.
+        recent = _or.recent_context(hist) if isinstance(hist, list) else ""
+        line = _or.unresolved_open(said, name, recent)
+        if not line:
+            return ""
+        print(f"  [launch] 'it' names nothing - asking instead of opening "
+              f"{name!r}")
+        from core.failure_markers import TERMINAL_FAILURE_PREFIX
+        return TERMINAL_FAILURE_PREFIX + line
+    except Exception:
+        return ""
+
+
 def _act_launch_app(name: str) -> str:
+    ask = _unresolved_open_line(name)
+    if ask:
+        return ask
     # A named site shortcut ("open Zorblat") is a page, not a program.
     shortcut = _site_shortcut_url(name)
     if shortcut:
@@ -3698,9 +3869,13 @@ def _act_play_streaming(args: str) -> str:
                 f"unknown service '{raw_service}'. Known: "
                 + ", ".join(sorted(bc._STREAMING_SERVICES.keys()))
             )
+        if service == "youtube":
+            # v3.0.6 B6: the monitor piece of "youtube | X | monitor:left"
+            # is never searched (_act_youtube_play / youtube_monitor_arg).
+            return _act_youtube_play(query)
         return bc._streaming_auto_play(service, query)
     # No service specified — default to YouTube as the universal fallback
-    return bc._streaming_auto_play("youtube", args.strip())
+    return _act_youtube_play(args.strip())
 
 
 def _act_streaming_search(args: str) -> str:
@@ -6054,6 +6229,45 @@ def _act_recall_screen(question: str) -> str:
 
 # ─── Changelog read + summarise (Phase 4I) ─────────────────────────────
 
+_CHANGELOG_VERSION_RE = re.compile(r"^##\s*v(\d+(?:\.\d+)*)", re.MULTILINE)
+
+
+def _changelog_version_line(text: str) -> str:
+    """"I'm on version 3.0.5, sir." from the NEWEST "## vX.Y.Z" header, or
+    "" when there is none.
+
+    Live 2026-10-28 17:58 "Jarvis, what's new with you?" got "I have updated
+    the system to include morning greetings and printer status updates, sir"
+    - no version at all, and v3.0.4's fixes told as new features. The version
+    is read from the header, never left to the summariser. Pure; never
+    raises."""
+    try:
+        m = _CHANGELOG_VERSION_RE.search(text or "")
+        return f"I'm on version {m.group(1)}, sir." if m else ""
+    except Exception:
+        return ""
+
+
+def _whats_new_version_first() -> bool:
+    """core.config.WHATS_NEW_VERSION_FIRST, read live (default True)."""
+    try:
+        import core.config as _cfg
+        return bool(getattr(_cfg, "WHATS_NEW_VERSION_FIRST", True))
+    except Exception:
+        return True
+
+
+def _with_version_line(version_line: str, body: str, spoken: bool) -> str:
+    """The returned answer: the body alone when the version line was already
+    voiced, else the version line in front of it. Pure; never raises."""
+    try:
+        if spoken or not version_line:
+            return body
+        return f"{version_line} {body}".strip()
+    except Exception:
+        return body
+
+
 def _act_read_changelog(args: str = "") -> str:
     """Read CHANGELOG.md and either speak a concise summary of the most
     recent entry (default) or up to 3 entries if the user asks 'what has
@@ -6090,6 +6304,7 @@ def _act_read_changelog(args: str = "") -> str:
             chunk = re.sub(r"\n---\s*$", "", chunk).strip()
             entries.append(chunk)
         combined = "\n\n".join(entries)
+        version_line = _changelog_version_line(text)
         # Long-entry branch — open file in default editor and give a short
         # spoken pointer.
         if len(combined) > 6000:
@@ -6101,27 +6316,64 @@ def _act_read_changelog(args: str = "") -> str:
                                      close_fds=True)
             except Exception:
                 pass
-            return ("The latest changelog entry is sizeable, sir — I've "
-                    f"opened {os.path.basename(_changelog_path)} for you to "
-                    "read in full.")
+            return _with_version_line(
+                version_line,
+                "The latest changelog entry is sizeable, sir — I've "
+                f"opened {os.path.basename(_changelog_path)} for you to "
+                "read in full.", False)
         plural = "entries" if n_entries > 1 else "entry"
+        # Live 2026-10-28 17:58: v3.0.4 was all fixes ("no longer opens with
+        # the sign-in command") and was voiced as "I have updated the system
+        # to include morning greetings". A fix is said as a fix, and the
+        # version is already said, so the summary never repeats or guesses it.
         system = (
             "You are J.A.R.V.I.S. Summarise the following CHANGELOG.md "
             f"{plural} into ONE to THREE concise sentences spoken in your "
-            "own voice for the user (he/sir). Call out new capabilities by "
-            "name and the rough number of bug fixes if visible. Plain "
-            "prose only — no markdown, no bullets, no headers."
+            "own voice for the user (he/sir). The version number has "
+            "already been said: do not repeat it. Most items are FIXES: say "
+            "a fix as a fix ('X no longer does Y', 'X works again'); never "
+            "describe a fix as a new feature or as something you added or "
+            "included. Name a new capability only when the entry says it is "
+            "new. Plain prose only — no markdown, no bullets, no headers."
         )
         user = f"Changelog content:\n\n{combined[:8000]}"
-        try:
-            summary = (bc._llm_quick(system, user, max_tokens=300,
-                                     caller="changelog_summary") or "").strip()
-        except Exception as e:
-            return f"could not summarise the changelog: {e}"
+        box: dict = {}
+
+        def _summarise():
+            try:
+                box["summary"] = (bc._llm_quick(
+                    system, user, max_tokens=300,
+                    caller="changelog_summary") or "").strip()
+            except Exception as e:       # reported on the caller's thread
+                box["error"] = e
+
+        spoken = False
+        if version_line and _whats_new_version_first():
+            # Live 2026-10-28 17:58: first_play 8253 ms - the summariser ran
+            # before a word was said. The version line needs no model, so it
+            # is voiced WHILE the summary is written (worker thread, no
+            # background job = the owner's own foreground call). Only a
+            # confirmed voicing (`is True`) leaves it out of the reply; muted
+            # or failed, it is returned in front of the summary instead.
+            worker = threading.Thread(target=_summarise, daemon=True,
+                                      name="changelog-summary")
+            worker.start()
+            try:
+                spoken = bc._speak(version_line) is True
+            except Exception:
+                spoken = False
+            worker.join(timeout=120)
+        else:
+            _summarise()
+        if "error" in box:
+            return f"could not summarise the changelog: {box['error']}"
+        summary = box.get("summary") or ""
         if not summary:
-            return ("I couldn't produce a summary just now, sir — the full "
-                    f"changelog is at {_changelog_path}.")
-        return summary
+            return _with_version_line(
+                version_line,
+                "I couldn't produce a summary just now, sir — the full "
+                f"changelog is at {_changelog_path}.", spoken)
+        return _with_version_line(version_line, summary, spoken)
     except Exception as e:
         return f"could not read the changelog: {e}"
 

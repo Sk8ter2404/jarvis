@@ -389,6 +389,21 @@ class SignatureLimiterTests(unittest.TestCase):
                     af.limit_signature_phrases(line, "b", **kw),
                     af.NEUTRAL_LINE)
 
+    def test_the_optimism_line_is_limited_like_the_rest(self):
+        # Reviewed 2026-10-28: the line that replaced the posterity line was
+        # outside the limiter - it was kept on every call.
+        line = "Right away, sir. One does admire the optimism, sir."
+        self.assertEqual(af.signature_key("One does admire the optimism, sir."),
+                         "optimism")
+        self.assertEqual(af.signature_key("One does admire the optimism."),
+                         "optimism")
+        self.assertEqual(self.lim(line, "a", 0.0), line)
+        self.assertEqual(self.lim(line, "b", 60.0), "Right away, sir.")
+        self.assertEqual(self.lim("One does admire the optimism, sir.", "c",
+                                  90.0), af.NEUTRAL_LINE)
+        self.assertEqual(self.lim("One does admire the optimism, sir.", "d",
+                                  120.0, action_ran=True), "")
+
     def test_a_phrase_inside_a_longer_sentence_is_not_a_signature(self):
         line = "You mentioned quite the strategy for the rollout, sir."
         self.lim(line, "a", 0.0)

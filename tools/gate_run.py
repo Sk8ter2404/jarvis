@@ -20,7 +20,7 @@ So the PARENT enforces two things this module owns:
     ``--exit-grace`` seconds (default 60) to be gone, or it is killed. The
     watchdog's verdict stands: the run reports the watchdog's exit code.
   * WALL-CLOCK CEILING — ``--max-seconds``; by default the watchdog's own
-    whole-run budget (``JARVIS_TEST_TOTAL_TIMEOUT_S``, else 900 s) times the
+    whole-run budget (``JARVIS_TEST_TOTAL_TIMEOUT_S``, else 1800 s) times the
     largest multiplier any runner applies to it (4x: run_coverage.py and
     run_tests_ci_sim.py --coverage) plus 10 minutes. A run the watchdog never
     managed to end reports 124, like a shell ``timeout``. A disabled total

@@ -356,11 +356,45 @@ class IntentAndGuardThroughActionsTests(unittest.TestCase):
         self.assertNotIn("not sure who",
                          self.mod._handoff_guard("send it to Claude please"))
 
+    def test_pass_that_over_never_browses(self):
+        # v3.0.6 scope F3: "pass that over" (no one named) must never become a
+        # paid browser run, through browser_task OR browse_for.
+        for name in ("browser_task", "browse_for"):
+            for task in ("pass that over", "Pass it over.",
+                         "No, just pass that over for me",
+                         "send it along please", "hand it over",
+                         # Review F3: the object-only and trailing-vocative
+                         # forms (no particle) used to fall through.
+                         "pass that", "send it", "forward it", "relay that",
+                         "pass it please", "send it please", "Then send it.",
+                         "pass that over, Jarvis", "hand it over, Jarvis."):
+                with self.subTest(name=name, task=task), \
+                     mock.patch.object(self.mod, "is_available",
+                                       return_value=True), \
+                     mock.patch.object(self.mod, "_ssrf_guard",
+                                       return_value=None), \
+                     mock.patch.object(self.mod, "_run_task_sync") as runner:
+                    out = self.actions[name](task)
+                    runner.assert_not_called()
+                    self.assertIn("pass that over to Claude", out)
+
+    def test_a_real_search_still_browses(self):
+        for query in ("cheap flights to Denver", "pass rates for the bar exam",
+                      "send flowers to mom"):
+            with self.subTest(query=query), \
+                 mock.patch.object(self.mod, "is_available", return_value=True), \
+                 mock.patch.object(self.mod, "_ssrf_guard", return_value=None), \
+                 mock.patch.object(self.mod, "_run_task_sync",
+                                   return_value="done") as runner:
+                self.assertEqual(self.actions["browse_for"](query), "done")
+                runner.assert_called_once()
+
     def test_a_real_task_still_browses(self):
         for task in ("book me a haircut Friday afternoon", "send flowers to mom",
                      "go to amazon.com and add it to my cart",
                      "forward this to john@example.com",
-                     "give me directions to the store"):
+                     "give me directions to the store", "send flowers",
+                     "give me directions", "give it a rating on yelp"):
             with self.subTest(task=task), \
                  mock.patch.object(self.mod, "is_available", return_value=True), \
                  mock.patch.object(self.mod, "_ssrf_guard", return_value=None), \

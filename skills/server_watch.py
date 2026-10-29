@@ -17,6 +17,24 @@ the owner's (array changes, "New Config", parity calls are his alone).
     changed live in data/server_watch.json, so "offline since ..." survives a
     restart and a restart never re-announces an old state.
   * "how's the server" / "is the server up" answer from a FRESH check.
+  * Health reads (3.0.6, Home Lab hub OK 2026-10-28, the rules are theirs):
+    three more read-only commands, from the fixed READ_COMMANDS tuple only -
+    the argv is never composed from model or spoken text:
+      - `cat /var/local/emhttp/disks.ini`: speak ONLY when a disk's numErrors
+        rises or its temp reaches 50 C.
+      - `apcaccess -u`: STATUS only - speak on ONBATT and on the way back to
+        ONLINE. NEVER load, overload, low battery or runtime ("record, do not
+        nag").
+      - `docker ps -a --format '{{.Names}} {{.Status}}'`: an Exited container
+        is announced once; silent while an Agent Office board claim on
+        server:unraid is held (someone is working on the server).
+    SERVER_WATCH_HEALTH_READS turns them off.
+  * SERVER_WATCH_SSH_KEY (3.0.6): the restricted key (forced command
+    /boot/config/jarvis-ro.sh allows exactly READ_COMMANDS). When set, the
+    argv carries `-i <key> -o IdentitiesOnly=yes`: without IdentitiesOnly ssh
+    offers the default ~/.ssh and agent keys first, the server accepts the
+    full-root key and the restriction silently does nothing (Home Lab hub,
+    2026-10-28). Empty = today's behaviour (ssh picks its default key).
 
 Off unless SERVER_WATCH_HOST is set (data/user_settings.json).
 """
@@ -86,6 +104,87 @@ def ssh_target() -> str:
     return t if re.match(r"^[A-Za-z0-9._-]+@[A-Za-z0-9._:-]+$", t) else ""
 
 
+# The ONLY commands ever run on the server, byte for byte what the restricted
+# key's forced command (/boot/config/jarvis-ro.sh, Home Lab hub 2026-10-28)
+# allows; anything else is refused + logged there, and refused here first.
+# Each goes as ONE argv element. Never built from model or spoken text.
+CMD_MDCMD = "mdcmd status"
+CMD_DISKS = "cat /var/local/emhttp/disks.ini"
+CMD_UPS = "apcaccess -u"
+CMD_DOCKER = "docker ps -a --format '{{.Names}} {{.Status}}'"
+READ_COMMANDS = (CMD_MDCMD, CMD_DISKS, CMD_UPS, CMD_DOCKER)
+
+_INVALID_KEY = object()
+
+
+def ssh_key():
+    """SERVER_WATCH_SSH_KEY: "" = today's behaviour (ssh's default key).
+    A value that could be read as an ssh option or carries control
+    characters is _INVALID_KEY - the caller then runs NOTHING rather than
+    fall back to the default (full-root) key."""
+    k = str(_cfg("SERVER_WATCH_SSH_KEY", "") or "").strip()
+    if not k:
+        return ""
+    if k.startswith("-") or any(ord(c) < 32 for c in k):
+        return _INVALID_KEY
+    # Review 2026-10-28: ssh only WARNS when an `-i` file cannot be read and
+    # then falls back to the default identities (~/.ssh/id_ed25519 = the
+    # full-root key) - IdentitiesOnly=yes limits agent keys, not those. So a
+    # typo, a deleted key or one not yet deployed would silently run every
+    # read as root. Checked on EVERY call (the key can vanish while JARVIS
+    # runs). ssh expands a leading "~" itself, so the check does too.
+    try:
+        present = os.path.isfile(os.path.expanduser(k))
+    except Exception:
+        present = False
+    if not present:
+        _warn_missing_key_once(k)
+        return _INVALID_KEY
+    return k
+
+
+_warned_key = [None]
+
+
+def _warn_missing_key_once(k: str) -> None:
+    """Log the missing key once per path (a poll runs 4 reads a time)."""
+    try:
+        if _warned_key[0] != k:
+            _warned_key[0] = k
+            print("  [server-watch] key file missing - not reading")
+    except Exception:
+        pass
+
+
+def ssh_argv(target: str, cmd: str, key=None):
+    """The exact ssh argv for one allow-listed read, or None (never run).
+    With a key: ["ssh", "-n", "-i", KEY, "-o", "IdentitiesOnly=yes", then
+    today's options] - the order the Home Lab hub sent (scope D2)."""
+    if cmd not in READ_COMMANDS or not target:
+        return None
+    key = ssh_key() if key is None else key
+    if key is _INVALID_KEY:
+        return None
+    argv = ["ssh", "-n"]
+    if key:
+        argv += ["-i", str(key), "-o", "IdentitiesOnly=yes"]
+    return argv + ["-o", "BatchMode=yes", "-o", "ConnectTimeout=6",
+                   "-o", "StrictHostKeyChecking=accept-new", target, cmd]
+
+
+def _run_read(target: str, cmd: str, run=subprocess.run):
+    """stdout of one allow-listed read, or None when it could not be read."""
+    argv = ssh_argv(target, cmd)
+    if argv is None:
+        return None
+    try:
+        out = run(argv, capture_output=True, text=True, timeout=SSH_TIMEOUT_S,
+                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return out.stdout if out.returncode == 0 else None
+    except Exception:
+        return None
+
+
 # ── checks ─────────────────────────────────────────────────────────────
 def _port_open(h: str, port: int, timeout: float = CONNECT_TIMEOUT_S) -> bool:
     try:
@@ -122,23 +221,124 @@ def read_array(target: str, run=subprocess.run):
     """One read-only `mdcmd status` over SSH; {} when unreadable."""
     if not target:
         return {}
+    text = _run_read(target, CMD_MDCMD, run)
+    return parse_mdcmd(text) if text is not None else {}
+
+
+def _int_or_none(v):
+    v = str(v if v is not None else "").strip().strip('"')
+    return int(v) if v.lstrip("-").isdigit() else None
+
+
+def parse_disks_ini(text: str) -> dict:
+    """{disk name: {"temp": int|None, "errors": int|None}} from
+    /var/local/emhttp/disks.ini (["name"] sections, key="value" lines). A
+    spun-down disk reports temp="*" -> None. Unknown output -> {}."""
+    out, cur = {}, None
     try:
-        out = run(["ssh", "-n", "-o", "BatchMode=yes", "-o", "ConnectTimeout=6",
-                   "-o", "StrictHostKeyChecking=accept-new", target, "mdcmd status"],
-                  capture_output=True, text=True, timeout=SSH_TIMEOUT_S,
-                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        return parse_mdcmd(out.stdout) if out.returncode == 0 else {}
+        for line in str(text or "").splitlines():
+            line = line.strip()
+            if line.startswith("[") and line.endswith("]"):
+                cur = line[1:-1].strip().strip('"') or None
+                if cur:
+                    out.setdefault(cur, {"temp": None, "errors": None})
+                continue
+            k, sep, v = line.partition("=")
+            if not sep or cur is None:
+                continue
+            k = k.strip()
+            if k == "temp":
+                out[cur]["temp"] = _int_or_none(v)
+            elif k == "numErrors":
+                out[cur]["errors"] = _int_or_none(v)
     except Exception:
         return {}
+    return out
+
+
+def parse_ups_status(text: str) -> str:
+    """The STATUS field of `apcaccess -u` and NOTHING else: "ONBATT",
+    "ONLINE" or "" (unknown). LOADPCT, BCHARGE, TIMELEFT and the LOWBATT /
+    OVERLOAD flags are deliberately never read (Home Lab hub: record, do not
+    nag)."""
+    try:
+        for line in str(text or "").splitlines():
+            k, sep, v = line.partition(":")
+            if sep and k.strip().upper() == "STATUS":
+                words = v.upper().split()
+                if "ONBATT" in words:
+                    return "ONBATT"
+                if "ONLINE" in words:
+                    return "ONLINE"
+                return ""
+    except Exception:
+        pass
+    return ""
+
+
+def parse_docker(text: str) -> dict:
+    """{container name: status text} from `docker ps -a --format
+    '{{.Names}} {{.Status}}'` ("plex Up 3 days", "foo Exited (0) 2 hours
+    ago")."""
+    out = {}
+    try:
+        for line in str(text or "").splitlines():
+            nm, _sp, status = line.strip().partition(" ")
+            # Docker's own name rule; anything else is not a name to speak.
+            if re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$", nm):
+                out[nm] = status.strip()
+    except Exception:
+        return {}
+    return out
+
+
+def _exited(status: str) -> bool:
+    return str(status or "").startswith("Exited")
+
+
+def health_reads_on() -> bool:
+    return bool(_cfg("SERVER_WATCH_HEALTH_READS", True))
+
+
+def read_health(target: str, run=subprocess.run) -> dict:
+    """The three health reads, in parallel. A read that fails is LEFT OUT
+    (never an empty guess), so a failed docker read never looks like "no
+    containers" and a failed UPS read never looks like a power change."""
+    if not target or not health_reads_on():
+        return {}
+    cmds = ((CMD_DISKS, "disks", parse_disks_ini), (CMD_UPS, "ups", parse_ups_status),
+            (CMD_DOCKER, "docker", parse_docker))
+    try:
+        with ThreadPoolExecutor(max_workers=len(cmds)) as ex:
+            texts = list(ex.map(lambda c: _run_read(target, c[0], run), cmds))
+    except Exception:
+        return {}
+    out = {}
+    for (_cmd, key, parse), text in zip(cmds, texts):
+        if text is None:
+            continue
+        val = parse(text)
+        if val:
+            out[key] = val
+    return out
 
 
 def check(h=None, target=None, opener=_port_open, run=subprocess.run) -> dict:
     h = host() if h is None else h
     target = ssh_target() if target is None else target
     up_services = probe_ports(h, opener) if h else []
-    array = read_array(target, run) if (up_services and target) else {}
+    array, health = {}, {}
+    if up_services and target:
+        # In parallel, so "how's the server" waits no longer than one read.
+        try:
+            with ThreadPoolExecutor(max_workers=2) as ex:
+                fa = ex.submit(read_array, target, run)
+                fh = ex.submit(read_health, target, run)
+                array, health = fa.result(), fh.result()
+        except Exception:
+            array, health = {}, {}
     return {"up": bool(up_services), "services": up_services, "array": array,
-            "at": time.time()}
+            "health": health, "at": time.time()}
 
 
 # ── state ──────────────────────────────────────────────────────────────
@@ -224,6 +424,131 @@ def step(state: dict, result: dict, agree: int = AGREE_POLLS):
     return st, msg
 
 
+HOT_C = 50          # Home Lab hub rule: speak at temp >= 50 C
+HOT_REARM_C = 45    # a disk hovering at 49/50 is said once, not every poll
+BOARD_PATH = "/api/board"
+BOARD_TIMEOUT_S = 2.0
+BOARD_AREA = "server:unraid"
+_OFFICE_DEFAULT = "http://127.0.0.1:8795"
+
+
+def _disk_word(d: str) -> str:
+    d = str(d)
+    m = re.match(r"^disk(\d+)$", d)
+    if m:
+        return "disk " + m.group(1)
+    if d == "parity2":
+        return "the second parity"
+    return d.replace("_", " ")
+
+
+def _office_url() -> str:
+    u = str(_cfg("AGENT_OFFICE_URL", _OFFICE_DEFAULT) or "").strip().rstrip("/")
+    return u if re.match(r"^https?://[A-Za-z0-9._:\[\]-]+$", u) else _OFFICE_DEFAULT
+
+
+def _fetch_board(url: str, timeout: float = BOARD_TIMEOUT_S) -> dict:
+    import urllib.request
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    req = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with opener.open(req, timeout=timeout) as resp:
+        raw = resp.read(1_000_001)
+    data = json.loads(raw.decode("utf-8", "replace"))
+    return data if isinstance(data, dict) else {}
+
+
+def board_claim_held(fetch=None, now=None) -> bool:
+    """True while an Agent Office board claim on server:unraid is held (the
+    owner or a chat is working on the server, e.g. the 10-28 parity swap).
+    One GET of AGENT_OFFICE_URL/api/board, 2 s; the Office not running or any
+    fault = False, quietly. Board text is data: only "what" and "until" are
+    looked at, and nothing from it is ever spoken."""
+    fetch = fetch or _fetch_board
+    now = time.time() if now is None else now
+    try:
+        board = fetch(_office_url() + BOARD_PATH, BOARD_TIMEOUT_S)
+        for c in (board or {}).get("claims") or []:
+            if not isinstance(c, dict):
+                continue
+            if str(c.get("what") or "").strip().lower() != BOARD_AREA:
+                continue
+            until = c.get("until")
+            try:
+                if until is not None and float(until) <= now:
+                    continue
+            except (TypeError, ValueError):
+                pass
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def step_health(state: dict, health: dict, claim_held=None):
+    """Fold the health reads into the believed state. Returns (state, [lines])
+    - only the Home Lab hub's speak rules ever produce a line:
+      * a disk's numErrors rising, or its temp reaching HOT_C (said once,
+        again only after it cooled below HOT_REARM_C);
+      * UPS STATUS ONBATT, and ONLINE again after ONBATT;
+      * a container newly Exited, once - unless a server:unraid board claim
+        is held (then it is noted silently and never said later: the work
+        that holds the claim stopped it).
+    The first read of each kind is a silent baseline (a restart never
+    re-announces). Never raises."""
+    claim_held = claim_held or board_claim_held
+    st = dict(state or {})
+    lines = []
+    try:
+        nm = name()
+        disks = (health or {}).get("disks")
+        if isinstance(disks, dict) and disks:
+            known_err = dict(st.get("disk_errors") or {})
+            hot = set(st.get("disk_hot") or [])
+            first = "disk_errors" not in st
+            for d, info in sorted(disks.items()):
+                err, temp = info.get("errors"), info.get("temp")
+                if err is not None:
+                    before = known_err.get(d)
+                    if not first and before is not None and err > int(before):
+                        n = err - int(before)
+                        lines.append(f"Sir, {_disk_word(d)} on the {nm} logged "
+                                     f"{n} new error{'' if n == 1 else 's'}.")
+                    known_err[d] = err      # a reset to 0 (array restart) is silent
+                if temp is not None:
+                    if temp >= HOT_C and d not in hot:
+                        hot.add(d)
+                        if not first:
+                            lines.append(f"Sir, {_disk_word(d)} on the {nm} is at "
+                                         f"{temp} degrees Celsius.")
+                    elif temp < HOT_REARM_C:
+                        hot.discard(d)
+            st["disk_errors"], st["disk_hot"] = known_err, sorted(hot)
+        ups = (health or {}).get("ups")
+        if ups in ("ONBATT", "ONLINE"):
+            before = st.get("ups")
+            if before == "ONLINE" and ups == "ONBATT":
+                lines.append(f"Sir, the {nm} is running on battery.")
+            elif before == "ONBATT" and ups == "ONLINE":
+                lines.append(f"The {nm} is back on mains power, sir.")
+            st["ups"] = ups
+        dock = (health or {}).get("docker")
+        if isinstance(dock, dict) and dock:
+            first = "exited" not in st
+            said = set(st.get("exited") or [])
+            now_exited = {c for c, status in dock.items() if _exited(status)}
+            new = sorted(now_exited - said)
+            if new and not first and not claim_held():
+                names = (", ".join(new[:-1]) + " and " + new[-1]) if len(new) > 1 else new[0]
+                lines.append(f"Sir, the {names} container{'s' if len(new) > 1 else ''} "
+                             f"on the {nm} stopped.")
+            # A container that is up again is forgotten, so a later exit is
+            # said again; one still Exited stays said.
+            st["exited"] = sorted(now_exited)
+    except Exception:
+        return dict(state or {}), []
+    return st, lines
+
+
 def resync_line(a: dict) -> str:
     """'Rebuilding disks 10 and 14, 75 percent done, about 1.5 hours left.'
     from mdResyncAction / Pos / Size / Dt / Db; "" when nothing is running.
@@ -286,6 +611,15 @@ def describe(result: dict, state: dict, now=None) -> str:
             line += " " + rs
     elif ssh_target():
         line += " I couldn't read the array's state just now."
+    # Health reads: only the conditions the poll itself would speak about.
+    h = result.get("health") or {}
+    if h.get("ups") == "ONBATT":
+        line += " It's running on battery."
+    hot = [(d, i.get("temp")) for d, i in sorted((h.get("disks") or {}).items())
+           if isinstance(i, dict) and i.get("temp") is not None and i["temp"] >= HOT_C]
+    for d, t in hot[:3]:
+        w = _disk_word(d)
+        line += f" {w[:1].upper() + w[1:]} is at {t} degrees Celsius."
     return line
 
 
@@ -321,10 +655,13 @@ def _poll_loop() -> None:
             with _lock:
                 result = check()
                 state, msg = step(load_state(), result)
+                lines = []
+                if result.get("up") and result.get("health"):
+                    state, lines = step_health(state, result["health"])
                 save_state(state)
-            if msg:
-                print(f"  [server-watch] {msg}")
-                _announce(msg)
+            for m in ([msg] if msg else []) + lines:
+                print(f"  [server-watch] {m}")
+                _announce(m)
         except Exception as e:
             print(f"  [server-watch] poll error: {e}")
         try:

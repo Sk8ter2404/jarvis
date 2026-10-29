@@ -787,13 +787,33 @@ _BARE_HANDOFF_RE = re.compile(
     re.IGNORECASE)
 _HANDOFF_COURTESY_RE = re.compile(
     r"(?:\s+(?:as\s+well|too|also|for\s+me|please|now))+$", re.IGNORECASE)
+# The same hand-off with no one named at all ("pass that over", "send it
+# along for me"): v3.0.6 scope F3 - "pass that over" must never become a
+# browser run. Needs the object (its particle optional: "send it", "pass
+# that") or the "over/along/on" particle alone, so "send flowers" / "give me
+# directions" stay real tasks. A trailing vocative ("pass that over, Jarvis")
+# is a courtesy word like the leading one (review finding F3: the first cut
+# demanded whitespace after the object, so every particle-less form - "send
+# it", "pass it please" - still started a paid browser run).
+_TARGETLESS_HANDOFF_RE = re.compile(
+    r"^(?:(?:no|ok|okay|just|please|jarvis|and|then)[\s,]+)*"
+    r"(?:pass|send|forward|hand|give|relay)\s+"
+    r"(?:(?:that|this|it|them|those|these|everything)(?:\s+(?:over|along|on))?"
+    r"|over|along|on)"
+    r"(?:[\s,]+(?:as\s+well|too|also|for\s+me|please|now|jarvis))*[\s.!?]*$",
+    re.IGNORECASE)
 
 
 def _handoff_guard(task: str) -> str | None:
     """The clarifying question for a task that is only a hand-off with no
     content ("pass over to Clog"), else None. Never raises (fails open)."""
     try:
-        m = _BARE_HANDOFF_RE.match(" ".join(str(task or "").split()))
+        flat = " ".join(str(task or "").split())
+        if _TARGETLESS_HANDOFF_RE.match(flat):
+            return ("A browser can't hand anything over, sir. If you meant "
+                    "Claude, say \"pass that over to Claude\" and I'll leave "
+                    "the note.")
+        m = _BARE_HANDOFF_RE.match(flat)
         if not m:
             return None
         name = _HANDOFF_COURTESY_RE.sub("", m.group("name")).strip(" .,!?")
@@ -857,6 +877,9 @@ def _action_browse_for(arg: str = "") -> str:
     query = (arg or "").strip()
     if not query:
         return "What should I look up, sir?"
+    asked = _handoff_guard(query)        # a hand-off is no web search either
+    if asked:
+        return asked
     task = (
         f"Search the web for '{query}'. Summarise the top three results "
         "with their URLs and one-line takeaways."

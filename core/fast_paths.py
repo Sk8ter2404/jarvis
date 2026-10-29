@@ -44,6 +44,9 @@ the local model is both slow and unreliable at them (live 2026-09-29):
     (the local model answered from its head). Only a WHOLE-utterance
     expression with a number on both sides of each operator matches; "what
     times does the store open" falls through untouched.
+  * "what can you do (for me)" (v3.0.6): a fixed overview of the real skills
+    (capability_reply), each phrase kept only while an action backs it. Live
+    2026-10-28 the model claimed "I can manage your schedule".
 
 Recall never returns a recall question itself or a bare wake phrase
 ("Jarvis", "hey Jarvis, wake up"): both are skipped (_skip_for_recall).
@@ -70,7 +73,7 @@ from core.date_math import normalize
 class FastAnswer(NamedTuple):
     kind: str    # "owner-name" | "owner-identity" | "last-utterance" |
     #              "first-utterance" | "world-clock" | "time" |
-    #              "arithmetic" | a date_math kind
+    #              "arithmetic" | "capabilities" | a date_math kind
     reply: str
 
 
@@ -577,7 +580,13 @@ def is_self_check_request(text) -> bool:
 # so a whole-utterance listing question never reaches the model — the
 # monolith's _run_timer_list_shortcut runs list_timers and speaks its line.
 # Setting / cancelling a timer never matches.
-_TIMERS_N = r"(?:timers?|reminders?|countdowns?)"
+# Live 2026-10-28 18:03 "Do I have any timers or reminders running?" and
+# 17:55 "How long is left on that timer?" both missed (no "X or Y" pair, no
+# "that") and went through the model (~4.5 s to first word); both now read
+# the store (describe_timers via list_timers).
+_TIMER_ONE = r"(?:timers?|reminders?|countdowns?)"
+_TIMERS_N = rf"(?:{_TIMER_ONE}(?: (?:or|and) (?:any )?{_TIMER_ONE})?)"
+_TIMER_THE = r"(?:my|the|that|this|our)"
 _TIMER_STATE_W = r"(?:running|set|going|active|pending|on)"
 _TIMER_LIST_RES = tuple(re.compile(p) for p in (
     rf"^(?:can you |could you |would you )?(?:list|show|read|tell me|give me|"
@@ -588,10 +597,10 @@ _TIMER_LIST_RES = tuple(re.compile(p) for p in (
     rf"^(?:do i have|have i got|are there|is there|got) (?:any|a) "
     rf"(?:active |running |pending )?{_TIMERS_N}(?: {_TIMER_STATE_W})?$",
     rf"^any (?:active |running |pending )?{_TIMERS_N}(?: {_TIMER_STATE_W})?$",
-    r"^how (?:much time|long) (?:is |do i have )?(?:left|remaining) on "
-    r"(?:my|the) (?:\w+ )?timers?$",
-    r"^what is left on (?:my|the) (?:\w+ )?timers?$",
-    r"^(?:when|what time) (?:does|will|is) (?:my|the) (?:\w+ )?timer "
+    rf"^how (?:much time|long) (?:is |do i have )?(?:left|remaining) on "
+    rf"{_TIMER_THE} (?:\w+ )?{_TIMER_ONE}$",
+    rf"^what is left on {_TIMER_THE} (?:\w+ )?{_TIMER_ONE}$",
+    rf"^(?:when|what time) (?:does|will|is) {_TIMER_THE} (?:\w+ )?timer "
     r"(?:go off|going off|done|due)$",
 ))
 
@@ -680,6 +689,126 @@ def local_time_answer(text, now) -> Optional[FastAnswer]:
     return None
 
 
+# ── "what can you do" (v3.0.6) ─────────────────────────────────────────────
+# Live 2026-10-28 18:02 "What can you do for me?" -> the model's own "I can
+# manage your schedule, control your smart home, monitor your systems ... I'm
+# also quite proficient at keeping track of your timers and emails" (4.4 s to
+# first word, a list the model made up on the spot and nothing checked). The answer is
+# a fixed overview of REAL skills, each phrase kept only while an action that
+# backs it is registered. Whole utterance only: "what can you do about the
+# noise" / "what can you do with this file" are requests and fall through.
+_CAPS_YOU = r"(?:you|jarvis)"
+_CAPABILITY_RES = tuple(re.compile(p) for p in (
+    rf"(?:so |and |ok |okay )?what (?:all |else |exactly |kind of things |"
+    rf"sort of things |things )?can {_CAPS_YOU} (?:do|help (?:me )?with)"
+    rf"(?: for me| for us)?(?: exactly| then| now)?",
+    r"what (?:are|is) (?:all )?(?:of )?your (?:capabilities|skills|"
+    r"abilities|features)",
+    rf"what are {_CAPS_YOU} capable of",
+    rf"(?:tell me |remind me )?what {_CAPS_YOU} can do",
+    rf"what do {_CAPS_YOU} do",
+))
+# (phrase, the action names any one of which makes it true), in speaking
+# order. Every name is a real registration (bobert_companion.ACTIONS / the
+# skills' register()) as of v3.0.5.
+_CAPABILITY_PARTS = (
+    ("set timers and reminders", ("set_timer", "schedule_once",
+                                  "add_reminder")),
+    ("tell you the weather", ("weather_briefing",)),
+    ("read your calendar", ("calendar_today", "ms_graph_calendar")),
+    ("sort and draft your email", ("categorize_inbox", "email_briefing",
+                                   "draft_reply")),
+    ("play music and YouTube", ("play_music", "youtube_play")),
+    ("run the smart-home lights and plugs", ("control_smart_home",
+                                             "smart_home_control")),
+    ("keep an eye on the 3D printer", ("check_print",)),
+    # Review F9: one phrase per backing. The first cut joined "this PC and the
+    # home server" / "your screen or through the cameras" and kept the whole
+    # phrase on ANY one action, so system_pulse alone claimed the home server
+    # and see_screen alone claimed the cameras.
+    ("check this PC", ("system_pulse", "check_system")),
+    ("check on the home server", ("server_status",)),
+    ("look at your screen", ("see_screen", "local_describe_screen")),
+    ("look through the cameras", ("look_around",)),
+    ("search the web and your own files", ("web_search", "search_my_files")),
+    ("pass a note to Claude", ("note_for_claude",)),
+)
+
+
+def _server_configured() -> bool:
+    """Is a home server set up to be watched (core.config.SERVER_WATCH_HOST,
+    the same value skills.server_watch.host() reads)? server_status is
+    registered on every install and, with no host, only answers "I'm not
+    watching a server yet" - so registration does not back the phrase.
+    False on any error. Never raises."""
+    try:
+        from core import config as _cfg
+        h = str(getattr(_cfg, "SERVER_WATCH_HOST", "") or "").strip()
+        return bool(re.match(r"^[A-Za-z0-9._:-]+$", h))
+    except Exception:
+        return False
+
+
+# Phrases that need more than a registered action: phrase -> a zero-argument
+# check, consulted only when `available` is given (None = the fixed shipped
+# overview, which has no live setup to ask).
+_CAPABILITY_GATES = {
+    "check on the home server": _server_configured,
+}
+
+
+def _capability_backed(phrase, names, available) -> bool:
+    if available is None:
+        return True
+    if not any(n in available for n in names):
+        return False
+    gate = _CAPABILITY_GATES.get(phrase)
+    return True if gate is None else bool(gate())
+
+
+def is_capability_question(text) -> bool:
+    """True for a whole-utterance "what can you do (for me)" question. Never
+    raises."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    try:
+        t = re.sub(r"\s+", " ", normalize(text)).strip()
+        return len(t) <= 60 and any(rx.fullmatch(t) for rx in _CAPABILITY_RES)
+    except Exception:
+        return False
+
+
+def _registered_actions():
+    """The live monolith's action names, or None when it is not loaded (then
+    the whole fixed overview is used). Reads sys.modules only - the same
+    module object core.actions._bc() imports; no import, no I/O. Never
+    raises."""
+    try:
+        import sys as _sys
+        acts = getattr(_sys.modules.get("bobert_companion"), "ACTIONS", None)
+        return set(acts) if isinstance(acts, dict) and acts else None
+    except Exception:
+        return None
+
+
+def capability_reply(available=None) -> str:
+    """One spoken overview of what JARVIS really does. ``available`` is the
+    set of registered action names (None = all of _CAPABILITY_PARTS, the
+    shipped setup); a phrase none of whose actions is registered is left
+    out. Never raises."""
+    try:
+        parts = [phrase for phrase, names in _CAPABILITY_PARTS
+                 if _capability_backed(phrase, names, available)]
+    except Exception:
+        parts = [phrase for phrase, _ in _CAPABILITY_PARTS]
+    if not parts:
+        return ("I can answer questions and run what you ask for by name, "
+                "sir.")
+    body = parts[0] if len(parts) == 1 else (
+        ", ".join(parts[:-1]) + ", and " + parts[-1])
+    return (f"Quite a bit, sir: I can {body}. Ask for any of it by name.")
+
+
 def match(text, *, now=None, history=(), owner_name="",
           session_turns=None, session_start_lost=False
           ) -> Optional[FastAnswer]:
@@ -712,6 +841,9 @@ def match(text, *, now=None, history=(), owner_name="",
                               first_utterance_reply(
                                   text, session_turns, history,
                                   start_lost=session_start_lost is True))
+        if is_capability_question(text):
+            return FastAnswer("capabilities",
+                              capability_reply(_registered_actions()))
         if now is not None:
             clock = world_clock.answer(text, now)
             if clock is not None:

@@ -585,6 +585,24 @@ class RegisterCudaDllDirsTests(MonolithGlobalsTestCase):
 # ===========================================================================
 # _ensure_whisper — engine selection via mocked faster_whisper
 # ===========================================================================
+def _pin_whisper_load_state(case) -> None:
+    """Every EnsureWhisper* test sets up its own load state (3.0.6; work
+    order 2026-10-13: two of these failed when this file ran ALONE and
+    passed in the full suite). The loader reads two things a test did not
+    always set: the real CUDA driver pre-init (cuInit on the live card) and
+    _force_whisper_cpu_int8, which an earlier CUDA failure in the same
+    process leaves True. Pinned here; a test that needs another value
+    patches it inside the test. The VRAM plan (free memory on the live card
+    - a busy or small card flips a CUDA arm to CPU before it runs) is pinned
+    by every test that reaches a CUDA arm (247c043, 2026-10-15), and is left
+    real here because EnsureWhisperTests also tests the plan itself."""
+    for name, kw in (("_cuda_driver_first", {}),
+                     ("_force_whisper_cpu_int8", {"new": False})):
+        p = mock.patch.object(case.bc, name, **kw)
+        p.start()
+        case.addCleanup(p.stop)
+
+
 @requires_monolith
 class EnsureWhisperTests(MonolithGlobalsTestCase):
     @classmethod
@@ -595,6 +613,7 @@ class EnsureWhisperTests(MonolithGlobalsTestCase):
         self._saved = (self.bc._stt, self.bc._stt_device,
                        self.bc._stt_model_name, self.bc._stt_engine)
         self.bc._stt = None
+        _pin_whisper_load_state(self)
 
     def tearDown(self):
         (self.bc._stt, self.bc._stt_device,
@@ -2741,6 +2760,7 @@ class EnsureWhisperFallbackTests(MonolithGlobalsTestCase):
         self._saved = (self.bc._stt, self.bc._stt_device,
                        self.bc._stt_model_name, self.bc._stt_engine)
         self.bc._stt = None
+        _pin_whisper_load_state(self)
 
     def tearDown(self):
         (self.bc._stt, self.bc._stt_device,
@@ -3918,6 +3938,7 @@ class EnsureWhisperOpenaiCudaFallbackTests(MonolithGlobalsTestCase):
         self._saved = (self.bc._stt, self.bc._stt_device,
                        self.bc._stt_model_name, self.bc._stt_engine)
         self.bc._stt = None
+        _pin_whisper_load_state(self)
 
     def tearDown(self):
         (self.bc._stt, self.bc._stt_device,
@@ -5484,6 +5505,7 @@ class EnsureWhisperRaiseArmTests(MonolithGlobalsTestCase):
         self._saved = (self.bc._stt, self.bc._stt_device,
                        self.bc._stt_model_name, self.bc._stt_engine)
         self.bc._stt = None
+        _pin_whisper_load_state(self)
 
     def tearDown(self):
         (self.bc._stt, self.bc._stt_device,

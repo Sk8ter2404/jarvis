@@ -22,6 +22,18 @@ indefinitely. The window is only as strict as the room is quiet. This port keeps
 the Dell's semantics unchanged; capping the total extension is a policy choice
 left to the owner.
 
+3.0.6 MITIGATION (media audio). Live 2026-10-28 17:28: "play vision quest on
+the left monitor" opened the window, a "Yeah." heard over the video he had
+just started was admitted and extended it, and 18 s later a 164-character
+narration from that video was admitted too and ran session_memory_recall.
+Both voices scored 0.64-0.68 - "unsure", which the media gate lets through
+because his own commands over media land there as well. So the media gate
+can now TAKE BACK the extension an admitted utterance made (take_back_admit)
+when the PC was playing audio and the voice was not confirmed as his (see
+core.media_gate.keeps_followup_extension, setting FOLLOWUP_MEDIA_NO_EXTEND).
+The utterance itself still runs; it just cannot hold the window open. A
+wake-word turn (note_addressed) is unchanged.
+
 Pure stdlib, no I/O, injectable clock — testable on the light-deps CI runner.
 """
 from __future__ import annotations
@@ -43,6 +55,10 @@ class FollowupWindow:
             self.window_s = 0.0          # a malformed setting disables, never widens
         self._clock = clock
         self._until = 0.0
+        # (deadline before, deadline after) of the last admit() that extended
+        # the window, until the turn is judged (take_back_admit) or a new
+        # gate decision starts (forget_admit / note_addressed).
+        self._last_admit = None
 
     @property
     def enabled(self) -> bool:
@@ -50,6 +66,7 @@ class FollowupWindow:
 
     def note_addressed(self) -> None:
         """The user just addressed JARVIS by its wake word: (re)open the window."""
+        self._last_admit = None
         if self.enabled:
             self._until = self._clock() + self.window_s
 
@@ -62,9 +79,34 @@ class FollowupWindow:
             return False
         now = self._clock()
         if now < self._until:
+            self._last_admit = (self._until, now + self.window_s)
             self._until = now + self.window_s
             return True
+        self._last_admit = None
         return False
+
+    def forget_admit(self) -> None:
+        """A new gate decision starts: an earlier turn's extension can no
+        longer be taken back. Never raises."""
+        self._last_admit = None
+
+    def take_back_admit(self) -> bool:
+        """Undo the extension the last admit() made, once: the window keeps
+        the deadline it had before that utterance (it may still be open, it
+        is just not pushed further). False when there is nothing to take
+        back (no admit since the last forget_admit / note_addressed, or the
+        window moved since). Never raises."""
+        try:
+            memo, self._last_admit = self._last_admit, None
+            if not memo:
+                return False
+            before, after = memo
+            if self._until != after:
+                return False
+            self._until = before
+            return True
+        except Exception:
+            return False
 
     def remaining_s(self) -> float:
         """Seconds left in the window (0.0 when closed or disabled)."""

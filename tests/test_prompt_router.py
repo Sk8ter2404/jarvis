@@ -2027,3 +2027,74 @@ class ReleaseTimingRoutingTests(unittest.TestCase):
         self.assertTrue(pr.is_release_timing_request("is it out yet"))
         self.assertEqual(t(""), "")
         self.assertEqual(t(None), "")
+
+
+# Live 2026-10-28 17:26:00 (session_2026-10-28_17-21-18.log).
+LIVE_DECLINE_ASK = "How's the master sheet looking?"
+LIVE_DECLINE = "[intent:briefing] I'm afraid I've no way to check that, sir."
+
+
+class DeclineRecheckTests(unittest.TestCase):
+    """B4 (v3.0.6): a flat decline is re-checked against the action names;
+    the nearest one is offered by name, else a note for Claude. Pure."""
+    NAMES = ("note_for_claude", "check_print", "printer_status",
+             "how_is_the_print", "project_status", "server_status",
+             "system_pulse", "weather_briefing", "list_timers",
+             "which_mic_is_active", "check_credits")
+
+    def test_the_live_decline_offers_a_note(self):
+        self.assertEqual(pr.decline_recheck(LIVE_DECLINE, LIVE_DECLINE_ASK,
+                                            self.NAMES),
+                         pr.DECLINE_NOTE_OFFER)
+
+    def test_a_strong_name_match_is_offered_not_run(self):
+        for ask, offer in (
+                ("which mic is active right now", "which mic is active"),
+                ("what are my claude credits like", "check credits"),
+                ("what's my server status", "server status")):
+            with self.subTest(ask=ask):
+                self.assertEqual(
+                    pr.decline_recheck(LIVE_DECLINE, ask, self.NAMES),
+                    f"Shall I try {offer} instead, sir?")
+
+    def test_a_lifecycle_action_is_never_offered(self):
+        # Review of B4: "yes" to "Shall I try shut down instead?" would
+        # shut JARVIS down. The REAL names, so the check is the registry's.
+        names = self.NAMES + ("shut_down", "restart", "close_window",
+                              "create_skill", "reload_skills")
+        for ask in ("is the server going to shut down tonight?",
+                    "can you check whether the computer will restart?",
+                    "did the window close by itself",
+                    "will the new skill be created tonight"):
+            with self.subTest(ask=ask):
+                got = pr.decline_recheck(LIVE_DECLINE, ask, names)
+                self.assertEqual(got, pr.DECLINE_NOTE_OFFER)
+        self.assertEqual(pr.decline_recheck(LIVE_DECLINE,
+                                            "is the server going to shut "
+                                            "down tonight?", ("shut_down",)),
+                         "")
+
+    def test_an_ambiguous_match_is_the_note(self):
+        # check_print / printer_status / how_is_the_print all match "print".
+        self.assertEqual(pr.nearest_action("how's the print on the printer",
+                                           self.NAMES), "")
+
+    def test_only_a_flat_decline_is_touched(self):
+        for reply in (
+                "[ACTION: check_print] I've no way to check that, sir.",
+                "I checked and couldn't reach it, sir.",
+                "It's 72 degrees, sir.",
+                "I'm afraid I've no way to check that, sir. " + "word " * 20,
+                "", None):
+            with self.subTest(reply=reply):
+                self.assertEqual(pr.decline_recheck(reply, LIVE_DECLINE_ASK,
+                                                    self.NAMES), "")
+        self.assertEqual(pr.decline_recheck(LIVE_DECLINE, "", self.NAMES), "")
+
+    def test_no_note_action_no_note_offer(self):
+        self.assertEqual(pr.decline_recheck(LIVE_DECLINE, LIVE_DECLINE_ASK,
+                                            ("get_time",)), "")
+
+    def test_never_raises(self):
+        self.assertEqual(pr.decline_recheck(object(), object(), object()), "")
+        self.assertEqual(pr.nearest_action(None, None), "")

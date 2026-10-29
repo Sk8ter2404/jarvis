@@ -2200,3 +2200,126 @@ def is_owner_memory_request(user_text: str) -> bool:
         return bool(_OWNER_MEMORY_RE.search((user_text or "").lower()))
     except Exception:
         return False
+
+
+# ── Flat-decline re-check (v3.0.6 B4) ────────────────────────────────────
+# Live 2026-10-28 17:26:00 "How's the master sheet looking?" -> "I'm afraid
+# I've no way to check that, sir." and nothing else: no action, no way on.
+# The prompt teaches that sentence for a capability that does not exist, but
+# a router keyword miss reaches it too (the 09-05 STATUS READ-BACKS block, the
+# BROWSER AGENT phrases above). decline_recheck looks the owner's words up in
+# the registered action names: a strong match (2+ of his content words in
+# one action's name) is OFFERED by name, never run ("Shall I try
+# printer status, sir?"); otherwise the offer is a note for Claude, so the
+# gap reaches the developer. Either way it is a question, which the open-
+# offer slot (core.open_offer) lets a plain "yes" accept. Only a FLAT
+# decline (no action token, at most 20 words) is touched.
+_DECLINE_RE = re.compile(
+    r"\b(?:i'?ve|i\s+have|i'?ve\s+got)\s+no\s+(?:way|means)\s+(?:to|of)\s+"
+    r"(?:check|checking|see|seeing|know|knowing|tell|telling|read|reading|"
+    r"look|looking)\b"
+    r"|\bi\s+(?:can'?t|cannot|am\s+unable\s+to|'m\s+unable\s+to)\s+"
+    r"(?:check|see|read)\s+(?:that|this|it)\b", re.IGNORECASE)
+_TAG_RE = re.compile(r"\[[^\]]*\]")
+# Name words that say nothing about the subject.
+_ACTION_NAME_GENERIC = frozenset("""
+check get list set show open close start stop run read status info toggle
+on off mode my the a to of for and is what which how do now current all
+""".split())
+DECLINE_NOTE_OFFER = "Shall I note that for Claude to add, sir?"
+
+
+def _name_words(name: str) -> set:
+    return {w for w in str(name or "").lower().split("_")
+            if len(w) >= 3 and w not in _ACTION_NAME_GENERIC}
+
+
+def nearest_action(user_text: str, action_names) -> str:
+    """The ONE registered action whose name his words point at, else "".
+    A name qualifies when 2+ of its content words (stem tolerant,
+    _word_match) are in ``user_text``, or when its only content word (5+
+    letters: "credits", "server") is one he said outright. The most matched
+    words win, then the fewest unmatched; a tie at the top is ambiguous and
+    returns "" (the note offer is the safe answer). Never raises."""
+    try:
+        own = _content_words(user_text)
+        if not own:
+            return ""
+        scored = []
+        for name in sorted(set(action_names or ())):
+            words = _name_words(name)
+            if not words:
+                continue
+            matched = {w for w in words if _word_match(own, {w})}
+            single = (len(words) == 1 and words <= own
+                      and len(next(iter(words))) >= 5)
+            if len(matched) >= 2 or single:
+                scored.append(((len(matched), -(len(words) - len(matched))),
+                               name))
+        if not scored:
+            return ""
+        scored.sort(key=lambda t: t[0], reverse=True)
+        if len(scored) > 1 and scored[0][0] == scored[1][0]:
+            return ""
+        return scored[0][1]
+    except Exception:
+        return ""
+
+
+def is_flat_decline(reply: str) -> bool:
+    """True when ``reply`` is ONLY the "no way to check that" decline: the
+    decline sentence, no [ACTION ...] token, at most 20 words once the
+    [intent:...] tags are off. Never raises."""
+    try:
+        text = str(reply or "")
+        if "[ACTION" in text.upper():
+            return False
+        spoken = " ".join(_TAG_RE.sub(" ", text).split())
+        if not spoken or len(spoken.split()) > 20:
+            return False
+        return _DECLINE_RE.search(spoken) is not None
+    except Exception:
+        return False
+
+
+_LIFECYCLE_NAME_RE = re.compile(
+    r"shut|restart|reboot|reload|close|kill|quit|exit|stop|delete|remove|"
+    r"create|wipe|uninstall|sleep|lock|logoff|log_off|sign_out", re.I)
+
+
+def _safe_to_offer(name: str) -> bool:
+    """A read-only action that is no lifecycle control, else False. Never
+    raises (a failed import = not safe)."""
+    try:
+        if _LIFECYCLE_NAME_RE.search(str(name or "")):
+            return False
+        from core import action_fit
+        return bool(action_fit.is_informative_action(name))
+    except Exception:
+        return False
+
+
+def decline_recheck(reply: str, user_text: str, action_names=()) -> str:
+    """The offer to add after a flat decline of ``user_text``, or "" (not a
+    flat decline, no owner words). The nearest registered action by name
+    (nearest_action) as a question, else DECLINE_NOTE_OFFER. Never runs
+    anything; pure; never raises."""
+    try:
+        if not (user_text or "").strip() or not is_flat_decline(reply):
+            return ""
+        names = set(action_names or ())
+        # Review of the live fix: a yes to "Shall I try shut down instead?"
+        # runs it, and "is the server going to shut down tonight?" matched
+        # shut_down (JARVIS's own exit) and "will the computer restart?"
+        # matched restart. Only a read-only action (core.action_fit
+        # .is_informative_action) is ever offered by name, and never one
+        # whose name says it stops, restarts, closes or creates something.
+        name = nearest_action(user_text, names)
+        if name and not _safe_to_offer(name):
+            name = ""
+        if name:
+            return f"Shall I try {name.replace('_', ' ')} instead, sir?"
+        # The note offer only when a yes can be carried out.
+        return DECLINE_NOTE_OFFER if "note_for_claude" in names else ""
+    except Exception:
+        return ""

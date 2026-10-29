@@ -64,7 +64,9 @@ MCU_PHRASES: dict[str, list[str]] = {
     ],
     "dry_humour": [
         "Shall I add that to the list of things you've reconsidered, sir?",
-        "I'll note that for posterity.",
+        # Was "I'll note that for posterity." - a promise of work no action
+        # does (live 2026-10-28 15:57:47; v3.0.6, core/persona.py too).
+        "One does admire the optimism, sir.",
         "A bold choice, if I may say so.",
         "Quite the strategy, sir.",
         "Noted, sir — though I make no promises about the outcome.",

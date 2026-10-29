@@ -75,6 +75,11 @@ DIR_NAME = "turns"
 # counted only when it carries the word "would" (shadow's wording), so the
 # 'on' mode's "skipped" / "not speaking" lines are not mistaken for shadow.
 SHADOW_TAGS = ("head-hold", "learn-prefilter", "action-fit", "loop-guard")
+# 3.0.6: the ambient-learn path's "[learn-prefilter] would skip (ambient
+# fragment)" line (bobert_companion._ambient_owner_fragment_skip) belongs to
+# no owner turn - 103 of the 116 W09 log lines on 2026-10-28 were these - so
+# it is counted under its own key and W09's per-turn figure stays honest.
+AMBIENT_SHADOW_KEY = "learn-prefilter-ambient"
 # Lines the speech / claim validators and guards print when they act.
 VALIDATOR_TAGS = ("validation", "speech-hygiene", "ack-hold", "result-hold",
                   "claim", "timers", "send-guard", "auth-guard",
@@ -161,9 +166,20 @@ def _finalize(rec: dict) -> dict:
 
 def begin() -> None:
     """A new turn started: clear the collector. Shadow lines counted while no
-    turn was open ride with this turn (see observe). Never raises."""
+    turn was open ride with this turn (see observe). Never raises.
+
+    An ABANDONED collector (begun, never committed) keeps its shadow lines:
+    they go back into the carry first. Live 2026-10-28 15:55: the "would skip
+    (command)" line carried into the 15:55:10 VAD break, that break was
+    dropped as noise (no [turn-timing] emit, so no commit), and the next VAD
+    break at 15:55:17 wiped it - W09's trace count read 9 against 115 log
+    lines that day."""
     try:
         with _lock:
+            if _active[0]:
+                for tag, n in (_cur.get("shadow") or {}).items():
+                    if isinstance(n, int):
+                        _carry[tag] = _carry.get(tag, 0) + n
             _cur.clear()
             _cur["shadow"] = dict(_carry)
             _carry.clear()
@@ -264,6 +280,8 @@ def observe(msg) -> None:
         if tag in SHADOW_TAGS:
             if "would" not in rest:
                 return
+            if tag == "learn-prefilter" and "ambient fragment" in rest:
+                tag = AMBIENT_SHADOW_KEY
             with _lock:
                 bucket = (_cur.setdefault("shadow", {}) if _active[0]
                           else _carry)

@@ -320,6 +320,47 @@ class WeatherBriefingTests(unittest.TestCase):
             out = actions["weather_briefing"]("")
         self.assertEqual(out, "Currently 69 degrees and clear, sir.")
 
+    def test_action_says_sir_once_live_20261028(self):
+        # Live 2026-10-28 17:53: "Currently 78 degrees and clear, sir. Sir, the
+        # temperature drops about 10 degrees by 7 PM — you may want a jacket."
+        mod, actions = load_skill_isolated("weather_briefing")
+        with mock.patch.object(mod, "_current_conditions_line",
+                               return_value="Currently 78 degrees and clear, sir."), \
+             mock.patch.object(mod, "get_umbrella_alert", return_value=""), \
+             mock.patch.object(mod, "get_two_hour_alert",
+                               return_value="Sir, the temperature drops about 10 "
+                                            "degrees by 7 PM — you may want a jacket."):
+            out = actions["weather_briefing"]("")
+        self.assertEqual(out, "Currently 78 degrees and clear, sir. The temperature "
+                              "drops about 10 degrees by 7 PM — you may want a jacket.")
+        self.assertEqual(out.lower().count("sir"), 1)
+
+    def test_action_umbrella_line_drops_its_inner_sir(self):
+        mod, actions = load_skill_isolated("weather_briefing")
+        with mock.patch.object(mod, "_current_conditions_line",
+                               return_value="Currently 61 degrees and overcast, sir."), \
+             mock.patch.object(mod, "get_umbrella_alert",
+                               return_value="I'd suggest the umbrella today, sir — "
+                                            "80% chance of rain at 3 PM."):
+            out = actions["weather_briefing"]("")
+        self.assertEqual(out, "Currently 61 degrees and overcast, sir. I'd suggest the "
+                              "umbrella today — 80% chance of rain at 3 PM.")
+
+    def test_alert_alone_keeps_its_sir(self):
+        # No current reading: the alert is the whole answer and keeps "Sir,".
+        mod, actions = load_skill_isolated("weather_briefing")
+        alert = "Sir, conditions shift to light rain around 5 PM."
+        with mock.patch.object(mod, "_current_conditions_line", return_value=""), \
+             mock.patch.object(mod, "get_umbrella_alert", return_value=""), \
+             mock.patch.object(mod, "get_two_hour_alert", return_value=alert):
+            self.assertEqual(actions["weather_briefing"](""), alert)
+
+    def test_drop_repeat_sir_never_raises(self):
+        mod, _ = load_skill_isolated("weather_briefing")
+        self.assertEqual(mod._drop_repeat_sir(None, "x"), "x")
+        self.assertEqual(mod._drop_repeat_sir("sir", ""), "")
+        self.assertEqual(mod._drop_repeat_sir("sir.", "Sir, "), "Sir, ")
+
     def test_action_combines_current_and_alert(self):
         mod, actions = load_skill_isolated("weather_briefing")
         with mock.patch.object(mod, "_current_conditions_line",

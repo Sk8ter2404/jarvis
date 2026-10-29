@@ -389,5 +389,64 @@ class RemarkRerunTests(unittest.TestCase):
         self.assertFalse(af.is_informative_action("lights_on"))
 
 
+class RobotSpeechTests(unittest.TestCase):
+    """Rule 6 (v3.0.6 B7; live 2026-10-28 17:26:20): "We need to give the
+    deskbot more voice lines." ran deskbot_speak ("I am ready for more
+    dialogue.") and the robot said it."""
+
+    # The live words and action named the owner's robot; "deskbot" is a
+    # made-up stand-in of the same shape (public code never names it).
+    LIVE = "We need to give the deskbot more voice lines."
+    _UNASKED = (LIVE, "Jarvis, the deskbot needs a new battery",
+                "he does not sound happy", "the robot is on the desk",
+                "we should make him smarter")
+    # The live fixture's two deskbot_speak turns, plus the shapes the
+    # skill is for.
+    _ASKS = ("Jarvis, make him talk.", "Jarvis, make the deskbut talk.",
+             "have the deskbot say hi", "tell the robot I aced my exam",
+             "let him introduce himself", "make him say good morning",
+             "deskbot, greet my roommate", "get him to tell a joke",
+             "have it read this out", "make the desk bot roast me")
+
+    def test_the_live_turn_flags(self):
+        reason = af.check(self.LIVE, "deskbot_speak", "I am ready for more "
+                          "dialogue.")
+        self.assertIsNotNone(reason)
+        self.assertIn("deskbot_speak", reason)
+
+    def test_unasked_speech_flags(self):
+        for text in self._UNASKED:
+            with self.subTest(text=text):
+                self.assertFalse(af.asks_robot_speech(text), text)
+                self.assertIsNotNone(af.check(text, "deskbot_speak", "hi"))
+
+    def test_asked_speech_fits(self):
+        for text in self._ASKS:
+            with self.subTest(text=text):
+                self.assertTrue(af.asks_robot_speech(text), text)
+                self.assertIsNone(af.check(text, "deskbot_speak", "hi"))
+
+    def test_other_robot_actions_are_not_rule_six(self):
+        self.assertIsNone(af.check(self.LIVE, "deskbot_banter"))
+        self.assertIsNone(af.check(self.LIVE, "deskbot_engage"))
+        self.assertIsNone(af.check(self.LIVE, "say_hello"))
+        self.assertIsNone(af.check(self.LIVE, "tts_speak"))
+
+    def test_any_bot_speak_action_is_recognised_by_name(self):
+        for nm in ("deskbot_speak", "DeskBot_Speak", "desk_bot_speak",
+                   "robot_speak", "deskbott_speak"):
+            with self.subTest(nm=nm):
+                self.assertTrue(af.is_robot_speak_action(nm), nm)
+                self.assertIsNotNone(af.check(self.LIVE, nm, "hi"))
+        for nm in ("deskbot_banter", "speak", "tts_speak", "bot_speaker",
+                   "", None):
+            with self.subTest(nm=nm):
+                self.assertFalse(af.is_robot_speak_action(nm), nm)
+
+    def test_no_owner_words_never_flags(self):
+        self.assertIsNone(af.check("", "deskbot_speak", "hello"))
+        self.assertFalse(af.asks_robot_speech(None))
+
+
 if __name__ == "__main__":
     unittest.main()

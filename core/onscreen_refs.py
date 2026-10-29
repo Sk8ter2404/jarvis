@@ -36,7 +36,7 @@ __all__ = [
     "referent_phrase", "is_ui_correction", "is_scene_back_reference",
     "pending_choice_answer", "is_screen_recall_request",
     "screen_memory_command", "forget_span", "claude_note", "is_video_like",
-    "rewrite_referent", "youtube_play_query",
+    "rewrite_referent", "youtube_play_query", "dev_todo_note",
 ]
 
 _WAKE_RE = re.compile(r"^\s*(?:(?:hey|ok|okay)[\s,]+)?jarvis\b[\s,.:;!?-]*",
@@ -630,6 +630,104 @@ def forget_span(text) -> "dict | None":
         return None
 
 
+# ── "open it" with nothing for "it" to be (v3.0.6) ──────────────────────
+# Live 2026-10-28 17:25:16: "Jarvis, can you open it up so I can help you?"
+# -> [ACTION: open_app, PowerShell] -> "launched PowerShell". Nothing he said
+# and nothing JARVIS had just said named PowerShell (the turn before was the
+# server status line); the model filled the bare "it" with an app of its own.
+# A WHOLE "open it / that (up)" turn whose app is named neither in his words
+# nor in the last few lines of the conversation is a question back.
+_OPEN_PRONOUN_RE = re.compile(
+    r"^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:go\s+ahead\s+"
+    r"and\s+|just\s+)?(?:open|launch|start|run|pull|bring|fire)\s+"
+    r"(?:it|that|this|them|those)\s*(?:back\s+)?(?:up\s*)?"
+    r"(?:(?:,\s*)?(?:so|and)\s+(?:that\s+)?(?:i|we)\s+.*"
+    r"|for\s+me|please|now|again|real\s+quick|sir|jarvis|[\s,])*$",
+    re.IGNORECASE)
+_APP_FILLER = frozenset({"the", "app", "application", "program", "a", "an",
+                         "my", "window", "exe"})
+OPEN_WHAT_LINE = "Open what, sir?"
+
+
+_REPLY_TOKEN_RE = re.compile(r"\[\s*(?:ACTION|intent)\s*:[^\]]*\]", re.IGNORECASE)
+
+
+def strip_reply_tokens(text) -> str:
+    """``text`` without its [ACTION: ...] / [intent:...] tokens. Pure; never
+    raises."""
+    try:
+        return re.sub(r"\s+", " ", _REPLY_TOKEN_RE.sub(" ", str(text or ""))
+                      ).strip()
+    except Exception:
+        return ""
+
+
+def history_through_latest_user(hist) -> list:
+    """The entries of ``hist`` (conversation_history) up to and INCLUDING the
+    latest user entry; the assistant reply of the turn in progress is left
+    out. Live 2026-10-28 review: _call_llm appends the brain's reply to
+    conversation_history BEFORE parse_and_run_actions runs the action, so a
+    handler that read the last lines of history saw its own
+    "[ACTION: open_app, PowerShell]" / "[ACTION: set_timer, ... | check the
+    oven]" and took the brain's invention for something the owner had said.
+    No user entry at all: the list unchanged. Pure; never raises."""
+    try:
+        if not isinstance(hist, list):
+            return []
+        for i in range(len(hist) - 1, -1, -1):
+            m = hist[i]
+            if isinstance(m, dict) and m.get("role") == "user":
+                return list(hist[:i + 1])
+        return list(hist)
+    except Exception:
+        return []
+
+
+def recent_context(hist, n: int = 5) -> str:
+    """The last ``n`` conversation lines through the latest user entry (see
+    history_through_latest_user), action / intent tokens stripped. Pure;
+    never raises."""
+    try:
+        kept = history_through_latest_user(hist)[-n:]
+        return " ".join(
+            strip_reply_tokens(m["content"]) for m in kept
+            if isinstance(m, dict) and isinstance(m.get("content"), str))
+    except Exception:
+        return ""
+
+
+def _compact(text) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(text or "").lower())
+
+
+def unresolved_open(said, name, recent="") -> "str | None":
+    """``OPEN_WHAT_LINE`` when ``said`` is WHOLLY "open it (up) ..." (a bare
+    pronoun for the object) and ``name`` - the app the brain chose - is
+    named neither in ``said`` nor in ``recent`` (the last lines of the
+    conversation, his and JARVIS's), else None. "Shall I open Spotify?" /
+    "yes, open it" keeps Spotify; "open it up so I can help you" after a
+    server status line gets "Open what, sir?" instead of PowerShell. Pure;
+    never raises."""
+    try:
+        s = clean(said)
+        if not s or not name or not _OPEN_PRONOUN_RE.match(s):
+            return None
+        words = [w for w in re.findall(r"[a-z0-9]+", str(name).lower())
+                 if w not in _APP_FILLER]
+        if not words:
+            return None
+        context = f"{s} {recent or ''}"
+        ctx_words = set(re.findall(r"[a-z0-9]+", context.lower()))
+        ctx_compact = _compact(context)
+        if _compact(" ".join(words)) in ctx_compact:
+            return None
+        if any(len(w) >= 3 and w in ctx_words for w in words):
+            return None
+        return OPEN_WHAT_LINE
+    except Exception:
+        return None
+
+
 # ── "tell Claude ..." (developer notes) ─────────────────────────────────
 _CLAUDE_NOTE_RE = re.compile(
     r"\b(?:tell|let|remind|ask|have|get|message|text|ping)\s+claude\b"
@@ -738,7 +836,141 @@ _DEV_TOPIC_RE = re.compile(
     r"not\s+working|working\s+properly)\b", re.IGNORECASE)
 
 
+# ── Developer to-dos WITHOUT the word "Claude" (v3.0.6) ─────────────────
+# Live 2026-10-28 17:26: "We need to give the robot more voice lines." (said
+# with the owner's robot's name) had no "Claude" in it, so no route claimed
+# it; the brain sent the robot's speak action with "I am ready for more
+# dialogue." and the robot said a line nobody asked for. The same words at 17:57 got note_for_claude from
+# the brain - a coin toss. A "we need to / we should" plan for JARVIS or the
+# robot to GAIN something is work for the developer, never a command to run
+# now. Deliberately narrow; everything else stays the brain's:
+#   * it must OPEN the turn (after the wake word / lead filler) - "do we need
+#     to ...?" / "should we make him ...?" are questions;
+#   * the subject is "we" (a plan); "you need to ..." only as "you need to
+#     stop saying / repeating / calling me ..." (speech habits, which no
+#     action changes - "stop playing music" / "stop commenting" are real
+#     commands and never match);
+#   * the object is JARVIS or the robot (you / yourself / jarvis / the
+#     robot, or him / his only together with a feature). The owner's robot
+#     is never named here: _ROBOT_WORD is any word ending in "bot" (robot,
+#     chatbot, a one-word device name, a doubled final t from the
+#     recogniser), optionally behind one more word for a two-word spoken
+#     name ("<word> bot", "<word>-bot");
+#   * and what he wants is a feature (voice lines, jokes, features,
+#     smarter, able to ...) - "we need to give him more time", "we should
+#     make you a playlist", "we need to turn off the lights" never match.
+# "update / upgrade you" is NOT here: an update is a real action.
+_DEV_SUBJECT = (r"^(?:(?:so|ok|okay|and|also|oh|hey|alright|right|now|"
+                r"jarvis)[\s,]+)*we\s+(?:really\s+|still\s+|definitely\s+|"
+                r"probably\s+)?(?:need\s+to|have\s+to|gotta|got\s+to|should|"
+                r"ought\s+to|must)\s+")
+_ROBOT_WORD = r"(?:[a-z]+(?:\s+|\s*-\s*))?[a-z]*bott?"
+_DEV_TARGET = (r"(?P<tgt>you|yourself|jarvis|(?:the\s+|my\s+|our\s+)?"
+               + _ROBOT_WORD + r"|him|his)")
+_DEV_FEATURE = (
+    r"(?:voice\s+lines?|lines|dialog(?:ue)?s?|phrases|sayings|catch\s*phrases|"
+    r"jokes|sounds?|sound\s+effects|responses|replies|reactions|features?|"
+    r"personality|abilit(?:y|ies)|skills?|commands|animations?|moves|"
+    r"gestures|expressions|options?|settings?|memory|voices?|vocabulary|"
+    r"smarter|faster|quicker|funnier|(?:a\s+)?(?:lot\s+)?better\s+at|"
+    r"more\s+(?:natural|human|responsive|reliable|accurate|expressive|"
+    r"talkative|useful)|able\s+to|(?:a\s+)?way\s+to|support\s+for)")
+_DEV_TODO_WE_RE = re.compile(
+    _DEV_SUBJECT
+    + r"(?:give|teach|add|make|program|build|let|improve|fix)\s+"
+    + r"(?:\S+\s+){0,3}?" + _DEV_TARGET + r"\b(?P<rest>.*)$",
+    re.IGNORECASE)
+_DEV_TODO_FIX_RE = re.compile(
+    _DEV_SUBJECT + r"(?:fix|improve)\s+(?:you|yourself|jarvis|"
+    r"(?:the\s+|my\s+|our\s+)?" + _ROBOT_WORD + r")$", re.IGNORECASE)
+_DEV_TODO_NEEDS_RE = re.compile(
+    r"^(?:the\s+|my\s+|our\s+)?" + _ROBOT_WORD + r"\s+(?:really\s+)?"
+    r"(?:needs|should\s+have|could\s+use)\s+(?P<rest>.*)$", re.IGNORECASE)
+_DEV_TODO_STOP_RE = re.compile(
+    r"^you\s+(?:really\s+)?(?:need\s+to|have\s+to|gotta|got\s+to|should|"
+    r"must)\s+stop\s+(?:saying|repeating|calling\s+me)\b\s*\S", re.IGNORECASE)
+_DEV_FEATURE_RE = re.compile(r"\b" + _DEV_FEATURE + r"\b", re.IGNORECASE)
+# "him" / "his" is also a person ("give him more time to finish his skills
+# test", "we need to give him a ride to his skills competition", "let him
+# know about the settings", "add him to the group chat with more options"):
+# the feature may sit ANYWHERE after "you" / "the robot", but after
+# "him" / "his" it must come RIGHT after the target, optionally behind a
+# quantity word ("make him smarter", "give him more voice lines").
+_DEV_FEATURE_NEXT_RE = re.compile(
+    r"^\s*(?:(?:more|new|better|some|extra|different|other|additional|"
+    r"another|a\s+few|a\s+lot\s+more|lots\s+of|many\s+more)\s+)?"
+    + _DEV_FEATURE + r"\b", re.IGNORECASE)
+# A second clause in the same breath is a command he gave too ("you need to
+# stop calling me sir and turn on the lights", "we need to make him able to
+# see, and also turn on the lights"): the note would swallow it, so the turn
+# stays the brain's. "and make him smarter" / "and stop saying X" are more
+# developer to-dos and do not count.
+_DEV_CMD_VERBS = (r"turn|switch|set|play|open|launch|close|dim|brighten|run|"
+                  r"call|send|text|put|check|tell|show|search|look|find|"
+                  r"pause|resume|mute|unmute|skip|lock|unlock|shut|read|"
+                  r"remind|schedule|start")
+_DEV_COMPOUND_RE = re.compile(
+    r"(?:,\s*and\b|\band\s+also\b|\bthen\b|\balso\s+(?:" + _DEV_CMD_VERBS
+    + r")\b|\band\s+(?:please\s+)?(?:" + _DEV_CMD_VERBS
+    + r")\b|[,;.]\s*(?:and\s+)?(?:please\s+)?(?:" + _DEV_CMD_VERBS
+    + r")\b)", re.IGNORECASE)
+
+
+def _dev_todo_on() -> bool:
+    """DEV_TODO_NOTES (core/config.py), read per call. Never raises."""
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, "DEV_TODO_NOTES", True))
+    except Exception:
+        return True
+
+
+def dev_todo_note(text) -> "str | None":
+    """The note when the WHOLE turn is a developer to-do for JARVIS / the
+    robot that never says "Claude" ("We need to give the robot more voice
+    lines", "we should make you smarter", "you need to stop saying 'indeed'"),
+    else None. The note is his sentence as said (wake word and trailing
+    punctuation off). See the block comment for how narrow it is. Never
+    raises."""
+    try:
+        s = clean(text)
+        if not s or "?" in s:
+            return None
+        if _DEV_TODO_STOP_RE.match(s) or _DEV_TODO_FIX_RE.match(s):
+            return None if _DEV_COMPOUND_RE.search(s) else s
+        m = _DEV_TODO_WE_RE.match(s)
+        if m:
+            rest = m.group("rest")
+            if _DEV_COMPOUND_RE.search(s):
+                return None
+            # The feature must be what he wants for JARVIS / the robot: it
+            # follows the target ("give the robot more voice lines",
+            # "make him smarter"). After him / his it follows IMMEDIATELY.
+            if (m.group("tgt") or "").lower() in ("him", "his"):
+                return s if _DEV_FEATURE_NEXT_RE.match(rest) else None
+            if _DEV_FEATURE_RE.search(rest):
+                return s
+            return None
+        m = _DEV_TODO_NEEDS_RE.match(s)
+        if (m and _DEV_FEATURE_RE.search(m.group("rest"))
+                and not _DEV_COMPOUND_RE.search(s)):
+            return s
+    except Exception:
+        return None
+    return None
+
+
 def claude_note(text) -> "str | None":
+    """The note for the developer: a "Claude" note (_claude_named_note), or,
+    with DEV_TODO_NOTES on, a developer to-do that never names him
+    (dev_todo_note). Never raises."""
+    note = _claude_named_note(text)
+    if note is None and _dev_todo_on():
+        note = dev_todo_note(text)
+    return note
+
+
+def _claude_named_note(text) -> "str | None":
     """The note for the developer (Claude) in "tell Claude to research the
     screen vision", "let Claude know your clicking is off", "leave Claude a
     note: ...", else None. The note must be about JARVIS or his workings

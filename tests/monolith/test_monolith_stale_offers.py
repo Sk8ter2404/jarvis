@@ -48,7 +48,9 @@ _HISTORY = [
      "content": f"On it, sir. [ACTION: web_search, {_QUERY}]"},
     {"role": "user", "content": "Jarvis, how's my print doing?"},
 ]
-_OPEN_OFFER = "offer to read the results via see_screen"
+# v3.0.6: was "... via see_screen" - live 2026-10-28 17:53 the action name
+# was spoken aloud; the offer is now in plain words.
+_OPEN_OFFER = "offer to read the results to him"
 
 # Verbatim from the 2026-10-01 session log.
 _R_205928 = (
@@ -109,6 +111,21 @@ class SearchGuardTests(_OfferBase):
         bc._note_turn_action_ran("web_search", _SEARCH_OK)
         bc._last_web_search_at[0] = time.time()
         self.assertIn(_OPEN_OFFER, self._guard_text())
+
+    def test_the_open_guard_names_no_action(self):
+        # Live 2026-10-28 17:53 ("what's a good quick dinner idea?"): the
+        # spoken reply carried "see_screen" - the guard asked for an offer
+        # "via see_screen". No action name in the words it asks for.
+        bc = self.bc
+        prev = bc._begin_turn_grounding("find me better models")
+        self.addCleanup(bc._end_turn_grounding, prev)
+        bc._note_turn_action_ran("web_search", _SEARCH_OK)
+        bc._last_web_search_at[0] = time.time()
+        text = self._guard_text()
+        start = text.index("IMPORTANT: a web search was just fired")
+        guard = text[start:text.index("\n\n", start)]
+        for name in ("see_screen", "web_search", "read_screen"):
+            self.assertNotIn(name, guard)
 
     def test_an_earlier_turns_search_only_forbids_inventing_results(self):
         self.bc._last_web_search_at[0] = time.time() - 120

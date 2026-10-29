@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+from unittest import mock
 
 from tests._monolith_harness import requires_monolith
 from tests.monolith.test_monolith_claim_validation import _Base
@@ -173,13 +174,26 @@ class FailureCircleTests(_Base):
                                      spoke_substance=True, barged=False),
             bc._CLOSE_OUT_GENERIC)
         # The other cuts keep their rule: something real was said, no line.
-        for cut in ("loop detected", "no new progress", "depth cap",
-                    "ended on a promise"):
+        for cut in ("loop detected", "no new progress", "depth cap"):
             with self.subTest(cut=cut):
                 self.assertEqual(
                     bc._chain_close_out_line(cut=cut, rounds=2,
                                              spoke_substance=True,
                                              barged=False), "")
+        # v3.0.6 (CHAIN_PROMISE_CHECK on): "ended on a promise" now means the
+        # last word was an unkept promise, so earlier substance does not
+        # excuse it. Off: the old rule, no line.
+        with self.subTest(cut="ended on a promise"):
+            self.assertEqual(
+                bc._chain_close_out_line(cut="ended on a promise", rounds=2,
+                                         spoke_substance=True, barged=False),
+                bc._CLOSE_OUT_GENERIC)
+        with self.subTest(cut="ended on a promise", check=False),                 mock.patch.object(bc, "CHAIN_PROMISE_CHECK", False,
+                                  create=True):
+            self.assertEqual(
+                bc._chain_close_out_line(cut="ended on a promise", rounds=2,
+                                         spoke_substance=True, barged=False),
+                "")
         self.assertEqual(
             bc._chain_close_out_line(cut="repeating failure", rounds=2,
                                      spoke_substance=True, barged=True), "")

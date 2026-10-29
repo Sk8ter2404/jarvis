@@ -115,6 +115,9 @@ class BudgetTests(_WatchdogBase):
         # 20-minute job timeout so the watchdog always reports first.
         self.assertGreaterEqual(tw.DEFAULT_PER_PHASE_S, 60.0)
         self.assertGreaterEqual(tw.DEFAULT_TOTAL_S, 600.0)
+        # v3.0.6: a local run measured 1,118 s (work order 10-13) and the
+        # 10-28 v3.0.4 gate took 32 min, so 900 s killed honest runs.
+        self.assertGreaterEqual(tw.DEFAULT_TOTAL_S, 1800.0)
         # Read the job timeout from ci.yml itself (it was raised 20 -> 40 on
         # 2026-10-14 when the two-run job outgrew 20 minutes).
         with open(os.path.join(_PROJECT_ROOT, ".github", "workflows", "ci.yml"),

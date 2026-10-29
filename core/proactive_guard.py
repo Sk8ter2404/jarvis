@@ -148,6 +148,9 @@ RETIRED_EXAMPLES = (
     "I've run the calculations, sir.",
     "Cross-referencing now.",
     "Cross-referencing now, sir.",
+    # An empty promise retired from the phrase pools (v3.0.6).
+    "I'll note that for posterity, sir.",
+    "I'll note that for posterity.",
 )
 
 # A capitalised single-quoted sentence in the persona prompt: 'Very good,

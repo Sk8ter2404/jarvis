@@ -17,7 +17,10 @@ returns ``None`` or a short reason string:
 * ``ping-pong``  the last four calls are A, B, A, B (two different actions,
                  each time with a similar argument);
 * ``poll``       a screen-look action (see_screen / read_screen /
-                 local_describe_screen ...) for the fourth time.
+                 local_describe_screen ...) for the fourth time with nothing
+                 in between that can change the screen (3.0.6: a click,
+                 scroll, type or open starts a fresh count, the rule
+                 screen_read_refusal below already follows).
 
 Input-driving actions (click, type, press, hotkey, scroll, wait ...) are
 exempt from all three: filling a form is click, type, click, type, and
@@ -53,6 +56,23 @@ EXEMPT_ACTIONS = frozenset({
     "scroll_up", "scroll_down", "wait", "sleep", "pause_for", "drag",
     "move_mouse", "mouse_move",
 })
+
+# Actions that really change what is on the screen: only these start a fresh
+# look count in LoopGuard (wait, find_on_screen, move_mouse, list_windows and
+# unrelated actions such as web_search do not). Open/launch/scroll families
+# are matched by prefix in _drives_screen.
+SCREEN_DRIVING_ACTIONS = frozenset({
+    "click", "click_on_screen", "local_click_target_by_description",
+    "double_click", "right_click", "type", "type_text", "press", "press_key",
+    "hotkey", "key", "drag",
+})
+SCREEN_DRIVING_PREFIXES = ("scroll", "open_", "launch")
+
+
+def _drives_screen(n: str) -> bool:
+    return (n in SCREEN_DRIVING_ACTIONS
+            or n.startswith(SCREEN_DRIVING_PREFIXES))
+
 
 REPEAT_LIMIT = 3          # the same (name, arg) this many times in a chain
 WINDOW = 4                # A, B, A, B
@@ -111,6 +131,24 @@ class LoopGuard:
                 return None
             self._calls.append((n, a))
             del self._calls[:-WINDOW * 2]
+            if _drives_screen(n):
+                # The screen may have changed since the last look (3.0.6,
+                # investigation 2026-10-28: the count ran across clicks and
+                # scrolls, so in 'on' a legitimate look, click, look, click,
+                # look, click, look chain would be cut at the fourth look).
+                # A look after such a step is a new look, so the repeat
+                # count of the looks starts again too (else the same chain
+                # is cut at its third empty-arg see_screen as a "repeat").
+                # Review 2026-10-28: ONLY a step that really drives the
+                # screen resets. wait / find_on_screen / move_mouse change
+                # nothing, and an unrelated action (web_search) is not a
+                # change to the screen being looked at - the live 10-19
+                # web_search / see_screen alternation and see_screen, wait x6
+                # would otherwise never trip poll budget or repeat. Other
+                # actions' repeats stand.
+                self._polls = 0
+                for k in [k for k in self._counts if k[0] in POLL_ACTIONS]:
+                    del self._counts[k]
             if n in EXEMPT_ACTIONS:
                 # Kept in the window so a step between two look-ups breaks
                 # an A, B, A, B run; never counted or judged itself.
