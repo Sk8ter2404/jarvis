@@ -1082,7 +1082,17 @@ class _ImmediateFuture:
 class SubmitAndSyncTests(_BrowserAgentTestBase):
     """Drive _submit / _run_task_sync without the real bg loop: the loop
     thread is stubbed and run_coroutine_threadsafe executes the coroutine on
-    a throwaway local loop, returning an immediate future."""
+    a throwaway local loop, returning an immediate future. These are the
+    blocking path (BROWSER_TASK_BACKGROUND off); the background path is
+    tests/skills/test_browser_agent_background.py."""
+
+    def setUp(self):
+        super().setUp()
+        import core.config as cfg
+        patcher = mock.patch.object(cfg, "BROWSER_TASK_BACKGROUND", False,
+                                    create=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _patch_loop(self, result="task result", exc=None):
         sentinel_loop = object()

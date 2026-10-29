@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.8 (2026-10-28)
+
+Faster answers and fewer freezes, from tonight's live checks. 'What's new' says the version and reads the summary once, without a second model round. 'What can you do' names seven skills and offers the rest. Web-browsing tasks run in the background: JARVIS says 'Working on it, sir', stays free to talk, and tells you the result when it is done ('stop' or 'never mind' cancels it). The morning briefing says 'sir' once, and 'I'll hand it to Claude' after a question refers back to that question. A cheaper at-desk face detector runs side by side with the current one and only logs how often they agree, so it can be switched on once it proves itself. A Kinect ghost-skeleton filter and a switch to keep the Claude safety net after November 5 are built but off by default.
+
 ## v3.0.7 (2026-10-28)
 
 Three fixes from tonight's live log. 'Why is the RAM so high?' or 'what's using all my memory?' is answered at once with the number and the biggest memory users, even below the high mark, and JARVIS's own thinking on the GPU is said as such. In the follow-up window after he answers, a voice that does not clearly match the owner no longer keeps the window open, and its remarks that are not a command or a question for JARVIS are ignored, so he stops replying to other people in the room. A spoken 'I've noted that' when no note was made is replaced with an honest 'I haven't made a note of that, sir.'

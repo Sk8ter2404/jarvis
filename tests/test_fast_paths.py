@@ -891,5 +891,46 @@ class MemoryQuestionTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
 
+
+class ShortCapabilityOverviewTests(unittest.TestCase):
+    """v3.0.8 H2: the overview is short, and a yes to its offer gets the
+    rest (the live entry point: tests/monolith/test_monolith_v308_fast_paths)."""
+
+    def setUp(self):
+        from unittest import mock
+        import core.config as cfg
+        p = mock.patch.object(cfg, "CAPABILITIES_SHORT_OVERVIEW", True,
+                              create=True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_short_then_rest_covers_everything_once(self):
+        short = fp.capability_short_reply()
+        rest = fp.capability_rest_reply()
+        self.assertTrue(short.endswith(fp.CAPABILITY_MORE_OFFER))
+        for phrase, _ in fp._CAPABILITY_PARTS:
+            self.assertEqual((phrase in short) + (phrase in rest), 1, phrase)
+
+    def test_few_skills_need_no_offer(self):
+        some = fp.capability_short_reply({"set_timer", "web_search"})
+        self.assertEqual(some, fp.capability_reply({"set_timer",
+                                                    "web_search"}))
+        self.assertNotIn(fp.CAPABILITY_MORE_OFFER, some)
+
+    def test_followup_needs_the_offer_last(self):
+        short = fp.capability_short_reply()
+        hist = [{"role": "user", "content": "what can you do"},
+                {"role": "assistant", "content": short}]
+        self.assertEqual(fp.match("yes", history=hist).kind,
+                         "capabilities-more")
+        self.assertIsNone(fp.match("yes", history=hist[:1]))
+        self.assertIsNone(fp.match("no", history=hist))
+        later = hist + [{"role": "user", "content": "x"},
+                        {"role": "assistant", "content": "y"}]
+        self.assertIsNone(fp.match("yes", history=later))
+        self.assertEqual(fp.match("what can you do", history=later).kind,
+                         "capabilities")
+
+
 if __name__ == "__main__":
     unittest.main()

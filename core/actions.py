@@ -6369,10 +6369,12 @@ def _act_read_changelog(args: str = "") -> str:
             return f"could not summarise the changelog: {box['error']}"
         summary = box.get("summary") or ""
         if not summary:
+            # Voiced word for word (a content result, v3.0.8 H1), so it
+            # names the file, never its full path.
             return _with_version_line(
                 version_line,
                 "I couldn't produce a summary just now, sir — the full "
-                f"changelog is at {_changelog_path}.", spoken)
+                f"notes are in {os.path.basename(_changelog_path)}.", spoken)
         return _with_version_line(version_line, summary, spoken)
     except Exception as e:
         return f"could not read the changelog: {e}"

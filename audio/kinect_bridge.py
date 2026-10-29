@@ -1598,6 +1598,10 @@ def _read_and_cache_bodies(consume: bool = True) -> list[dict]:
     except Exception:   # pragma: no cover - defensive: mid-stream readiness/getter glitch
         return []
     bodies = _parse_body_frame(frame)
+    # KINECT_GHOST_FILTER_ENABLED (default OFF = this returns bodies as is):
+    # drop bodies that cannot be a person in the room, before any consumer
+    # sees the frame. See filter_ghost_bodies.
+    bodies = filter_ghost_bodies(bodies)
     # Cache it AND advance the shared hand stabiliser exactly once for this
     # real frame (get_tracked_frame) - see publish_body_frame.
     publish_body_frame(bodies)
@@ -2516,6 +2520,7 @@ DEPTH_SURROUND_MARGIN_M = 0.30  # a ring sample counts as "nearer" beyond this
 DEPTH_SURROUND_SUSPECT_FRAC = 0.60   # ring this nearer-dominated -> "suspect"
 DEPTH_AGREE_GHOST_FRAC = 0.35   # corroboration below this -> "uncorroborated"
 DEPTH_MIN_SAMPLES = 6           # fewer valid samples than this -> "unknown"
+DEPTH_COPLANAR_TOL_M = 0.06     # a ring sample this close to the body's z is "same"
 DEPTH_W, DEPTH_H = 512, 424
 
 
@@ -2563,11 +2568,14 @@ def depth_corroborate(body: dict, depth, mapper) -> dict:
                          the KNOWN FALSE POSITIVE note above.
       "real"           -- corroborated and occluding its surroundings.
 
-    Nothing acts on this verdict yet; it is scoring, not gating."""
+    Live, nothing acts on this verdict: it is scoring, not gating. The ghost
+    filter (KINECT_GHOST_FILTER_ENABLED, default OFF) is the one opt-in reader
+    that drops a body on it - see filter_ghost_bodies."""
     out = {"verdict": "unknown", "reason": "", "body_z_m": None,
            "joint_samples": 0, "joint_agree": 0, "agree_frac": None,
            "surround_samples": 0, "surround_nearer": 0,
-           "surround_nearer_frac": None}
+           "surround_nearer_frac": None,
+           "surround_same": 0, "surround_same_frac": None}
     try:
         if not body or depth is None or not callable(mapper):
             out["reason"] = "no body / depth frame / mapper"
@@ -2641,6 +2649,7 @@ def depth_corroborate(body: dict, depth, mapper) -> dict:
         near_cut = float(z_ref) - DEPTH_SURROUND_MARGIN_M
         s_total = 0
         s_near = 0
+        s_same = 0
         for px, py in ring:
             mm = _depth_mm_at(depth, px, py)
             if mm is None:
@@ -2648,8 +2657,18 @@ def depth_corroborate(body: dict, depth, mapper) -> dict:
             s_total += 1
             if (mm / 1000.0) < near_cut:
                 s_near += 1
+            elif abs(mm / 1000.0 - float(z_ref)) <= DEPTH_COPLANAR_TOL_M:
+                s_same += 1
         out["surround_samples"] = s_total
         out["surround_nearer"] = s_near
+        # Additive (2026-10-28): ring samples at the body's OWN depth. A body
+        # whose surroundings sit at its depth is not standing in front of
+        # anything - it is part of a surface (a flat depth blob: a picture, a
+        # screen, a wall). The verdict below ignores it; the default-off ghost
+        # filter (filter_ghost_bodies) reads it.
+        out["surround_same"] = s_same
+        if s_total:
+            out["surround_same_frac"] = round(s_same / float(s_total), 3)
         if s_total < DEPTH_MIN_SAMPLES:
             out["verdict"] = "real"
             out["reason"] = ("corroborated (%d/%d joints); surround unreadable "
@@ -2702,6 +2721,272 @@ def depth_check_bodies(bodies: Optional[list] = None) -> list[dict]:
         return out
     except Exception:   # pragma: no cover - defensive: accessors already swallow
         return []
+
+
+# --- OPT-IN GHOST-BODY FILTER (KINECT_GHOST_FILTER_ENABLED, default OFF) -------
+# The owner's report: the Kinect "sees ghost skeletons". _body_is_real (always
+# on, at the parse point) already drops inferred / zero-fill phantoms; what gets
+# past it is a body whose joints track cleanly but cannot be a person standing
+# in the room. This filter, run once per body frame on the pump before the frame
+# is published (so presence, the nearest-body pick, gestures, the stabiliser and
+# the HUD all see the same list), drops a body when:
+#   1. limbs  - too many of its measured bones have a length no adult has
+#               (GHOST_BONES): a skeleton fitted onto furniture or noise;
+#   2. flat   - its tracked joints all sit at one depth (z span under
+#               GHOST_FLAT_Z_SPAN_M): a body painted onto a surface;
+#   3. depth  - (rechecked per body every KINECT_GHOST_DEPTH_RECHECK_SEC, 0 = no
+#               depth check) depth_corroborate says "uncorroborated" (no mass
+#               where the joints are), "suspect" (framed by NEARER geometry: a
+#               mirror or a TV screen's reflection), or its surround sits at its
+#               own depth (surround_same_frac >= DEPTH_SURROUND_FLAT_FRAC: a flat
+#               depth blob - a picture or a screen, not a person in front of
+#               anything).
+# An "unknown" depth verdict (too little depth) never drops a body.
+# KNOWN FALSE POSITIVES, which is why it is OFF until tested live: a real person
+# standing IN a doorway or framed by a nearer monitor edge reads "suspect"; one
+# flat against a wall can read coplanar. The thresholds are seeded from adult
+# anatomy and geometry, not calibrated on this sensor.
+GHOST_BONES = (
+    # (joint a, joint b, min m, max m) - generous adult ranges; hands, thumbs,
+    # tips and feet are left out (the SDK's noisiest joints).
+    ("head", "neck", 0.05, 0.35),
+    ("neck", "spine_shoulder", 0.02, 0.25),
+    ("spine_shoulder", "spine_mid", 0.10, 0.50),
+    ("spine_mid", "spine_base", 0.08, 0.45),
+    ("spine_shoulder", "shoulder_left", 0.08, 0.35),
+    ("spine_shoulder", "shoulder_right", 0.08, 0.35),
+    ("shoulder_left", "elbow_left", 0.15, 0.45),
+    ("shoulder_right", "elbow_right", 0.15, 0.45),
+    ("elbow_left", "wrist_left", 0.12, 0.40),
+    ("elbow_right", "wrist_right", 0.12, 0.40),
+    ("spine_base", "hip_left", 0.03, 0.25),
+    ("spine_base", "hip_right", 0.03, 0.25),
+    ("hip_left", "knee_left", 0.20, 0.65),
+    ("hip_right", "knee_right", 0.20, 0.65),
+    ("knee_left", "ankle_left", 0.20, 0.60),
+    ("knee_right", "ankle_right", 0.20, 0.60),
+)
+GHOST_MIN_BONES = 3            # fewer measured bones than this: no limb verdict
+GHOST_BAD_BONES_MIN = 2        # at least this many bad bones...
+GHOST_BAD_BONE_FRAC = 0.34     # ...AND at least this share of the measured ones
+GHOST_FLAT_MIN_JOINTS = 8      # need this many tracked joints for a flat verdict
+GHOST_FLAT_Z_SPAN_M = 0.03     # every tracked joint within this depth band = flat
+DEPTH_SURROUND_FLAT_FRAC = 0.85  # this share of the ring at the body's own depth
+GHOST_DEPTH_REJECT = ("uncorroborated", "suspect")
+
+_ghost_lock = threading.Lock()
+_ghost_depth_seen: dict = {}       # body id -> (monotonic checked-at, reason|"")
+_ghost_dropped_ids: set = set()    # ids already announced as dropped
+_ghost_last: dict = {"checked": 0, "dropped": 0, "reasons": []}
+# The newest depth frame the filter itself received as GENUINELY new, and when.
+GHOST_DEPTH_MAX_AGE_SEC = 0.5
+_ghost_depth_frame: list = [None, 0.0]     # [ndarray|None, monotonic received-at]
+
+
+def _ghost_cfg(name: str, default):
+    """A core.config value read live (user_settings.json applies there), coerced
+    to the default's type; a bad value keeps the default. Never raises."""
+    try:
+        from core import config as _c
+        v = getattr(_c, name, default)
+        if isinstance(default, bool):
+            if isinstance(v, str):
+                return v.strip().lower() in ("1", "true", "yes", "on", "y")
+            return bool(v)
+        if isinstance(default, float):
+            f = float(v)
+            return f if f == f and f not in (float("inf"), float("-inf")) \
+                else default
+        return v
+    except Exception:
+        return default
+
+
+def _ghost_fresh_depth(max_age: float = GHOST_DEPTH_MAX_AGE_SEC):
+    """The depth frame the ghost filter may judge a body against, or None.
+
+    get_depth() with require_new=False keeps serving one frozen buffer after the
+    depth stream dies, so judging live bodies against it would drop the real
+    user ("uncorroborated") on every recheck. Only a frame that arrived new
+    (get_depth(require_new=True)) or was received that way within ``max_age``
+    seconds is used; otherwise the verdict is "no depth" (unknown, never
+    remembered, never a drop). Never raises."""
+    try:
+        now = time.monotonic()
+        d = get_depth(require_new=True)
+        if d is not None:
+            with _ghost_lock:
+                _ghost_depth_frame[0], _ghost_depth_frame[1] = d, now
+            return d
+        with _ghost_lock:
+            held, at = _ghost_depth_frame
+        if held is not None and 0.0 <= now - at <= max_age:
+            return held
+    except Exception:   # pragma: no cover - defensive
+        pass
+    return None
+
+
+def ghost_filter_enabled() -> bool:
+    """KINECT_GHOST_FILTER_ENABLED (core.config, default False)."""
+    return bool(_ghost_cfg("KINECT_GHOST_FILTER_ENABLED", False))
+
+
+def body_limb_report(joints: dict) -> dict:
+    """Score a parsed joint dict's bone lengths against GHOST_BONES. Only bones
+    whose BOTH ends are fully tracked are measured. Pure; never raises.
+    {"measured": int, "bad": int, "bad_bones": [(a, b, length_m), ...]}"""
+    out = {"measured": 0, "bad": 0, "bad_bones": []}
+    try:
+        for a, b, lo, hi in GHOST_BONES:
+            ja, jb = (joints or {}).get(a), (joints or {}).get(b)
+            if not (_joint_reliable(ja) and _joint_reliable(jb)):
+                continue
+            d = _dist3(ja, jb)
+            if d is None:
+                continue
+            out["measured"] += 1
+            if not (lo <= d <= hi):
+                out["bad"] += 1
+                out["bad_bones"].append((a, b, round(float(d), 3)))
+    except Exception:   # pragma: no cover - defensive: malformed joints
+        pass
+    return out
+
+
+def body_plausibility(body: dict, depth_report: Optional[dict] = None) -> dict:
+    """Is this parsed body (a get_bodies() entry) a person in the room? PURE -
+    the depth evidence, when there is any, comes in as a depth_corroborate()
+    report. Never raises; an unusable body reads as plausible (this filter only
+    ever drops on positive evidence).
+    {"ok": bool, "reason": str, "limbs": body_limb_report(...),
+     "z_span_m": float | None, "depth_verdict": str | None}"""
+    out = {"ok": True, "reason": "", "limbs": None, "z_span_m": None,
+           "depth_verdict": None}
+    try:
+        joints = (body or {}).get("joints") or {}
+        limbs = body_limb_report(joints)
+        out["limbs"] = limbs
+        if (limbs["measured"] >= GHOST_MIN_BONES
+                and limbs["bad"] >= GHOST_BAD_BONES_MIN
+                and limbs["bad"] >= GHOST_BAD_BONE_FRAC * limbs["measured"]):
+            out["ok"] = False
+            out["reason"] = ("impossible limb lengths (%d of %d bones)"
+                             % (limbs["bad"], limbs["measured"]))
+            return out
+        zs = [float(j[2]) for j in joints.values() if _joint_reliable(j)]
+        if zs:
+            out["z_span_m"] = round(max(zs) - min(zs), 3)
+        if (len(zs) >= GHOST_FLAT_MIN_JOINTS
+                and (max(zs) - min(zs)) < GHOST_FLAT_Z_SPAN_M):
+            out["ok"] = False
+            out["reason"] = ("flat: %d tracked joints within %.0f mm of depth"
+                             % (len(zs), (max(zs) - min(zs)) * 1000.0))
+            return out
+        if isinstance(depth_report, dict):
+            verdict = depth_report.get("verdict")
+            out["depth_verdict"] = verdict
+            if verdict in GHOST_DEPTH_REJECT:
+                out["ok"] = False
+                out["reason"] = "depth %s" % verdict
+                return out
+            same = depth_report.get("surround_same_frac")
+            if (verdict == "real" and isinstance(same, (int, float))
+                    and same >= DEPTH_SURROUND_FLAT_FRAC):
+                out["ok"] = False
+                out["reason"] = ("flat depth blob: the surround sits at the "
+                                 "body's own depth")
+                return out
+    except Exception:   # pragma: no cover - defensive: malformed body
+        out["ok"], out["reason"] = True, ""
+    return out
+
+
+def filter_ghost_bodies(bodies: list, now: Optional[float] = None,
+                        depth_fn=None, mapper_fn=None) -> list:
+    """The pump's opt-in ghost filter (see the block comment above). With
+    KINECT_GHOST_FILTER_ENABLED off this returns ``bodies`` itself, untouched -
+    the live path is exactly as before. On, it returns the bodies that pass
+    body_plausibility; the depth evidence is read at most once per call, and
+    for each body at most every KINECT_GHOST_DEPTH_RECHECK_SEC (its last depth
+    verdict is reused in between). Prints one line when a body is first dropped.
+    NEVER raises: any failure returns ``bodies`` unfiltered."""
+    if not bodies or not ghost_filter_enabled():
+        return bodies
+    try:
+        ts = time.monotonic() if now is None else float(now)
+        recheck = float(_ghost_cfg("KINECT_GHOST_DEPTH_RECHECK_SEC", 1.0))
+        depth_fn = depth_fn or _ghost_fresh_depth
+        mapper_fn = mapper_fn or get_depth_space_mapper
+        keep: list = []
+        reasons: list = []
+        frame_depth: list = []       # [(depth, mapper)] once read this call
+        ids = set()
+        for b in bodies:
+            bid = b.get("id")
+            ids.add(bid)
+            rep = body_plausibility(b)
+            if rep["ok"] and recheck > 0:
+                with _ghost_lock:
+                    seen = _ghost_depth_seen.get(bid)
+                if seen is not None and 0.0 <= ts - seen[0] < recheck:
+                    depth_reason = seen[1]
+                else:
+                    if not frame_depth:
+                        d = depth_fn()
+                        m = mapper_fn() if d is not None else None
+                        frame_depth.append((d, m))
+                    d, m = frame_depth[0]
+                    depth_reason = ""
+                    if d is not None and m is not None:
+                        drep = body_plausibility(
+                            b, depth_report=depth_corroborate(b, d, m))
+                        depth_reason = "" if drep["ok"] else drep["reason"]
+                        # Only a real depth read is remembered: with no
+                        # frame yet, the next call tries again.
+                        with _ghost_lock:
+                            _ghost_depth_seen[bid] = (ts, depth_reason)
+                if depth_reason:
+                    rep = {"ok": False, "reason": depth_reason}
+            if rep["ok"]:
+                keep.append(b)
+                continue
+            reasons.append(rep["reason"])
+            with _ghost_lock:
+                first = bid not in _ghost_dropped_ids
+                _ghost_dropped_ids.add(bid)
+            if first:
+                print("  [kinect] ghost filter dropped a body - "
+                      f"{rep['reason']}", flush=True)
+        with _ghost_lock:
+            for gone in [k for k in _ghost_depth_seen if k not in ids]:
+                _ghost_depth_seen.pop(gone, None)
+            _ghost_dropped_ids.intersection_update(ids)
+            _ghost_last.update(checked=len(bodies),
+                               dropped=len(bodies) - len(keep),
+                               reasons=reasons)
+        return keep
+    except Exception:   # pragma: no cover - defensive: never break the body pipe
+        return bodies
+
+
+def ghost_filter_status() -> dict:
+    """The last filtered frame: {"enabled", "checked", "dropped", "reasons"}.
+    For diagnostics and tests. Never raises."""
+    with _ghost_lock:
+        out = dict(_ghost_last)
+        out["reasons"] = list(_ghost_last.get("reasons") or ())
+    out["enabled"] = ghost_filter_enabled()
+    return out
+
+
+def reset_ghost_filter() -> None:
+    """Forget every per-body depth verdict and dropped id (tests, a reset)."""
+    with _ghost_lock:
+        _ghost_depth_seen.clear()
+        _ghost_dropped_ids.clear()
+        _ghost_last.update(checked=0, dropped=0, reasons=[])
+        _ghost_depth_frame[0], _ghost_depth_frame[1] = None, 0.0
 
 
 def _nearest_body(bodies: list[dict]) -> Optional[dict]:

@@ -340,6 +340,37 @@ def _fetch_robot_volunteer() -> str:
         return ""
 
 
+def _sir_once_on() -> bool:
+    """BRIEFING_SIR_ONCE (core/config.py), read per call. Never raises."""
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, "BRIEFING_SIR_ONCE", True))
+    except Exception:
+        return True
+
+
+def _drop_repeat_sir(earlier: str, later: str) -> str:
+    """``later`` minus its own "sir" when ``earlier`` already said it - the
+    weather skill's own join rule (weather_briefing._drop_repeat_sir, v3.0.6),
+    so the two can never drift. The briefing opens "Good morning, sir." and
+    the umbrella alert / robot remark that ride along open "Sir, ..." or carry
+    ", sir -" because they are also spoken alone. BRIEFING_SIR_ONCE off, or
+    the weather skill unavailable: ``later`` unchanged. Never raises."""
+    if not later or not _sir_once_on():
+        return later
+    try:
+        try:
+            from . import weather_briefing  # type: ignore
+        except Exception:
+            sys.path.insert(0, _SKILLS_DIR)
+            import weather_briefing  # type: ignore
+        fn = getattr(weather_briefing, "_drop_repeat_sir", None)
+        out = fn(earlier, later) if callable(fn) else later
+        return out if isinstance(out, str) and out else later
+    except Exception:
+        return later
+
+
 def _build_briefing() -> str:
     now = time.localtime()
     day = time.strftime("%A", now)
@@ -371,11 +402,11 @@ def _build_briefing() -> str:
         head = f"{sentence_one} {sentence_two}"
 
     if umbrella:
-        head = f"{head} {umbrella}"
+        head = f"{head} {_drop_repeat_sir(head, umbrella)}"
 
     robot = _fetch_robot_volunteer()
     if robot:
-        head = f"{head} {robot}"
+        head = f"{head} {_drop_repeat_sir(head, robot)}"
 
     # If we've got news, prepend the briefing intent tag so the whole
     # message reads with the measured "briefing" TTS preset. The tag is

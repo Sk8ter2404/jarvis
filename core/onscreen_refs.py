@@ -798,6 +798,52 @@ _PASS_ASKED_RE = re.compile(
 # Review 2026-10-28: "I'm looking forward to Claude." noted "I'm looking".
 _PASS_CLAUSE_END_RE = re.compile(
     r"(?:[.!?]|\b(?:or|and)(?:\s+just)?)[\s,]*$", re.IGNORECASE)
+# v3.0.8 (PASS_FUTURE_REFERS_BACK): "I'll hand it to Claude" made a note
+# reading "I'll" (known since 3.0.5). A first-person future / "let me" right
+# before the hand-off says nothing of its own: it is the hand-off of the
+# previous request, or of the task said before it ("find the manual, or I'll
+# pass it to Claude").
+_PASS_FUTURE_SUBJ_RE = re.compile(
+    r"(?:^|(?<=[\s,;:.!?-]))"
+    r"(?:i[’']ll|i\s+will|i\s+shall|i[’']m\s+(?:going\s+to|gonna)|"
+    r"i\s+am\s+(?:going\s+to|gonna)|let\s+me|let[’']s|let\s+us|we[’']ll|"
+    r"we\s+will|we[’']re\s+(?:going\s+to|gonna))"
+    r"(?:\s+(?:just|probably|then|now|also|go\s+ahead\s+and|go\s+and))*"
+    r"[\s,]*$", re.IGNORECASE)
+# The clause before a future hand-off is a task when it ended in "or" / "and"
+# ("find the manual, or I'll pass it to Claude"), opens with an imperative
+# verb, or holds one of the module's task verbs. "know" / "see" / "note" are
+# left out of the last test: "I don't know, I'll hand it to Claude" is an
+# aside (review 2026-10-28).
+_PASS_LEAD_CONNECT_RE = re.compile(r"\b(?:or|and)(?:\s+just)?[\s,]*$",
+                                   re.IGNORECASE)
+_PASS_IMPERATIVES = (
+    r"find|look|get|put|send|write|call|order|buy|book|schedule|create|open|"
+    r"search|set|turn|read|draft|plan|ask|tell|show|give|take|pull|run|"
+    r"install|remove|delete|pick|bring|email|text|message|make|fix|add|"
+    r"research|improve|change|build|learn|study|investigate|figure|debug|"
+    r"update|check|review|watch|test|teach|implement|redo|rewrite|tune|train|"
+    r"remember|work|clean|move|sort|file|print|download|upload|save|finish|"
+    r"start|cancel|reply|respond|draw|design|compare|summarize|"
+    r"translate|list|track|monitor")
+_PASS_TASK_START_RE = re.compile(
+    r"^(?:(?:please|just|go\s+ahead\s+and|can\s+you|could\s+you|would\s+you|"
+    r"will\s+you)[\s,]+)*(?:" + _PASS_IMPERATIVES + r")\s+\w", re.IGNORECASE)
+_PASS_TASK_ANY_RE = re.compile(
+    r"\b(?:research|fix|fixes|fixing|look\s+into|work\s+on|improve|change|add|"
+    r"make|build|learn|study|investigate|figure\s+out|debug|update|check|"
+    r"review|watch|test|teach|implement|redo|rewrite|tune|train|remember)\b",
+    re.IGNORECASE)
+
+
+def _pass_future_on() -> bool:
+    """PASS_FUTURE_REFERS_BACK (core/config.py), read per call. Never
+    raises."""
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, "PASS_FUTURE_REFERS_BACK", True))
+    except Exception:
+        return True
 # "Put my hours in for me, or tell Claude to DO IT" (live 2026-10-26 20:06):
 # the task is the clause before the hand-off.
 _CLAUDE_DO_IT_RE = re.compile(
@@ -852,10 +898,11 @@ _DEV_TOPIC_RE = re.compile(
 #     commands and never match);
 #   * the object is JARVIS or the robot (you / yourself / jarvis / the
 #     robot, or him / his only together with a feature). The owner's robot
-#     is never named here: _ROBOT_WORD is any word ending in "bot" (robot,
-#     chatbot, a one-word device name, a doubled final t from the
-#     recogniser), optionally behind one more word for a two-word spoken
-#     name ("<word> bot", "<word>-bot");
+#     is never named here: _ROBOT_WORD is "robot", "bot", a one-word
+#     "<word>bot" device name (a doubled final t from the recogniser too)
+#     or a two-word spoken name ("<word> bot", "<word>-bot") - since v3.0.8
+#     not a common English word such as chatbot / abbot (see
+#     _ROBOT_WORD_STRICT);
 #   * and what he wants is a feature (voice lines, jokes, features,
 #     smarter, able to ...) - "we need to give him more time", "we should
 #     make you a playlist", "we need to turn off the lights" never match.
@@ -864,9 +911,28 @@ _DEV_SUBJECT = (r"^(?:(?:so|ok|okay|and|also|oh|hey|alright|right|now|"
                 r"jarvis)[\s,]+)*we\s+(?:really\s+|still\s+|definitely\s+|"
                 r"probably\s+)?(?:need\s+to|have\s+to|gotta|got\s+to|should|"
                 r"ought\s+to|must)\s+")
-_ROBOT_WORD = r"(?:[a-z]+(?:\s+|\s*-\s*))?[a-z]*bott?"
-_DEV_TARGET = (r"(?P<tgt>you|yourself|jarvis|(?:the\s+|my\s+|our\s+)?"
-               + _ROBOT_WORD + r"|him|his)")
+_ROBOT_WORD_LOOSE = r"(?:[a-z]+(?:\s+|\s*-\s*))?[a-z]*bott?"
+# v3.0.8 (DEV_TODO_ROBOT_STRICT): the loose word above also took "we need to
+# fix the chatbot", "make the Talbot more reliable" and "the abbot needs more
+# lines". Strict: "robot", "bot" on its own, a two-word "<word> bot" /
+# "<word>-bot" (not "chat bot"), or a one-word "<word>bot" that is not a
+# common English word; never a household "robot vacuum / mower ...". A
+# doubled final t from the recogniser still counts.
+_BOT_COMMON_WORDS = (r"(?:abbott?|sabot|turbot|jabot|talbott?|cabot|chatbot|"
+                     r"chabot)")
+_ROBOT_WORD_STRICT = (
+    r"(?:(?!chat\b)[a-z]+(?:\s+|\s*-\s*)bott?\b|robot\b|bott?\b"
+    r"|(?!" + _BOT_COMMON_WORDS + r"\b)[a-z]+bott?\b)"
+    r"(?!\s+(?:vacuums?|mops?|mowers?|lawn\s*mowers?|cleaners?|toys?)\b)")
+_ROBOT_WORD = _ROBOT_WORD_STRICT
+
+
+def _dev_target(robot_word: str) -> str:
+    return (r"(?P<tgt>you|yourself|jarvis|(?:the\s+|my\s+|our\s+)?"
+            + robot_word + r"|him|his)")
+
+
+_DEV_TARGET = _dev_target(_ROBOT_WORD)
 _DEV_FEATURE = (
     r"(?:voice\s+lines?|lines|dialog(?:ue)?s?|phrases|sayings|catch\s*phrases|"
     r"jokes|sounds?|sound\s+effects|responses|replies|reactions|features?|"
@@ -875,17 +941,26 @@ _DEV_FEATURE = (
     r"smarter|faster|quicker|funnier|(?:a\s+)?(?:lot\s+)?better\s+at|"
     r"more\s+(?:natural|human|responsive|reliable|accurate|expressive|"
     r"talkative|useful)|able\s+to|(?:a\s+)?way\s+to|support\s+for)")
-_DEV_TODO_WE_RE = re.compile(
-    _DEV_SUBJECT
-    + r"(?:give|teach|add|make|program|build|let|improve|fix)\s+"
-    + r"(?:\S+\s+){0,3}?" + _DEV_TARGET + r"\b(?P<rest>.*)$",
-    re.IGNORECASE)
-_DEV_TODO_FIX_RE = re.compile(
-    _DEV_SUBJECT + r"(?:fix|improve)\s+(?:you|yourself|jarvis|"
-    r"(?:the\s+|my\s+|our\s+)?" + _ROBOT_WORD + r")$", re.IGNORECASE)
-_DEV_TODO_NEEDS_RE = re.compile(
-    r"^(?:the\s+|my\s+|our\s+)?" + _ROBOT_WORD + r"\s+(?:really\s+)?"
-    r"(?:needs|should\s+have|could\s+use)\s+(?P<rest>.*)$", re.IGNORECASE)
+def _dev_todo_res(robot_word: str):
+    """The (we-need-to, fix, needs) regexes for one robot-word pattern."""
+    we = re.compile(
+        _DEV_SUBJECT
+        + r"(?:give|teach|add|make|program|build|let|improve|fix)\s+"
+        + r"(?:\S+\s+){0,3}?" + _dev_target(robot_word)
+        + r"\b(?P<rest>.*)$", re.IGNORECASE)
+    fix = re.compile(
+        _DEV_SUBJECT + r"(?:fix|improve)\s+(?:you|yourself|jarvis|"
+        r"(?:the\s+|my\s+|our\s+)?" + robot_word + r")$", re.IGNORECASE)
+    needs = re.compile(
+        r"^(?:the\s+|my\s+|our\s+)?" + robot_word + r"\s+(?:really\s+)?"
+        r"(?:needs|should\s+have|could\s+use)\s+(?P<rest>.*)$",
+        re.IGNORECASE)
+    return we, fix, needs
+
+
+_DEV_TODO_WE_RE, _DEV_TODO_FIX_RE, _DEV_TODO_NEEDS_RE = _dev_todo_res(
+    _ROBOT_WORD_STRICT)
+_DEV_TODO_RES_LOOSE = _dev_todo_res(_ROBOT_WORD_LOOSE)
 _DEV_TODO_STOP_RE = re.compile(
     r"^you\s+(?:really\s+)?(?:need\s+to|have\s+to|gotta|got\s+to|should|"
     r"must)\s+stop\s+(?:saying|repeating|calling\s+me)\b\s*\S", re.IGNORECASE)
@@ -916,6 +991,19 @@ _DEV_COMPOUND_RE = re.compile(
     + r")\b)", re.IGNORECASE)
 
 
+def _dev_todo_res_now():
+    """The (we, fix, needs) regexes DEV_TODO_ROBOT_STRICT picks (core/
+    config.py, read per call; default strict). Never raises."""
+    try:
+        from core import config as _cfg
+        strict = bool(getattr(_cfg, "DEV_TODO_ROBOT_STRICT", True))
+    except Exception:
+        strict = True
+    if strict:
+        return _DEV_TODO_WE_RE, _DEV_TODO_FIX_RE, _DEV_TODO_NEEDS_RE
+    return _DEV_TODO_RES_LOOSE
+
+
 def _dev_todo_on() -> bool:
     """DEV_TODO_NOTES (core/config.py), read per call. Never raises."""
     try:
@@ -936,9 +1024,10 @@ def dev_todo_note(text) -> "str | None":
         s = clean(text)
         if not s or "?" in s:
             return None
-        if _DEV_TODO_STOP_RE.match(s) or _DEV_TODO_FIX_RE.match(s):
+        we_re, fix_re, needs_re = _dev_todo_res_now()
+        if _DEV_TODO_STOP_RE.match(s) or fix_re.match(s):
             return None if _DEV_COMPOUND_RE.search(s) else s
-        m = _DEV_TODO_WE_RE.match(s)
+        m = we_re.match(s)
         if m:
             rest = m.group("rest")
             if _DEV_COMPOUND_RE.search(s):
@@ -951,7 +1040,7 @@ def dev_todo_note(text) -> "str | None":
             if _DEV_FEATURE_RE.search(rest):
                 return s
             return None
-        m = _DEV_TODO_NEEDS_RE.match(s)
+        m = needs_re.match(s)
         if (m and _DEV_FEATURE_RE.search(m.group("rest"))
                 and not _DEV_COMPOUND_RE.search(s)):
             return s
@@ -990,6 +1079,21 @@ def _claude_named_note(text) -> "str | None":
             before = re.sub(r"^(?:(?:hey|ok|okay)[\s,]+)?jarvis\b[\s,.:;!?-]*",
                             "", before, flags=re.IGNORECASE).strip()
             if _PASS_FILLER_RE.match(before):
+                return _PASS_REFERS_BACK
+            fm = _PASS_FUTURE_SUBJ_RE.search(before) if _pass_future_on() \
+                else None
+            if fm:
+                lead = before[:fm.start()]
+                task = _BEFORE_TELL_RE.sub("", lead + " ")
+                task = task.strip(" ,.;:!?")
+                if not task or _PASS_FILLER_RE.match(task):
+                    return _PASS_REFERS_BACK
+                # Only a clause that reads as a task is the note; an aside or
+                # condition ("I think", "Wait", "If that fails") is not.
+                if (_PASS_LEAD_CONNECT_RE.search(lead)
+                        or _PASS_TASK_START_RE.match(task)
+                        or _PASS_TASK_ANY_RE.search(task)):
+                    return task
                 return _PASS_REFERS_BACK
             if not m.group("obj") and not _PASS_CLAUSE_END_RE.search(
                     s[:m.start()]):

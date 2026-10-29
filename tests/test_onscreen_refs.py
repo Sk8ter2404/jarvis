@@ -583,6 +583,118 @@ class DevTodoNoteTests(unittest.TestCase):
             self.assertIsNone(O.dev_todo_note(bad))
 
 
+class FutureHandOffTests(unittest.TestCase):
+    """v3.0.8 PASS_FUTURE_REFERS_BACK: "I'll hand it to Claude" made a note
+    reading "I'll" (known since 3.0.5). Through core.dispatcher.screen_route,
+    the route the live turn asks before the brain. Fails on v3.0.7."""
+    REFERS_BACK = f"[ACTION: note_for_claude, {O._PASS_REFERS_BACK}]"
+    FUTURE = (
+        "I'll hand it to Claude", "Jarvis, I'll hand it to Claude.",
+        "Okay, I'll just pass it over to Claude then",
+        "I will send that to Claude", "let me hand this over to Claude",
+        "I'm going to pass that to Claude", "I’ll hand it to Claude",
+        "I'll pass over to Claude", "we'll hand it to Claude",
+    )
+
+    def test_a_future_hand_off_refers_back(self):
+        for said in self.FUTURE:
+            with self.subTest(said=said):
+                self.assertEqual(screen_route(said, {}), self.REFERS_BACK)
+                self.assertNotIn("I'll", O.claude_note(said))
+
+    def test_a_task_before_it_is_the_note(self):
+        for said in ("Find the manual, or I'll hand it to Claude",
+                     "Find the manual. I'll pass it to Claude"):
+            with self.subTest(said=said):
+                self.assertEqual(screen_route(said, {}),
+                                 "[ACTION: note_for_claude, Find the manual]")
+
+    ASIDES = (
+        "I think I'll hand it to Claude", "Maybe I'll just give it to Claude",
+        "Tomorrow I'll hand it to Claude", "Wait, I'll hand it to Claude",
+        "Good idea, I'll hand it to Claude",
+        "No worries, I'll hand it to Claude",
+        "Fine, let me hand it to Claude",
+        "Don't bother, I'll hand it to Claude",
+        "I don't know, I'll hand it to Claude",
+        "If that doesn't work, I'll hand it to Claude",
+        "You can't do it so I'll hand it to Claude",
+        "Look, I'll hand it to Claude",
+    )
+
+    def test_an_aside_before_it_is_not_the_task(self):
+        for said in self.ASIDES:
+            with self.subTest(said=said):
+                self.assertEqual(screen_route(said, {}), self.REFERS_BACK)
+
+    def test_a_task_in_other_shapes_is_still_the_note(self):
+        for said, note in (
+                ("Fix the clicking, I'll hand it to Claude", "Fix the clicking"),
+                ("Please research the bug, I'll pass it to Claude",
+                 "research the bug"),
+                ("I want you to fix the clicking, I'll hand it to Claude",
+                 "I want you to fix the clicking")):
+            with self.subTest(said=said):
+                self.assertEqual(screen_route(said, {}),
+                                 f"[ACTION: note_for_claude, {note}]")
+
+    def test_questions_stay_with_the_brain(self):
+        for said in ("Should I hand it to Claude?", "Will I hand it to Claude?",
+                     "I'm looking forward to Claude."):
+            with self.subTest(said=said):
+                self.assertIsNone(screen_route(said, {}))
+
+    def test_setting_off_is_the_old_behaviour(self):
+        from unittest import mock
+        from core import config as cfg
+        with mock.patch.object(cfg, "PASS_FUTURE_REFERS_BACK", False):
+            self.assertEqual(O.claude_note("I'll hand it to Claude"), "I'll")
+            # the 3.0.5 filler hand-off is untouched by the setting
+            self.assertEqual(screen_route("No, just pass over to Claude.", {}),
+                             self.REFERS_BACK)
+
+
+class StrictRobotWordTests(unittest.TestCase):
+    """v3.0.8 DEV_TODO_ROBOT_STRICT: the 3.0.6 robot word took any word ending
+    in "bot". Through core.dispatcher.screen_route. Fails on v3.0.7. (The
+    owner's robot is never named; "deskbot" is a made-up stand-in.)"""
+    OVER = (
+        "we need to fix the chatbot",
+        "we need to make the Talbot more reliable",
+        "the abbot needs more lines",
+        "we need to give the chatbot more jokes",
+        "we need to fix the chat bot",
+        "we should make the robot vacuum smarter",
+        "the robot vacuum needs more features",
+        "we need to fix the robot vacuum",
+        "we need to give the sabot more options",
+        "the turbot needs more sauce options",
+    )
+
+    def test_common_words_are_not_the_robot(self):
+        for said in self.OVER:
+            with self.subTest(said=said):
+                self.assertIsNone(O.dev_todo_note(said), said)
+                self.assertIsNone(screen_route(said, {}), said)
+
+    def test_every_robot_shape_still_counts(self):
+        for said in DevTodoNoteTests.TODOS + (
+                "we need to fix the robot", "we need to fix the deskbot",
+                "The robot needs more voice lines",
+                "my bot could use more jokes"):
+            with self.subTest(said=said):
+                self.assertTrue(screen_route(said, {}).startswith(
+                    "[ACTION: note_for_claude, "), said)
+
+    def test_setting_off_is_the_3_0_6_pattern(self):
+        from unittest import mock
+        from core import config as cfg
+        with mock.patch.object(cfg, "DEV_TODO_ROBOT_STRICT", False):
+            self.assertEqual(O.dev_todo_note("we need to fix the chatbot"),
+                             "we need to fix the chatbot")
+            self.assertTrue(O.dev_todo_note(LIVE_DEV_TODO))
+
+
 # Live 2026-10-28 17:25:16 (session_2026-10-28_17-21-18.log): the turn before
 # was "how's the server?" -> the server-status line; then this, and the brain
 # sent [ACTION: open_app, PowerShell] -> "launched PowerShell".

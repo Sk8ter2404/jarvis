@@ -656,6 +656,8 @@ WHISPER_TRUST_RMS = _speech_filter_mod.WHISPER_TRUST_RMS
 # sustained face-presence arithmetic. Both pure stdlib modules.
 import core.proactive_guard as _proactive_guard  # noqa: E402
 import core.face_presence as _face_presence  # noqa: E402
+# The cheaper at-desk face detector path + its shadow comparison (2026-10-28).
+import core.face_detect_fast as _face_fast  # noqa: E402
 
 # (LOCAL_LLM_*, ORCHESTRATOR_*, LOCAL_VISION_*, IMAGE_GEN_*, TTS_*, XTTS_*,
 # WHISPER_MODEL — all moved to core/config.py in Phase-1 refactor.
@@ -6763,6 +6765,9 @@ _face_presence_fp: dict = {}
 # idle-rate look (one shared "ran" let the first camera in the loop starve
 # the rest: it marked the slot and every later camera that pass was skipped).
 _face_detect_idle: dict = {"seen": None, "ran": {}}   # producer thread only
+# Shadow-mode agreement counters for the cheap detector path (counts and
+# timings only; core/face_detect_fast.py). Producer thread only.
+_face_detect_shadow = _face_fast.ShadowStats()
 
 
 def _face_detect_due(now: float, state: "dict | None" = None,
@@ -11629,58 +11634,90 @@ def _open_capture_bounded(idx, opener, label: str = "",
     return box["cap"]
 
 
+def _face_detect_fast_settings() -> tuple:
+    """(mode, width, min_frac, every_n, report_n) for the cheaper detector
+    path (core/face_detect_fast.py). Read per call so a settings change or a
+    test patch applies at once; a missing or broken value means today's
+    full-resolution detector. Never raises."""
+    g = globals()
+    mode = _face_fast.normalise_mode(g.get("FACE_DETECT_FAST_MODE", "off"))
+    try:
+        width = int(g.get("FACE_DETECT_FAST_WIDTH", 640))
+        min_frac = float(g.get("FACE_DETECT_FAST_MIN_FRAC", 0.05))
+        every_n = int(g.get("FACE_DETECT_SHADOW_EVERY_N", 20))
+        report_n = int(g.get("FACE_DETECT_SHADOW_REPORT_N", 30))
+    except Exception:
+        return "off", 0, 0.0, 0, 0
+    if width <= 0:
+        mode = "off"
+    return mode, width, min_frac, every_n, max(1, report_n)
+
+
+def _face_detect_shadow_sample(frame_bgr, full, full_ms: float, width: int,
+                               min_frac: float, report_n: int) -> None:
+    """SHADOW mode: run the cheap path on the frame the full path just
+    decided on and keep only the agreement (core/face_detect_fast.py). The
+    full path's result is already final; nothing here can change it, and a
+    cheap-path fault is counted, never raised. No image, box or position is
+    kept or logged - counts and timings only."""
+    try:
+        t0 = time.perf_counter()
+        cheap = _face_fast.detect(cv2, frame_bgr, _face_cascade,
+                                  _profile_cascade, width=width,
+                                  min_frac=min_frac)
+        cheap_ms = (time.perf_counter() - t0) * 1000.0
+        _face_detect_shadow.record(_face_fast.verdicts(*full),
+                                   _face_fast.verdicts(*cheap),
+                                   full_ms, cheap_ms)
+    except Exception:
+        _face_detect_shadow.note_error()
+    try:
+        if _face_detect_shadow.window_size() >= report_n:
+            print(f"  {_face_detect_shadow.report(width, min_frac)}")
+    except Exception:  # pragma: no cover - defensive: a log line never stops the loop
+        pass
+
+
 def _detect_face(frame_bgr: np.ndarray) -> tuple[float, float] | None:
     """Returns (fx, fy) 0.0–1.0 face-centre coords, or None.
 
     Also publishes the detection's detail (which pass found it, the box as a
     fraction of the frame) in _face_detect_last for the presence gate — a
     hit from the relaxed (minNeighbors=3) pass steers the eyes but is not evidence
-    that someone is at the desk."""
+    that someone is at the desk.
+
+    The passes themselves live in core/face_detect_fast.cascade_passes (one
+    copy for both paths): equalised grey frame; strict frontal
+    (scaleFactor 1.05, minNeighbors 4, minSize 40); an escalation at
+    minNeighbors 3 / minSize 60 only when that found nothing; then the
+    profile cascade and its mirrored pass (profileface is trained on
+    left-facing heads only). FACE_DETECT_FAST_MODE picks the frame they run
+    on (2026-10-28, CPU + camera-lag work): "off" = full resolution as
+    always; "shadow" = full resolution decides and 1 in
+    FACE_DETECT_SHADOW_EVERY_N runs also times the downscaled path for the
+    agreement log line; "on" = the downscaled path decides."""
     _face_detect_last[0] = None
     if _face_cascade is None:
         return None
-    h, w = frame_bgr.shape[:2]
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    # Equalize histogram so backlit / dim-room frames don't fall below the
-    # cascade's contrast threshold. Cheap (~1 ms at 1280x720).
-    gray = cv2.equalizeHist(gray)
-    # scaleFactor 1.1 → 1.05 gives finer pyramid steps (more positions checked
-    # per image scale) — material recall bump for heads that fall between the
-    # cascade's stride boundaries on the previous setting.
-    faces = _face_cascade.detectMultiScale(
-        gray, scaleFactor=1.05, minNeighbors=4, minSize=(40, 40)
-    )
-    found_by = "frontal"
-    # Escalation pass: when the strict frontal cascade returns nothing, retry
-    # once at minNeighbors=3 but with a larger minSize to keep false positives
-    # from tiny shadow artifacts in check. Only runs on frames the strict pass
-    # already rejected, so per-frame FP rate stays bounded.
-    if len(faces) == 0:
-        faces = _face_cascade.detectMultiScale(
-            gray, scaleFactor=1.05, minNeighbors=3, minSize=(60, 60)
-        )
-        found_by = "frontal_relaxed"
-    # Frontal cascade misses heads turned past ~30°. Fall through to the
-    # profile cascade — and a mirrored second pass since profileface is
-    # trained on left-facing heads only — before giving up.
-    if len(faces) == 0 and _profile_cascade is not None:
-        prof = _profile_cascade.detectMultiScale(
-            gray, scaleFactor=1.05, minNeighbors=4, minSize=(40, 40)
-        )
-        if len(prof) > 0:
-            faces = prof
-            found_by = "profile"
-        else:
-            mirror = cv2.flip(gray, 1)
-            prof_m = _profile_cascade.detectMultiScale(
-                mirror, scaleFactor=1.05, minNeighbors=4, minSize=(40, 40)
-            )
-            if len(prof_m) > 0:
-                faces = [(w - x - fw, y, fw, fh) for (x, y, fw, fh) in prof_m]
-                found_by = "profile_mirror"
-    if len(faces) == 0:
+    mode, fast_w, fast_frac, every_n, report_n = _face_detect_fast_settings()
+    if mode == "on":
+        box, found_by, (w, h) = _face_fast.detect(
+            cv2, frame_bgr, _face_cascade, _profile_cascade,
+            width=fast_w, min_frac=fast_frac)
+    else:
+        t0 = time.perf_counter()
+        box, found_by, (w, h) = _face_fast.detect(
+            cv2, frame_bgr, _face_cascade, _profile_cascade)
+        full_ms = (time.perf_counter() - t0) * 1000.0
+        # A frame no wider than the cheap width IS the cheap path: nothing
+        # to compare.
+        if (mode == "shadow" and w > fast_w
+                and _face_detect_shadow.due(every_n)):
+            _face_detect_shadow_sample(frame_bgr, (box, found_by, (w, h)),
+                                       full_ms, fast_w, fast_frac, report_n)
+    if box is None:
         return None
-    x, y, fw, fh = max(faces, key=lambda f: f[2] * f[3])   # largest face
+    x, y, fw, fh = box   # the largest face, in this frame's pixels
     try:
         _face_detect_last[0] = {"pass": found_by,
                                 "w_frac": float(fw) / float(w),
@@ -12901,6 +12938,11 @@ def _face_tracking_thread_body():
     DRIFT    = 0.015  # drift back to centre when no face
     MIN_MOVE = 0.02
     print(f"  {_face_detect_policy_line()}")
+    try:
+        _fm, _fw, _ff, _fn, _fr = _face_detect_fast_settings()
+        print(f"  {_face_fast.policy_line(_fm, _fw, _ff, _fn, _fr)}")
+    except Exception:  # pragma: no cover - defensive: a boot line never stops the thread
+        pass
     # If c.read() returns False this many times in a row, the capture is
     # presumed wedged (Teams stole the cam, USB hub flickered, DirectShow
     # driver returned half-init Mat headers). Release and reopen instead of
@@ -14371,6 +14413,9 @@ def _build_focus_recap(*, clear: bool, prefix: str = "While you were focused, si
     return f"{head} — {listed}."
 
 
+_HISTORY_TEXT_MAX_CHARS = 1500
+
+
 def proactive_announce(message: str, source: str = "skill",
                        *, mood: str | None = None,
                        volume_scale: float = 1.0,
@@ -14378,7 +14423,8 @@ def proactive_announce(message: str, source: str = "skill",
                        dedupe_key: str | None = None,
                        offer: bool = False,
                        urgent: bool = False,
-                       still_valid: str | None = None) -> bool:
+                       still_valid: str | None = None,
+                       history_text: str | None = None) -> bool:
     """Public proactive-speech API for skills.
 
     Skills that want JARVIS to speak something unprompted (print milestones,
@@ -14424,6 +14470,13 @@ def proactive_announce(message: str, source: str = "skill",
     a printer error code, a layer shift. The speech-queue drain speaks it
     through the owner-away and room-talk holds and never folds it into a
     recap (core/owner_presence.is_urgent). Focus mode still holds it.
+
+    `history_text` (optional, v3.0.8 F3) is what the drainer records in
+    conversation_history once the line has been SPOKEN, instead of the spoken
+    text: a background browser result is spoken without its URLs, but his
+    follow-up ("open that one") needs the full answer. Capped at
+    _HISTORY_TEXT_MAX_CHARS. Without it the old rule applies (a question or
+    `offer` is recorded, a plain statement is not).
     """
     # ── FOCUS MODE GATE ──────────────────────────────────────────────────────
     # This is the whole point of focus / do-not-disturb: while the owner is
@@ -14488,6 +14541,9 @@ def proactive_announce(message: str, source: str = "skill",
             entry["dedupe_key"] = str(dedupe_key)
         if offer:
             entry["offer"] = True
+        if isinstance(history_text, str) and history_text.strip():
+            entry["history_text"] = history_text.strip()[
+                :_HISTORY_TEXT_MAX_CHARS]
         if urgent:
             entry["urgent"] = True
         if still_valid:
@@ -23686,18 +23742,33 @@ def _cloud_boost_on() -> bool:
         return False
 
 
+def _turn_check_cloud_always() -> bool:
+    """TURN_CHECK_CLOUD_ALWAYS (core/config.py, default False): the turn
+    checker's Claude retry stays allowed without the chat cloud or the
+    boost, when a key exists. Never raises; an error counts as "no"."""
+    try:
+        return (bool(globals().get("TURN_CHECK_CLOUD_ALWAYS", False))
+                and bool((os.environ.get("ANTHROPIC_API_KEY") or "").strip()))
+    except Exception:
+        return False
+
+
 def _claude_oneshot(system: "str | list", messages: list,
                     max_tokens: int = 500,
                     model: str | None = None,
                     boost: bool = False, caller: str = "",
-                    background: "bool | None" = None) -> str | None:
+                    background: "bool | None" = None,
+                    cloud_always: bool = False) -> str | None:
     """Single Claude completion used as the cloud fallback when the LOCAL model
     fails on a 'local'-routed turn. Returns the text, or None if the cloud is
     unreachable / errors (caller then emits the honest both-down message).
     Mirrors the timeout + client-reuse the main _call_llm Claude path uses.
     ``model`` defaults to CLAUDE_MODEL; the turn checker's retry passes
-    TURN_CHECK_ESCALATE_MODEL (see _turn_check_escalate)."""
-    if not (_claude_reachable() or (boost and _cloud_boost_on())):
+    TURN_CHECK_ESCALATE_MODEL (see _turn_check_escalate). ``cloud_always``
+    (that retry only) also allows the call when TURN_CHECK_CLOUD_ALWAYS is
+    on (_turn_check_cloud_always)."""
+    if not (_claude_reachable() or (boost and _cloud_boost_on())
+            or (cloud_always and _turn_check_cloud_always())):
         return None
     model = model or CLAUDE_MODEL
     try:
@@ -37302,7 +37373,7 @@ def _after_reply_note(results=(), spoke=None) -> None:
             name = str(r[0])
             if name not in turn.actions:
                 turn.actions.append(name)
-            if len(r) > 1 and _action_result_failed(r[1]):
+            if len(r) > 1 and _action_result_failed(r[1], name):
                 turn.failed = True
         if spoke is False:
             turn.failed = True
@@ -44429,7 +44500,8 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             # also catches a send_* handler registered under another name
             # (confirm_pending_draft) - see _is_draft_send (2026-10-01).
             res = _run_draft_gated(name, arg, fn)
-            results.append((name, res, name in INFORMATIVE_ACTIONS))
+            results.append((name, res, name in INFORMATIVE_ACTIONS
+                            and not _browser_bg_started(name, res)))
             print(f"  [action] {name}: {res[:120]}{'…' if len(res) > 120 else ''}")
             # Turn grounding ledger: lets a later follow-up round that reads
             # this result back pass the claim validators (no-op outside a
@@ -45303,7 +45375,9 @@ def handle_confirmation_response(user_text: str) -> bool:
                     # Route the ANSWER, not a blanket "Done.": INFORMATIVE
                     # actions get an LLM restatement via the follow-up loop;
                     # VERBATIM actions are already finished sentences.
-                    if name in INFORMATIVE_ACTIONS:
+                    if _browser_bg_started(name, res):
+                        verbatim_results.append((name, res, False))
+                    elif name in INFORMATIVE_ACTIONS:
                         informative_results.append((name, res))
                     elif name.lower() in SPEAK_RESULT_VERBATIM_ACTIONS:
                         verbatim_results.append((name, res, False))
@@ -45404,6 +45478,55 @@ def _apply_quip_layer(spoken_text: str,
         return spoken_text
 
 
+# ── Background browser runs (v3.0.8 F3) ────────────────────────────────────
+# skills/browser_agent.py returns its BACKGROUND_STARTED_REPLY at once when a
+# browser-agent task goes to the background (BROWSER_TASK_BACKGROUND): that
+# line is a finished sentence, voiced word for word, and no follow-up round
+# reads it back (the result is announced when the run ends). Any other
+# result of these actions keeps the informative read-back.
+_BROWSER_AGENT_TASK_ACTIONS = frozenset({
+    "browser_task", "browser_do", "browser_run", "browse_for",
+    "find_cheapest", "book_appointment", "fill_form",
+})
+
+
+def _browser_bg_started(name, result) -> bool:
+    """True when ``result`` of browser-agent action ``name`` is the loaded
+    skill's background-started line. Never raises."""
+    try:
+        if str(name or "").strip().lower() not in _BROWSER_AGENT_TASK_ACTIONS:
+            return False
+        line = getattr(sys.modules.get("skill_browser_agent"),
+                       "BACKGROUND_STARTED_REPLY", "")
+        return bool(line) and isinstance(result, str) and result == line
+    except Exception:
+        return False
+
+
+def _browser_bg_stop_shortcut(text) -> bool:
+    """A spoken stop ("stop", "e-stop", "never mind", "cancel the browser
+    task") while a background browser run is in flight cancels it (the
+    skill's stop_background_for) and says so; True when it handled the turn.
+    Nothing running or no stop: False, the turn routes as before. Never
+    raises."""
+    try:
+        fn = getattr(sys.modules.get("skill_browser_agent"),
+                     "stop_background_for", None)
+        line = fn(text) if callable(fn) else None
+    except Exception as _e:
+        print(f"  [browser-bg] stop check failed: {_e}")
+        return False
+    if not line:
+        return False
+    print("  [browser-bg] stop heard - the background browser task is "
+          "cancelled")
+    print(f"  JARVIS: {line}")
+    _append_turn(text, line)
+    _speak(line)
+    set_state("idle")
+    return True
+
+
 def _verbatim_result_text(name, result) -> str:
     """The text _speak_verbatim_results would voice for one action result, or
     "" when it would voice nothing: the action is not in
@@ -45419,13 +45542,14 @@ def _verbatim_result_text(name, result) -> str:
     _terminal = _terminal_failure_text(result)
     if _terminal:
         return _terminal
+    if _browser_bg_started(name, result):
+        return result
     if not name or str(name).lower() not in SPEAK_RESULT_VERBATIM_ACTIONS:
         return ""
     text = (result or "").strip() if isinstance(result, str) else ""
     if not text:
         return ""
-    low = text.lower()
-    if any(m.lower() in low for m in FAILURE_MARKERS):
+    if _action_result_failed(text, name):
         return ""
     return text
 
@@ -45580,14 +45704,53 @@ def _is_confident_ack(text) -> bool:
         return False
 
 
-def _action_result_failed(result) -> bool:
+# ── Content results (v3.0.8 H1) ───────────────────────────────────────────
+# Live 2026-10-28 19:47 "what's new": the changelog summary said fixes as fixes
+# ("X no longer fails", "Y can't happen again"), so its FAILURE_MARKERS words
+# made a SUCCESSFUL read_changelog look failed: the verbatim read-out was
+# skipped, "[ack-hold] ... an action in this reply failed" was logged, and a
+# failure follow-up round re-summarised the summary (end 22.7 s). For these
+# actions the result is prose ABOUT things, so it fails only when it OPENS
+# with the action's own failure wording (or is a terminal failure).
+# VERBATIM_CONTENT_RESULTS (core/config.py) off = the substring test for all.
+_CONTENT_RESULT_ACTIONS = frozenset({
+    "read_changelog", "whats_new", "what_changed", "show_changelog",
+    "recent_changes",
+})
+# ONLY the exact openings _act_read_changelog returns on failure. Generic
+# words ("failed", "error", "could not") are NOT here: a summary of a fix
+# release can open with them ("Failed prints are now announced once"), and
+# that successful summary was re-summarised as a failure (H1, 2026-10-28).
+_CONTENT_RESULT_FAIL_PREFIXES = ("could not summarise the changelog:",
+                                 "could not read the changelog:")
+
+
+def _is_content_result_action(name) -> bool:
+    """True when ``name`` is a _CONTENT_RESULT_ACTIONS action and
+    VERBATIM_CONTENT_RESULTS is on. Never raises."""
+    try:
+        if not globals().get("VERBATIM_CONTENT_RESULTS", True):
+            return False
+        return str(name or "").strip().lower() in _CONTENT_RESULT_ACTIONS
+    except Exception:
+        return False
+
+
+def _action_result_failed(result, name=None) -> bool:
     """THE failure test of the follow-up loop (its _is_failure delegates
     here): the result carries a FAILURE_MARKERS substring, case-insensitive.
-    Never raises."""
+    With ``name`` a content-result action (_is_content_result_action) fails
+    only on a result that STARTS with its failure wording, so a summary that
+    mentions "failed" or "can't" is not a failure. Never raises."""
     try:
         if not isinstance(result, str):
             return False
         low = result.lower()
+        if name is not None and _is_content_result_action(name):
+            head = low.lstrip()
+            return (head.startswith(_CONTENT_RESULT_FAIL_PREFIXES)
+                    or bool(_terminal_failure_text(result))
+                    or _ACTION_CRASH_MARK in result)
         return any(m.lower() in low for m in FAILURE_MARKERS)
     except Exception:
         return False
@@ -45608,15 +45771,39 @@ def _failed_or_refused_actions(action_results) -> list:
             if not isinstance(result, str) or result.startswith(
                     _ANSWER_FIRST_DEFERRED_PREFIXES):
                 continue
-            if _action_result_failed(result):
+            if _action_result_failed(result, n):
                 out.append(n)
                 continue
+            if _is_content_result_action(n):
+                continue     # prose about things, never a refusal (H1)
             text = _verbatim_result_text(n, result).lower()
             if text and any(m in text for m in _ACK_REFUSAL_MARKERS):
                 out.append(n)
     except Exception:
         return out
     return out
+
+
+def _ack_hold_reason(action_results) -> str:
+    """The [ack-hold] log reason: which action(s) failed and which refused,
+    e.g. "rover_explore refused" - never "failed" for an action whose result
+    was not a failure (v3.0.8 H1). Never raises."""
+    try:
+        names = _failed_or_refused_actions(action_results)
+        failed, refused = [], []
+        for name, result, _info in action_results or ():
+            n = str(name or "").strip().lower()
+            if n not in names or n in failed or n in refused:
+                continue
+            (failed if _action_result_failed(result, n) else refused).append(n)
+        parts = []
+        if failed:
+            parts.append(f"{', '.join(failed)} failed")
+        if refused:
+            parts.append(f"{', '.join(refused)} refused")
+        return "; ".join(parts) or "an action in this reply failed"
+    except Exception:
+        return "an action in this reply failed"
 
 
 def _drop_ack_before_failure(text, action_results) -> tuple:
@@ -49319,7 +49506,12 @@ def _speak_pending(only_sources=None):
             # closing question) goes into the conversation so the owner's
             # answer has its question (_note_spoken_question) — and so does
             # an offer phrased as a statement (proactive_announce offer=True).
-            if "?" in msg or item.get("offer") is True:
+            _hist = item.get("history_text")
+            if isinstance(_hist, str) and _hist.strip():
+                # v3.0.8 F3: a queued statement that must be remembered (a
+                # background browser result) is recorded as its skill gave it.
+                _note_spoken_question(_hist)
+            elif "?" in msg or item.get("offer") is True:
                 _note_spoken_question(msg)
         except Exception as _spe:
             # Don't let one bad TTS attempt nuke the main loop: print and
@@ -49708,6 +49900,10 @@ def _run_voice_shortcuts(text: str) -> bool:
     Returns True when a shortcut handled the utterance (caller should
     ``continue``); False to fall through to the full LLM dispatch.
     """
+    # v3.0.8 F3: "stop" / "never mind" while a browser task runs in the
+    # background cancels it (no-op when none is running).
+    if _browser_bg_stop_shortcut(text):
+        return True
     # Replay-last-action voice trigger: 'do that again' / 'replay that'
     # / 'do it again' / 'do that on monitor right' — re-fires the most
     # recent non-destructive action straight out of the in-memory deque
@@ -51545,7 +51741,8 @@ def _turn_check_escalate(user_text, verdict, failed_texts, barge_seq0,
                                       + _turn_check_retry_note(verdict))
         retry = _claude_oneshot(system, _self_knowledge_for_cloud(msgs),
                                 max_tokens=500, model=model,
-                                caller="turn_check_retry", boost=True)
+                                caller="turn_check_retry", boost=True,
+                                cloud_always=True)
         if not (isinstance(retry, str) and retry.strip()):
             print(f"  [turn-check] the {model} retry returned nothing - the "
                   f"local reply stands")
@@ -51583,7 +51780,7 @@ def _turn_check_escalate(user_text, verdict, failed_texts, barge_seq0,
         info = [] if _terminal else [
             (n, r) for (n, r, i) in results
             if not str(n).startswith("_") and not _self_voiced_did_talk(n, r)
-            and (i or _action_result_failed(r))]
+            and (i or _action_result_failed(r, n))]
         if info and not _turn_check_barged(barge_seq0):
             set_state("thinking")
             _heartbeat()
@@ -51764,7 +51961,10 @@ def _turn_check_after_chain(user_text, chain_texts, chain_results, *,
         # (2026-10-20, owner's 'full brain plan'): with AI_BACKEND 'ollama'
         # and chat routed local, _chat_cloud_allowed() is always False, so
         # TURN_CHECK_MODE 'on' could never retry anything.
-        cloud_allowed=bool(_chat_cloud_allowed() or _cloud_boost_on()),
+        # TURN_CHECK_CLOUD_ALWAYS (default False) keeps it allowed after
+        # the boost ends (2026-10-28); _claude_oneshot honours the same.
+        cloud_allowed=bool(_chat_cloud_allowed() or _cloud_boost_on()
+                           or _turn_check_cloud_always()),
         out=sys.stdout, log_path_fn=_turn_check_log_path,
         close_line=close_line, barge_seq0=barge_seq0)
     args = (mode, user_text, list(chain_texts or ()), results,
@@ -52082,7 +52282,7 @@ def _run_llm_dispatch_body(text: str) -> str:
                                                          action_results)
         if _ack_cut:
             print(f"  [ack-hold] dropped the acknowledgement ({_ack_cut} "
-                  f"words): an action in this reply failed")
+                  f"words): {_ack_hold_reason(action_results)}")
     if not _self_voiced_only:
         _note_early_ack_before_failure(action_results)
     if _af_words:
@@ -52121,8 +52321,8 @@ def _run_llm_dispatch_body(text: str) -> str:
     # don't go silently unreported to the user.
     # canonical list — core/failure_markers.py, via _action_result_failed (the
     # acknowledgement drop above asks the same question).
-    def _is_failure(result: str) -> bool:
-        return _action_result_failed(result)
+    def _is_failure(result: str, name=None) -> bool:
+        return _action_result_failed(result, name)
 
     current_results = action_results
     _chain_seen: set[str] = set()   # loop-break: actions already fired this chain
@@ -52187,7 +52387,8 @@ def _run_llm_dispatch_body(text: str) -> str:
         # explain: the action already said what it had to.
         informative = [
             (n, r) for (n, r, is_info) in current_results
-            if not _self_voiced_did_talk(n, r) and (is_info or _is_failure(r))
+            if not _self_voiced_did_talk(n, r)
+            and (is_info or _is_failure(r, n))
         ]
         if not informative:
             break
@@ -52209,16 +52410,16 @@ def _run_llm_dispatch_body(text: str) -> str:
         # / local_click_target_by_description) counts as ONE action here
         # (2026-10-05): the second failure in the family stops the chain.
         _failing_now = {_action_family(n) for (n, r) in informative
-                        if _is_failure(r)}
+                        if _is_failure(r, n)}
         _failing_repeat = _failing_now & _failed_seen
         # An IDENTICAL failure (same action, same result) is a repeat even
         # after a success of that action cleared it (the reset below).
         _failing_repeat |= {_action_family(n) for (n, r) in informative
-                            if _is_failure(r) and (n, r) in _info_seen}
+                            if _is_failure(r, n) and (n, r) in _info_seen}
         if _failing_repeat:
             # name the ACTIONS that failed (the family key is "screen-target")
             _rep_names = sorted({str(n).strip().lower()
-                                 for (n, r) in informative if _is_failure(r)
+                                 for (n, r) in informative if _is_failure(r, n)
                                  and _action_family(n) in _failing_repeat})
             print(f"  [follow-up] "
                   f"{', '.join(_rep_names or sorted(_failing_repeat))} failed "
@@ -52232,7 +52433,7 @@ def _run_llm_dispatch_body(text: str) -> str:
         # not the same failure twice. A round where the action only
         # succeeded clears it; a round where it also failed does not.
         _failed_seen -= ({_action_family(n) for (n, r, _i) in current_results
-                          if not _is_failure(r)} - _failing_now)
+                          if not _is_failure(r, n)} - _failing_now)
         # SUCCESS-repeat break (mirror of the failure-repeat break above): if a
         # whole round adds NO new informative (name, result) pair — every result
         # this round was already seen earlier in the chain — the chain is going
@@ -52310,7 +52511,8 @@ def _run_llm_dispatch_body(text: str) -> str:
                                                           current_results)
             if _ack_cut:
                 print(f"  [ack-hold] dropped the follow-up's acknowledgement "
-                      f"({_ack_cut} words): an action in it failed")
+                      f"({_ack_cut} words): "
+                      f"{_ack_hold_reason(current_results)}")
         # v3.0.1: the follow-up reply gets the same persona hygiene as the
         # first (live 10-27 20:41: a closing "A bold choice" after a screen
         # read slipped past because only the first reply was checked).
@@ -52340,7 +52542,7 @@ def _run_llm_dispatch_body(text: str) -> str:
             _spoke_substance = _spoke_substance or bool(_round_verbatim)
     else:
         # Depth cap: the last round's results were never read back.
-        if any(not _self_voiced_did_talk(n, r) and (i or _is_failure(r))
+        if any(not _self_voiced_did_talk(n, r) and (i or _is_failure(r, n))
                for (n, r, i) in current_results):
             _chain_cut = "depth cap"
     # A chain can also stop on its own words (2026-10-02 review repair): the

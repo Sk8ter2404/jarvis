@@ -265,7 +265,8 @@ class HelperTests(_AckBase):
         # question (the stale-duplicate rule).
         import inspect
         src = inspect.getsource(self.bc._run_llm_dispatch_body)
-        self.assertIn("return _action_result_failed(result)", src)
+        # v3.0.8 H1: the name rides along (content-result actions).
+        self.assertIn("return _action_result_failed(result, name)", src)
         self.assertTrue(self.bc._action_result_failed("It FAILED."))
         self.assertFalse(self.bc._action_result_failed(None))
 

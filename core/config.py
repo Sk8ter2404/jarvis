@@ -1517,6 +1517,13 @@ SMART_TURN_MODEL = r"C:\JARVIS-models\smart-turn-v3\smart-turn-v3.2-cpu.onnx"
 # Set via user_settings.json; applies on the next start.
 TURN_CHECK_MODE = "off"
 TURN_CHECK_ESCALATE_MODEL = "claude-sonnet-5-5"
+# TURN_CHECK_CLOUD_ALWAYS  True = the 'on' retry may go to Claude whenever an
+#   API key exists, even with chat routed local and no Claude boost
+#   (CLOUD_BOOST_UNTIL) running - the safety net outlives the boost. Each
+#   caught turn is one paid Claude call and sends that turn to the cloud,
+#   so it ships False (the retry then needs the chat cloud or the boost,
+#   exactly as before).
+TURN_CHECK_CLOUD_ALWAYS = False
 
 # ─── Head hold (core/speech_plan.py, v3 W02, 2026-10-27) ─────────────────
 # The prose a reply writes BEFORE an action token whose result will still
@@ -1746,6 +1753,30 @@ CHAIN_PROMISE_CHECK = True
 # of that, sir."). A bare "Noted, sir." is untouched, and so is a true claim.
 # False: such sentences are spoken as before. Applies on the next start.
 NOTE_CLAIM_CHECK = True
+# VERBATIM_CONTENT_RESULTS (bool, v3.0.8, bobert_companion
+# _action_result_failed): live 2026-10-28 19:47 "what's new" - the changelog
+# summary said fixes as fixes ("no longer fails"), its words read as a failed
+# action, so the summary was not spoken, the acknowledgement was dropped as
+# "an action in this reply failed" and a second model round re-summarised it.
+# True (default): read_changelog and its aliases fail only when the result
+# opens with their own failure words; a summary is spoken word for word with
+# no read-back round. False: the old word test. Applies on the next start.
+VERBATIM_CONTENT_RESULTS = True
+# CAPABILITIES_SHORT_OVERVIEW (bool, v3.0.8, core/fast_paths
+# capability_short_reply): "what can you do" was spoken with every skill
+# (about 20 items). True (default): the 7 most useful, then "Want the full
+# list, sir?" - a yes, or "what else can you do" right after, gives the rest.
+# False: the whole list at once (the old behaviour). Read live.
+CAPABILITIES_SHORT_OVERVIEW = True
+# BROWSER_TASK_BACKGROUND (bool, v3.0.8, skills/browser_agent.py): a browser
+# task (browser_task, browse_for, find_cheapest, book_appointment, fill_form)
+# held the voice loop for up to 90 s (live 10-28: 77 s). True (default): the
+# task runs in the background, JARVIS says "Working on it, sir" at once and
+# tells you the result when it is done; "stop" / "never mind" / "cancel the
+# browser task" while it runs cancels it (and then nothing is announced). The
+# browser agent still uses paid Claude calls either way. False: wait for the
+# result as before. Read live.
+BROWSER_TASK_BACKGROUND = True
 
 # ─── Routing fixes (v3.0.6, 2026-10-28 human test + misroutes report) ─────
 # TIMER_LABEL_GROUNDING (skills/timer.py grounded_label): live 2026-10-28
@@ -1767,6 +1798,27 @@ TIMER_LABEL_GROUNDING = True
 # miss is a note instead of an action, said aloud as "Noted for Claude".
 # False: only turns naming Claude are claimed (the old behaviour).
 DEV_TODO_NOTES = True
+# DEV_TODO_ROBOT_STRICT (v3.0.8, core/onscreen_refs._ROBOT_WORD): the 3.0.6
+# robot word was any word ending in "bot", so "we need to fix the chatbot",
+# "make the Talbot more reliable" and "the abbot needs more lines" were noted
+# for Claude. True (default): only "robot", "bot" on its own, a two-word
+# "<word> bot" / "<word>-bot", or a one-word "<word>bot" that is not a common
+# English word (chatbot, abbot, sabot, turbot ...), and never a "robot vacuum"
+# / "robot mower". False: the 3.0.6 pattern (the old behaviour).
+DEV_TODO_ROBOT_STRICT = True
+# PASS_FUTURE_REFERS_BACK (v3.0.8, core/onscreen_refs._claude_named_note):
+# "I'll hand it to Claude" made a note reading "I'll". True (default): a
+# future-tense hand-off ("I'll / I will / I'm going to / let me ... hand it to
+# Claude") is the hand-off of the previous request, so the note refers back;
+# with a task before it ("find the manual, I'll pass it to Claude") the task is
+# the note. False: the old behaviour.
+PASS_FUTURE_REFERS_BACK = True
+# BRIEFING_SIR_ONCE (v3.0.8, skills/daily_briefing/light._drop_repeat_sir):
+# the morning briefing opens "Good morning, sir." and the umbrella alert /
+# robot remark that ride along say "Sir, ..." again. True (default): the
+# appended line drops its own "sir" (the weather skill's 3.0.6 join rule).
+# False: every piece keeps its "sir" (the old behaviour).
+BRIEFING_SIR_ONCE = True
 # UNRESOLVED_OPEN_ASK (core/onscreen_refs.unresolved_open, checked in
 # core/actions._act_launch_app): live 2026-10-28 17:25:16 "can you open it up
 # so I can help you?" launched PowerShell - nothing said had named it. True
@@ -2197,6 +2249,19 @@ CAMERA_OPEN_MIN_GAP_S       = 10.0
 #   either value = never back off (today's behaviour).
 FACE_TRACK_IDLE_AFTER_S     = 15.0
 FACE_TRACK_IDLE_HZ          = 1.0
+# FACE_DETECT_FAST_* — the cheaper at-desk face detector (2026-10-28,
+#   core/face_detect_fast.py): the same Haar passes on a frame shrunk to
+#   FACE_DETECT_FAST_WIDTH px, searching only for faces at least
+#   FACE_DETECT_FAST_MIN_FRAC of the width (presence needs 0.07).
+#   MODE "off" = full resolution only (the old path); "shadow" = full
+#   resolution decides and 1 in FACE_DETECT_SHADOW_EVERY_N detections also
+#   runs the cheap path, logging agreement (counts + ms, no images) every
+#   FACE_DETECT_SHADOW_REPORT_N samples; "on" = the cheap path decides.
+FACE_DETECT_FAST_MODE       = "shadow"
+FACE_DETECT_FAST_WIDTH      = 640
+FACE_DETECT_FAST_MIN_FRAC   = 0.05
+FACE_DETECT_SHADOW_EVERY_N  = 20
+FACE_DETECT_SHADOW_REPORT_N = 30
 
 # Processes that commonly hold exclusive locks on webcams. If the probe
 # finds zero cameras, we scan for these and surface them so the user
@@ -2750,6 +2815,16 @@ KINECT_POSTURE_NUDGE = False
 #   arming is ALLOWED — arming is always an explicit voice action ('guard the
 #   room' / 'stand down'), never automatic. Off by default.
 KINECT_GUARD_ENABLED = False
+# KINECT_GHOST_FILTER_ENABLED — when True, the body pump drops a skeleton that
+#   cannot be a person in the room before anything sees it (presence, gestures,
+#   the air-mouse, the HUD): impossible limb lengths, every joint at one depth,
+#   or (rechecked per body every KINECT_GHOST_DEPTH_RECHECK_SEC, 0 = never) a
+#   depth frame that shows no body there, a body framed by nearer geometry (a
+#   mirror / TV reflection) or a flat depth blob. Known false positives: a
+#   person in a doorway or flat against a wall. See audio/kinect_bridge.py
+#   filter_ghost_bodies. Off by default until tested live.
+KINECT_GHOST_FILTER_ENABLED = False
+KINECT_GHOST_DEPTH_RECHECK_SEC = 1.0
 
 
 # ─── Camera-based "is the TV on?" detector (suppression signal) ─────────

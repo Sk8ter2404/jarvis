@@ -2065,7 +2065,11 @@ PC_CONTROL_PROMPT = (
     "    Example: 'what have I been doing lately' → [ACTION: project_status]\n"
     "    Example: 'what are my projects' → [ACTION: project_status]\n"
     "  Answer these ONLY with project_status, never from the auto-learned\n"
-    "  topics or projects in memory. Its reply is spoken as-is.\n\n"
+    "  topics or projects in memory. Its reply is spoken as-is.\n"
+    # v3.0.8: the local brain's 3.0.6 line (live 2026-10-28 ~18:00 "how's
+    # the master sheet looking?" ran project_status -> "no project list").
+    "  The master sheet: no action reads it - say \"I can't read the master\n"
+    "  sheet yet, sir.\" Never project_status for it.\n\n"
     "DOSSIER (pull-up-the-file recall card):\n"
     "  dossier, <subject>           — aggregate everything JARVIS knows about\n"
     "                                  a subject (memory facts, queued tasks,\n"

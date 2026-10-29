@@ -644,7 +644,8 @@ class BuildAndFireTests(unittest.TestCase):
         with self._all_sources(_fetch_umbrella_alert="Bring an umbrella, sir.",
                                _fetch_robot_volunteer="The part shipped."):
             out = self.mod._build_briefing()
-        self.assertIn("Bring an umbrella, sir.", out)
+        # v3.0.8 BRIEFING_SIR_ONCE: "Good morning, sir." already said it.
+        self.assertIn("Bring an umbrella.", out)
         self.assertIn("The part shipped.", out)
         self.assertFalse(out.startswith("[intent:briefing]"))
 
@@ -803,6 +804,68 @@ def _rmtree(path):
         os.rmdir(path)
     except OSError:
         pass
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# v3.0.8: "sir" once in the spoken briefing (BRIEFING_SIR_ONCE)
+# ─────────────────────────────────────────────────────────────────────────
+# The briefing opens "Good morning, sir." and the umbrella alert from
+# weather_briefing (spoken alone by the proactive alert too) opens "Sir, ...",
+# so the joined briefing said "sir" twice in a row - the same shape as the
+# weather answer fixed in v3.0.6. Run through the REAL morning_briefing action
+# with the REAL weather_briefing join rule; fails on v3.0.7 (1561e62).
+_ALERT = ("Sir, the forecast turns notably wetter at 5 PM — 75% chance of "
+          "rain. Worth knowing before you head outside.")
+_ROBOT = "The workshop robot's parcel arrived today, sir — shall I log it?"
+
+
+class BriefingSirOnceTests(unittest.TestCase):
+    def setUp(self):
+        self.mod, self.actions = load_briefing_part("light")
+        import skills.weather_briefing as wb
+        mods = inject_modules(**{"weather_briefing": wb,
+                                 "skill_daily_briefing.weather_briefing": wb})
+        mods.__enter__()
+        self.addCleanup(mods.__exit__, None, None, None)
+
+    def _speak(self, umbrella=_ALERT, robot=""):
+        with mock.patch.object(self.mod, "_fetch_weather", return_value="64 degrees and clear in your area"), \
+             mock.patch.object(self.mod, "_count_pending_tasks", return_value=2), \
+             mock.patch.object(self.mod, "_bed_remark", return_value=""), \
+             mock.patch.object(self.mod, "_fetch_news", return_value=""), \
+             mock.patch.object(self.mod, "_fetch_umbrella_alert", return_value=umbrella), \
+             mock.patch.object(self.mod, "_outlook_summary", return_value=""), \
+             mock.patch.object(self.mod, "_fetch_robot_volunteer", return_value=robot), \
+             mock.patch.object(self.mod, "_show_card_safe"), \
+             mock.patch.object(self.mod, "_mark_briefing_fired_today"):
+            return self.actions["morning_briefing"]("")
+
+    def test_the_umbrella_alert_does_not_say_sir_again(self):
+        out = self._speak()
+        self.assertEqual(out.lower().count("sir"), 1, out)
+        self.assertIn("You have 2 tasks queued. The forecast turns notably "
+                      "wetter at 5 PM", out)
+
+    def test_the_robot_remark_drops_its_inner_sir(self):
+        out = self._speak(umbrella="", robot=_ROBOT)
+        self.assertEqual(out.lower().count("sir"), 1, out)
+        self.assertIn("arrived today — shall I log it?", out)
+
+    def test_a_piece_without_sir_is_untouched(self):
+        out = self._speak(umbrella="Rain likely after lunch.")
+        self.assertTrue(out.endswith(" Rain likely after lunch."), out)
+
+    def test_setting_off_is_the_old_behaviour(self):
+        from core import config as cfg
+        with mock.patch.object(cfg, "BRIEFING_SIR_ONCE", False):
+            out = self._speak(robot=_ROBOT)
+        self.assertIn(_ALERT, out)
+        self.assertIn(_ROBOT, out)
+        self.assertEqual(out.lower().count("sir"), 3, out)
+
+    def test_never_raises(self):
+        for a, b in ((None, None), ("", ""), ("sir", None), (5, "Sir, x")):
+            self.mod._drop_repeat_sir(a, b)
 
 
 if __name__ == "__main__":

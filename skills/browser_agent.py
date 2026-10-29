@@ -109,6 +109,9 @@ _state: dict[str, Any] = {
     "last_result":   None,
     "last_error":    None,
     "model":         None,    # the Claude model the current / last run uses
+    "bg_run":        None,    # id of the latest background run (v3.0.8 F3)
+    "bg_inline":     None,    # run id whose caller is still waiting inline
+    "bg_cancelled":  None,    # run id a spoken stop cancelled (no announce)
 }
 
 
@@ -736,8 +739,11 @@ def _run_task_sync(
     max_steps: int = _DEFAULT_MAX_STEPS,
     timeout: float = _SYNC_WAIT_SECONDS,
     headless: bool = False,
+    background: bool | None = None,
 ) -> str:
     """Submit `task` and block until it finishes OR `timeout` elapses.
+    With BROWSER_TASK_BACKGROUND on (``background`` None = the setting) it
+    returns at once instead - see _run_task_background (v3.0.8 F3).
     Past the timeout we return a "still running, poll browser_status"
     message rather than killing the agent — long browser tasks are
     legitimate (booking flow w/ 2FA may take minutes).
@@ -750,6 +756,11 @@ def _run_task_sync(
     _gone = _retired_current_model()
     if _gone:
         return _retired_model_reply(_gone)
+    if background is None:
+        background = _background_enabled()
+    if background:
+        return _run_task_background(task, max_steps=max_steps,
+                                    headless=headless)
     try:
         fut = _submit(task, max_steps=max_steps, headless=headless)
     except RuntimeError as e:
@@ -763,6 +774,248 @@ def _run_task_sync(
                 f"Poll `browser_status` for progress or `browser_stop` to cancel."
             )
         return f"Browser agent failed, sir — {type(e).__name__}: {e}"
+
+
+# ── background runs (v3.0.8 F3) ────────────────────────────────────
+# Live 2026-10-28 (scope F3): browse_for held the voice loop for ~77 s
+# ("[watchdog] main loop stalled 68 s") while the agent's paid cloud steps
+# ran. With BROWSER_TASK_BACKGROUND on (core/config.py, default True) an agent
+# task is submitted and the action returns at once with BACKGROUND_STARTED_REPLY
+# (the monolith voices it word for word, no read-back round); the result is
+# announced through bobert_companion.proactive_announce when the run ends,
+# exactly once per run (dedupe_key + a claim under _lock, shared with a run
+# that finishes inside the short inline wait, which is returned directly). A
+# spoken stop ("stop", "e-stop", "never mind", "cancel the browser task")
+# cancels it (stop_background_for, called by the monolith's voice shortcuts),
+# and a cancelled run is never announced. Off: the old blocking wait.
+BACKGROUND_STARTED_REPLY = ("Working on it, sir. I'll tell you when the "
+                            "browser is done.")
+# A run that ends this fast (a refusal, the API cap) is answered inline.
+_BG_INLINE_WAIT_S = 2.0
+# Longest announcement spoken (the agent's answer can run to 1200 chars).
+_BG_ANNOUNCE_CHARS = 420
+_bg_announced: set = set()        # run ids already announced / answered
+_bg_seq = [0]
+
+
+def _background_enabled() -> bool:
+    """core.config.BROWSER_TASK_BACKGROUND, read live (default True)."""
+    try:
+        import core.config as _cfg
+        return bool(getattr(_cfg, "BROWSER_TASK_BACKGROUND", True))
+    except Exception:
+        return True
+
+
+_URL_RE = re.compile(r"\(?\s*(?:https?://|www\.)[^\s)]+\s*\)?", re.IGNORECASE)
+
+
+def _spoken_result(result: Any) -> str:
+    """The agent's answer as one spoken line: URLs dropped, whitespace
+    collapsed, cut at a sentence end within _BG_ANNOUNCE_CHARS. Never
+    raises."""
+    try:
+        s = " ".join(_URL_RE.sub(" ", str(result or "")).split())
+        s = re.sub(r"\s+([,.;:!?])", r"\1", s).strip(" -:;,")
+        if len(s) <= _BG_ANNOUNCE_CHARS:
+            return s
+        cut = s[:_BG_ANNOUNCE_CHARS]
+        end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+        if end >= 80:
+            return cut[:end + 1]
+        return cut.rsplit(" ", 1)[0].rstrip(" ,;:") + "..."
+    except Exception:
+        return ""
+
+
+def _bg_announcement(result: Any) -> str:
+    """What JARVIS says when a background run ends. The skill's own lines
+    ("Browser agent failed, sir - ...") are said as they are. Never raises."""
+    spoken = _spoken_result(result)
+    if not spoken:
+        return "The browser task finished, sir, but it brought nothing back."
+    if spoken.lower().startswith("browser "):
+        return spoken
+    return f"The browser task is done, sir. {spoken}"
+
+
+# Longest result kept in conversation_history (URLs included).
+_BG_HISTORY_CHARS = 900
+
+
+def _bg_history_text(text: str, result: Any) -> str:
+    """What conversation_history keeps of a background run (F3): the spoken
+    lead-in plus the agent's answer WITH its URLs, whitespace collapsed and
+    cut to _BG_HISTORY_CHARS, so "what was the price again?" and "open that
+    one" have something to refer to. Never raises."""
+    try:
+        full = " ".join(str(result or "").split())
+        if not full or text.lower().startswith("browser "):
+            return text
+        if len(full) > _BG_HISTORY_CHARS:
+            full = full[:_BG_HISTORY_CHARS].rsplit(" ", 1)[0] + "..."
+        return f"The browser task is done, sir. {full}"
+    except Exception:
+        return text
+
+
+def _announce(text: str, run_id: int, result: Any = None) -> bool:
+    """Queue ``text`` through the live monolith's proactive_announce (sys.
+    modules only - never a fresh import of the monolith). The unstripped
+    ``result`` rides along as history_text, which the monolith's drain records
+    in conversation_history once the line is spoken (F3). Never raises."""
+    try:
+        import sys as _sys
+        fn = getattr(_sys.modules.get("bobert_companion"),
+                     "proactive_announce", None)
+        if callable(fn):
+            hist = _bg_history_text(text, result) if result is not None else ""
+            if hist:
+                try:
+                    return bool(fn(text, source="browser",
+                                   dedupe_key=f"browser-task:{run_id}",
+                                   history_text=hist))
+                except TypeError:     # an announcer without history_text
+                    pass
+            return bool(fn(text, source="browser",
+                           dedupe_key=f"browser-task:{run_id}"))
+    except Exception as e:
+        print(f"  [browser_agent] announce failed: {type(e).__name__}: {e}")
+        return False
+    print(f"  [browser_agent] (no announcer) {text}")
+    return False
+
+
+def _bg_claim(run_id: int) -> bool:
+    """Claim the one voicing of run ``run_id`` for the done-callback. False
+    when it is already claimed, was cancelled by a spoken stop, or its caller
+    is still waiting inline. Caller must NOT hold _lock. Never raises."""
+    try:
+        with _lock:
+            if run_id in _bg_announced:
+                return False
+            if _state.get("bg_cancelled") == run_id:
+                return False
+            if _state.get("bg_inline") == run_id:
+                return False
+            _bg_announced.add(run_id)
+            return True
+    except Exception:
+        return False
+
+
+def _fut_cancelled(fut: Any) -> bool:
+    try:
+        return bool(fut.cancelled())
+    except Exception:
+        return False
+
+
+def _on_bg_done(fut: Any, run_id: int) -> None:
+    """Done-callback of a background run: announce its result once; a
+    cancelled run says nothing (the stop already answered). Never raises."""
+    try:
+        if _fut_cancelled(fut) or not _bg_claim(run_id):
+            return
+        try:
+            result = fut.result()
+        except Exception as e:
+            result = f"Browser agent failed, sir — {type(e).__name__}: {e}"
+        print(f"  [browser_agent] background run {run_id} finished - "
+              f"announcing")
+        _announce(_bg_announcement(result), run_id, result)
+    except Exception as e:
+        print(f"  [browser_agent] background done-callback failed: "
+              f"{type(e).__name__}: {e}")
+
+
+def _run_task_background(task: str, *, max_steps: int,
+                         headless: bool) -> str:
+    """Submit ``task`` and return at once (BACKGROUND_STARTED_REPLY), or the
+    result itself when the run ends within _BG_INLINE_WAIT_S."""
+    try:
+        fut = _submit(task, max_steps=max_steps, headless=headless)
+    except RuntimeError as e:
+        return f"{e}, sir."
+    with _lock:
+        _bg_seq[0] += 1
+        run_id = _bg_seq[0]
+        _state["bg_run"] = run_id
+        _state["bg_inline"] = run_id
+        _state["bg_cancelled"] = None
+    # Never registered under _lock: a future that is already done runs the
+    # callback right here, and the callback takes _lock.
+    fut.add_done_callback(lambda f: _on_bg_done(f, run_id))
+    try:
+        fut.result(timeout=_BG_INLINE_WAIT_S)
+    except Exception:
+        pass
+    with _lock:
+        _state["bg_inline"] = None
+        inline = (fut.done() and not _fut_cancelled(fut)
+                  and run_id not in _bg_announced)
+        if inline:
+            _bg_announced.add(run_id)
+    if inline:
+        try:
+            return fut.result(timeout=0)
+        except Exception as e:
+            return f"Browser agent failed, sir — {type(e).__name__}: {e}"
+    print(f"  [browser_agent] run {run_id} continues in the background")
+    return BACKGROUND_STARTED_REPLY
+
+
+def background_running() -> bool:
+    """True while a background run is in flight. Never raises."""
+    try:
+        with _lock:
+            fut = _state.get("current_fut")
+            run_id = _state.get("bg_run")
+        return run_id is not None and fut is not None and not fut.done()
+    except Exception:
+        return False
+
+
+# A whole-utterance stop: "stop", "e-stop", "halt", "never mind", "forget it",
+# "cancel that", "stop the browser (task)", "stop browsing". "stop the music",
+# "cancel the timer", "stop listening" name something else and never match.
+_STOP_RE = re.compile(
+    r"^(?:(?:hey|ok|okay|oh|no|just|please|jarvis)\s+)*"
+    r"(?:stop|halt|abort|cancel|estop|emergency\s+stop|never\s?mind|"
+    r"forget\s+(?:it|about\s+it|that)|scratch\s+that|"
+    r"(?:stop|cancel|abort|halt)\s+(?:it|that|this|everything|now)|"
+    r"(?:stop|cancel|abort|halt|kill|end)\s+(?:the\s+|that\s+|this\s+)?"
+    r"(?:browser|browsing|web\s+search|search|lookup|look\s+up)"
+    r"(?:\s+(?:task|search|agent|job|thing|run))?)"
+    r"(?:\s+(?:please|now|sir|jarvis|then|thanks|thank\s+you))*$")
+
+
+def is_stop_request(text: Any) -> bool:
+    """True for a whole-utterance stop / never-mind. Never raises."""
+    try:
+        t = re.sub(r"[^a-z0-9\s-]", " ", str(text or "").lower())
+        t = " ".join(t.replace("-", " ").split())
+        t = re.sub(r"\be stop\b", "estop", t)
+        return bool(t) and len(t) <= 60 and bool(_STOP_RE.match(t))
+    except Exception:
+        return False
+
+
+def stop_background_for(text: Any) -> str | None:
+    """The spoken line when ``text`` is a stop request and a background run
+    is in flight (the run is cancelled and never announced), else None.
+    Never raises."""
+    try:
+        if not background_running() or not is_stop_request(text):
+            return None
+        with _lock:
+            _state["bg_cancelled"] = _state.get("bg_run")
+        _action_browser_stop("")
+        return "Stopped the browser task, sir."
+    except Exception as e:
+        print(f"  [browser_agent] background stop failed: "
+              f"{type(e).__name__}: {e}")
+        return None
 
 
 # ── public helpers exposed as actions ──────────────────────────────
@@ -922,7 +1175,8 @@ def _action_browser_open(arg: str = "") -> str:
     if blocked:
         return blocked
     task = f"Navigate to {url} and wait for the page to load. Report the page title."
-    return _truncate(_run_task_sync(task, max_steps=3))
+    # Three steps: short enough to wait for; the page title is the answer.
+    return _truncate(_run_task_sync(task, max_steps=3, background=False))
 
 
 def _action_browser_screenshot(_: str = "") -> str:

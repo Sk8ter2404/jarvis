@@ -2626,7 +2626,9 @@ class ReadChangelogTests(unittest.TestCase):
             with _patch_bc(bc):
                 out = A._act_read_changelog()
         self.assertIn("the full", out)
-        self.assertIn("changelog is at", out)
+        # v3.0.8 H1: voiced verbatim, so the file is named, not its path.
+        self.assertIn("notes are in CHANGELOG.md", out)
+        self.assertNotIn(td, out)
 
 
 class WhatsNewVersionFirstTests(unittest.TestCase):

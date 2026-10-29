@@ -46,7 +46,9 @@ the local model is both slow and unreliable at them (live 2026-09-29):
     times does the store open" falls through untouched.
   * "what can you do (for me)" (v3.0.6): a fixed overview of the real skills
     (capability_reply), each phrase kept only while an action backs it. Live
-    2026-10-28 the model claimed "I can manage your schedule".
+    2026-10-28 the model claimed "I can manage your schedule". v3.0.8: the
+    short form (capability_short_reply) names the most useful few and offers
+    the rest; a yes or "what else can you do" right after gets them.
   * "why is the RAM so high" / "what's using all my memory" (v3.0.7): the
     loaded system_pulse skill's memory_answer (the percent, the biggest
     memory users). The one fast path that reads live state; see
@@ -78,7 +80,8 @@ from core.date_math import normalize
 class FastAnswer(NamedTuple):
     kind: str    # "owner-name" | "owner-identity" | "last-utterance" |
     #              "first-utterance" | "world-clock" | "time" |
-    #              "arithmetic" | "capabilities" | "memory-users" |
+    #              "arithmetic" | "capabilities" | "capabilities-more" |
+    #              "memory-users" |
     #              a date_math kind
     reply: str
 
@@ -810,9 +813,148 @@ def capability_reply(available=None) -> str:
     if not parts:
         return ("I can answer questions and run what you ask for by name, "
                 "sir.")
-    body = parts[0] if len(parts) == 1 else (
-        ", ".join(parts[:-1]) + ", and " + parts[-1])
-    return (f"Quite a bit, sir: I can {body}. Ask for any of it by name.")
+    return (f"Quite a bit, sir: I can {_spoken_list(parts)}. Ask for any of "
+            f"it by name.")
+
+
+def _spoken_list(parts) -> str:
+    """ "a", "a, and b", "a, b, and c" (the v3.0.6 overview's own join).
+    Pure."""
+    parts = list(parts)
+    if len(parts) <= 1:
+        return "".join(parts)
+    return ", ".join(parts[:-1]) + ", and " + parts[-1]
+
+
+# ── the short overview (v3.0.8 H2) ─────────────────────────────────────────
+# Live 2026-10-28 19:47 the overview above was spoken with every backed skill
+# (about 20 items). With CAPABILITIES_SHORT_OVERVIEW on (core/config.py,
+# default True) "what can you do" says the CAPABILITY_SHORT_MAX most useful
+# backed skills (_CAPABILITY_TOP order, topped up from the rest) and ends on
+# CAPABILITY_MORE_OFFER; a yes to it, or "what else can you do" right after
+# it, gives the rest (capability_rest_reply). Off: the full overview.
+CAPABILITY_SHORT_MAX = 7
+CAPABILITY_MORE_OFFER = "Want the full list, sir?"
+_CAPABILITY_TOP = (
+    "set timers and reminders", "tell you the weather",
+    "read your calendar", "sort and draft your email",
+    "play music and YouTube", "run the smart-home lights and plugs",
+    "search the web and your own files",
+)
+_CAPABILITY_REST_END = "That's the lot, sir: ask for any of it by name."
+_ELSE_RE = re.compile(r"\belse\b")
+# "the full list", "go on", "tell me more" answer the offer like a yes.
+_MORE_RES = tuple(re.compile(p) for p in (
+    r"(?:yes |yeah |sure |ok |okay |please )*(?:give me |read me |tell me |"
+    r"let s hear |let me hear |go through )?(?:the )?(?:full|whole|rest of the)"
+    r" list(?: please)?",
+    r"(?:yes |yeah |sure |ok |okay )*(?:go on|go ahead|tell me more|"
+    r"go for it|let s hear (?:it|them|the rest)|the rest|all of (?:it|them)|"
+    r"what else)(?: please)?",
+))
+
+
+def _short_overview_enabled() -> bool:
+    """core.config.CAPABILITIES_SHORT_OVERVIEW, read live (default True).
+    Never raises."""
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, "CAPABILITIES_SHORT_OVERVIEW", True))
+    except Exception:
+        return True
+
+
+def _backed_parts(available) -> list:
+    try:
+        return [phrase for phrase, names in _CAPABILITY_PARTS
+                if _capability_backed(phrase, names, available)]
+    except Exception:
+        return [phrase for phrase, _ in _CAPABILITY_PARTS]
+
+
+def _short_split(available) -> tuple:
+    """(said first, the rest) for the short overview. Pure but for the
+    capability gates. Never raises."""
+    parts = _backed_parts(available)
+    top = [p for p in _CAPABILITY_TOP if p in parts]
+    for p in parts:
+        if len(top) >= CAPABILITY_SHORT_MAX:
+            break
+        if p not in top:
+            top.append(p)
+    top = top[:CAPABILITY_SHORT_MAX]
+    # Speaking order: the overview's own order.
+    first = [p for p in parts if p in top]
+    rest = [p for p in parts if p not in top]
+    # One left over is said at once rather than offered (8 is still short).
+    if len(rest) == 1:
+        first, rest = parts, []
+    return first, rest
+
+
+def capability_short_reply(available=None) -> str:
+    """The short spoken overview: the most useful backed skills and, when
+    more are left, CAPABILITY_MORE_OFFER. Never raises."""
+    try:
+        first, rest = _short_split(available)
+        if not first:
+            return capability_reply(available)
+        if not rest:
+            return capability_reply(available)
+        return (f"Quite a bit, sir: I can {_spoken_list(first)}. "
+                f"{CAPABILITY_MORE_OFFER}")
+    except Exception:
+        return capability_reply(available)
+
+
+def capability_rest_reply(available=None) -> str:
+    """The rest of the overview, after the short one. Never raises."""
+    try:
+        _first, rest = _short_split(available)
+        if not rest:
+            return capability_reply(available)
+        return f"I can also {_spoken_list(rest)}. {_CAPABILITY_REST_END}"
+    except Exception:
+        return capability_reply(available)
+
+
+def _last_said(history) -> str:
+    """The content of the last message in ``history`` when it is JARVIS's
+    (role "assistant"), else "". Never raises."""
+    try:
+        last = list(history or ())[-1]
+        if isinstance(last, dict) and last.get("role") == "assistant":
+            return str(last.get("content") or "").strip()
+    except Exception:
+        pass
+    return ""
+
+
+def capability_followup_answer(text, history, available=None):
+    """The rest of the overview when ``text`` answers the short overview JARVIS
+    just said (the last message of ``history`` ends on CAPABILITY_MORE_OFFER):
+    a clear yes, "the full list", "go on", or "what else can you do". None
+    otherwise. Never raises."""
+    try:
+        if not isinstance(text, str) or not text.strip():
+            return None
+        if not _last_said(history).endswith(CAPABILITY_MORE_OFFER):
+            return None
+        t = re.sub(r"\s+", " ", normalize(text)).strip()
+        t = re.sub(r"[^a-z0-9 ]", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        asked = (any(rx.fullmatch(t) for rx in _MORE_RES)
+                 or (is_capability_question(text)
+                     and bool(_ELSE_RE.search(t))))
+        if not asked:
+            try:
+                from core import yes_no as _yes_no
+                asked = _yes_no.classify_reply(text) == "yes"
+            except Exception:
+                asked = False
+        return capability_rest_reply(available) if asked else None
+    except Exception:
+        return None
 
 
 # ── "why is the RAM so high" (v3.0.7) ──────────────────────────────────────
@@ -912,7 +1054,15 @@ def match(text, *, now=None, history=(), owner_name="",
                               first_utterance_reply(
                                   text, session_turns, history,
                                   start_lost=session_start_lost is True))
+        if _short_overview_enabled():
+            more = capability_followup_answer(text, history,
+                                              _registered_actions())
+            if more:
+                return FastAnswer("capabilities-more", more)
         if is_capability_question(text):
+            if _short_overview_enabled():
+                return FastAnswer("capabilities", capability_short_reply(
+                    _registered_actions()))
             return FastAnswer("capabilities",
                               capability_reply(_registered_actions()))
         if is_memory_question(text):
