@@ -71,6 +71,10 @@ _BOOL_FLAG = re.compile(r"^([A-Z][A-Z0-9_]*)\s*=\s*(?:True|False)\b", re.M)
 # Matches of the grep that are NOT a behaviour of their own, and why.
 _RETIRED = "a retired overlay, superseded by the unified HUD (forced off)"
 NOT_PROACTIVE = {
+    "BRIEFING_SIR_ONCE": "wording inside the morning briefing (one 'sir'); "
+                         "starts nothing",
+    "DEV_TODO_ROBOT_STRICT": "how strictly a developer to-do names the robot; "
+                             "routing only, starts nothing",
     "AUDIO_AUTOSWITCH_DEFER_DURING_MEDIA": "a condition on audio auto-switch "
                                            "(its row): waits while media "
                                            "plays, starts nothing",
