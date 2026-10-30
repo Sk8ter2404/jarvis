@@ -60,6 +60,10 @@ class _InstantBase(_Base):
         # latter is a skill's declaration, folded in at load time).
         self._p(bc, "INFORMATIVE_ACTIONS",
                 set(bc.INFORMATIVE_ACTIONS) | {"pause_music"})
+        # These tests pin the brain path's follow-up round; since v3.0.10 a
+        # pause that plainly worked skips it (MEDIA_TOGGLE_NO_FOLLOWUP,
+        # pinned in tests/monolith/test_monolith_v3010_lane_e.py).
+        self._p(bc, "MEDIA_TOGGLE_NO_FOLLOWUP", False, create=True)
         self._p(bc, "SPEAK_RESULT_VERBATIM_ACTIONS",
                 set(bc.SPEAK_RESULT_VERBATIM_ACTIONS)
                 | {"pause_print", "smart_home_control"})

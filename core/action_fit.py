@@ -663,6 +663,57 @@ def check_rule(user_text, name, arg="",
         return 0, None
 
 
+# ── Action topic (v3.0.10, ACTION_TOPIC_GATE) ──────────────────────────────
+# Live 2026-10-29 18:55:45 a misheard short line, "Much more percentage, so
+# I've got", got "[ACTION: server_status]": 10 s of an Unraid read-out
+# nobody asked for. The pre-model filters let it through (real words, loud
+# enough). A few read-only status checks only make sense when his words, or
+# the turns just before, name their subject; with no such word the check is
+# not run and JARVIS asks him to repeat. Only these checks - never a control
+# action (pause, stop, lights ...) and never a check whose subject he named:
+# "is the server up?", "how's the print?", "check the printer" all run.
+_SERVER_TOPIC_RE = re.compile(
+    r"\b(?:servers?|unraid|nas|array|plex|disks?|drives?|parity|"
+    r"rebuild(?:ing|s)?|tower|storage|home\s*lab)\b", re.I)
+_PRINT_TOPIC_RE = re.compile(
+    r"\b(?:print(?:s|er|ers|ing|ed)?|bambu|h2d|nozzle|bed|filament|layers?|"
+    r"percent(?:age)?|done|finish(?:ed|es)?|left|long|eta|progress|"
+    r"remaining)\b|%", re.I)
+# action name -> (subject label for the log, the words that name it)
+TOPIC_ACTIONS = {
+    "server_status": ("server", _SERVER_TOPIC_RE),
+    "check_print": ("print", _PRINT_TOPIC_RE),
+    "how_is_the_print": ("print", _PRINT_TOPIC_RE),
+    "print_details": ("print", _PRINT_TOPIC_RE),
+}
+
+
+def action_topic_missing(name, user_text, context_texts=()) -> str:
+    """A short reason (no transcript words in it) when ``name`` is one of
+    TOPIC_ACTIONS and neither ``user_text`` nor any of ``context_texts``
+    (the turns just before this one, the actions that ran on them) names its
+    subject; "" when it fits, when ``name`` is not such a check, or with no
+    owner words (a proactive dispatch). Never raises ("")."""
+    try:
+        entry = TOPIC_ACTIONS.get(str(name or "").strip().lower())
+        text = _norm(user_text)
+        if entry is None or not text:
+            return ""
+        label, rx = entry
+        if rx.search(text):
+            return ""
+        # A check of the same subject just before ("[ACTION: check_print]")
+        # is context too: "_" joins the name, so the words above miss it.
+        family = [k for k, (lab, _rx) in TOPIC_ACTIONS.items() if lab == label]
+        for ctx in context_texts or ():
+            c = _norm(ctx)
+            if c and (rx.search(c) or any(k in c.lower() for k in family)):
+                return ""
+        return f"no {label} word in his line or the turns before it"
+    except Exception:
+        return ""
+
+
 def failure_result(reason: str) -> str:
     """The result an 'on' block records: carries the 'refused' failure
     marker (core.failure_markers) so the follow-up round chooses again."""

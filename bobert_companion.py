@@ -488,6 +488,9 @@ from core import action_aliases as _action_aliases  # noqa: E402
 # words (ACTION_FIT_MODE; see _action_fit_refusal and _runner).
 from core import action_fit as _action_fit  # noqa: E402
 from core import loop_guard as _loop_guard  # noqa: E402
+# "Wait, what? Did it send that?" - the actions of the last minute go into
+# that turn's prompt (RECALL_ACTION_GROUNDING; see _recall_action_note).
+from core import recall_actions as _recall_actions  # noqa: E402
 _AUTOCORRECT_THRESHOLD = 0.75
 # When two candidates both clear the threshold and sit within this gap of
 # each other, the dispatcher asks 'did you mean X or Y' instead of silently
@@ -4318,6 +4321,28 @@ def record_action_history(action_name: str, arg: str, result: str) -> None:
             "result": result if isinstance(result, str) else str(result),
             "at": time.time(),
         })
+
+
+def _recall_action_note(user_text: str) -> str:
+    """RECALL_ACTION_GROUNDING (v3.0.10): for a recall or surprise question
+    about what just happened, a prompt note listing the actions of the last
+    minute and their results (core.recall_actions.recall_action_note). Live
+    2026-10-29 18:54:51, 14 s after the robot's speak action ran, "... sent
+    it over to the robot?" was answered "a bit of a misinterpretation".
+    "" when off, when the line is no such question or nothing ran. Logs a
+    count only. Never raises."""
+    try:
+        if not globals().get("RECALL_ACTION_GROUNDING", True):
+            return ""
+        with _action_history_lock:
+            hist = list(_action_history)
+        note = _recall_actions.recall_action_note(user_text, hist)
+        if note:
+            n = note.count("\n- ")
+            print(f"  [recall-grounding] {n} recent action(s) in the prompt")
+        return note
+    except Exception:
+        return ""
 
 
 def record_session_action(action_name: str, arg: str = "") -> None:
@@ -17947,6 +17972,12 @@ _TURN_FLAG_KEYS = (
     "BAMBU_PUSHALL_ON_CONNECT", "PRINT_STATUS_HONEST",
     # v3.0.9 lane C: a transport word is not a song.
     "PLAY_MUSIC_TRANSPORT_WORDS",
+    # v3.0.10 lane E: the stressed reflex, media toggles with no second
+    # round, the action-topic check and recall grounding.
+    "VOICE_MOOD_SWEAR_ALONE_STRESSED", "VOICE_MOOD_QUOTED_WORDS_IGNORED",
+    "VOICE_MOOD_CALMING_LIGHTS", "VOICE_MOOD_HONEST_ADDENDUM",
+    "MEDIA_TOGGLE_NO_FOLLOWUP", "ACTION_TOPIC_GATE",
+    "RECALL_ACTION_GROUNDING",
 )
 
 
@@ -27038,9 +27069,10 @@ def _call_llm(user_text: str) -> str:
 
     # Voice-mood response: closes the loop on a 'stressed' label by
     # suppressing proactive nudges for 15 min, dimming Hue/Govee lights to
-    # warm 2700K on a daemon thread, and returning an extra-deferential
-    # addendum to stack onto sys_prompt_now. Returns '' for every other
-    # mood so non-stressed turns are unchanged.
+    # warm 2700K on a daemon thread (only per VOICE_MOOD_CALMING_LIGHTS since
+    # v3.0.10: 'off' by default), and returning a short-reply addendum to
+    # stack onto sys_prompt_now. Returns '' for every other mood so
+    # non-stressed turns are unchanged.
     voice_mood_addendum = ""
     if _voice_mood_response is not None:
         try:
@@ -27183,6 +27215,11 @@ def _call_llm(user_text: str) -> str:
         # in the system prompt, where each rotation changed the cached prefix.
         ("phrase rotation", _phrase_rotation_hint(),
          _prompt_budget.RANK_STYLE_HINT),
+        # "Wait, what? It sent that?" (v3.0.10, RECALL_ACTION_GROUNDING): the
+        # actions that really ran in the last minute, so the reply cannot
+        # deny one; '' on every other turn.
+        ("recent actions", _recall_action_note(user_text),
+         _prompt_budget.RANK_SECTION),
         # Last, nearest the owner's words; ranked with the action grammar,
         # since it IS what this turn has to do.
         ("accepted offer",
@@ -43214,6 +43251,53 @@ def _result_hold_name(new_results) -> str:
     return ""
 
 
+# ── Media toggle without a second round (v3.0.10, MEDIA_TOGGLE_NO_FOLLOWUP) ──
+# Live 2026-10-29 18:53:21 "pause movie": pause_music answered "paused
+# Chrome, sir", the reply's prose was held ([result-hold]) and a follow-up
+# round said "Understood, sir. I've paused Chrome, sir." - first audio at
+# 7.3 s. A pause / resume that plainly worked ("paused <app>, sir",
+# "resumed <app>, sir", "<app> is already paused / playing, sir") has
+# nothing for the model to read back, so it is not sent to a follow-up round:
+# the reply's own prose is spoken, or the result line when the reply had
+# none. A failure or "nothing seems to be playing" still holds and goes back
+# to the model, as before. MEDIA_TOGGLE_NO_FOLLOWUP False = the old path.
+_MEDIA_TOGGLE_ACTIONS = ("pause_music", "resume_music")
+_MEDIA_TOGGLE_DONE_RE = re.compile(
+    r"(?:(?:paused|resumed)\s+\S.*|\S.*\s+is\s+already\s+(?:paused|playing))"
+    r",\s+sir\.?", re.I | re.S)
+
+
+def _media_toggle_done(name, result) -> bool:
+    """True when ``name`` is pause_music / resume_music, its ``result`` is a
+    plain success (see the section comment) and MEDIA_TOGGLE_NO_FOLLOWUP is
+    on. Never raises (False: the old hold and follow-up round)."""
+    try:
+        if not globals().get("MEDIA_TOGGLE_NO_FOLLOWUP", True):
+            return False
+        if str(name or "").strip().lower() not in _MEDIA_TOGGLE_ACTIONS:
+            return False
+        if not isinstance(result, str) or len(result) > 160:
+            return False
+        if _action_result_failed(result, name):
+            return False
+        return _MEDIA_TOGGLE_DONE_RE.fullmatch(result.strip()) is not None
+    except Exception:
+        return False
+
+
+def _media_toggle_line(result) -> str:
+    """A media toggle's result as a spoken sentence: "paused Chrome, sir" ->
+    "Paused Chrome, sir." Never raises ("")."""
+    try:
+        line = str(result or "").strip()
+        if not line:
+            return ""
+        line = line[:1].upper() + line[1:]
+        return line if line.endswith((".", "!", "?")) else line + "."
+    except Exception:
+        return ""
+
+
 def _result_hold_cut(reply: str, cleaned: str, cut: int, name: str) -> str:
     """``cleaned`` (the reply minus its tokens) cut down to the prose before
     ``reply[cut:]`` - the token of action ``name`` - with any bracket tags
@@ -44353,6 +44437,66 @@ def _action_fit_refusal(name: str, arg: str, reply_names=()) -> "str | None":
         return None
 
 
+def _action_topic_context(user_text: str) -> list:
+    """What the turns just before this one said and ran, for
+    core.action_fit.action_topic_missing: up to four conversation_history
+    messages before this turn's own user message, and the names of the
+    actions that ran on the previous turn. Never raises ([])."""
+    out: list = []
+    try:
+        hist = list(conversation_history[-16:])
+        cur = " ".join(str(user_text or "").split())
+        idx = len(hist)
+        for i in range(len(hist) - 1, -1, -1):
+            m = hist[i] if isinstance(hist[i], dict) else {}
+            if m.get("role") == "user" and " ".join(
+                    str(m.get("content") or "").split()) == cur:
+                idx = i
+                break
+        out.extend(str((m or {}).get("content") or "")
+                   for m in hist[max(0, idx - 4):idx] if isinstance(m, dict))
+    except Exception:
+        pass
+    try:
+        out.extend(str(n) for n, _a in _action_fit_prior_actions())
+    except Exception:
+        pass
+    return out
+
+
+def _action_topic_refusal(name: str) -> "str | None":
+    """ACTION_TOPIC_GATE (v3.0.10): the result for a read-only status check
+    whose subject sir's line never names (core.action_fit.
+    action_topic_missing; live 2026-10-29 18:55:45 "Much more percentage, so
+    I've got" -> server_status) - a terminal failure carrying UNCLEAR_CUE,
+    so the check does not run, JARVIS asks him to repeat and no follow-up
+    round guesses again. None (run it) outside an owner turn, while a prompt
+    or JARVIS's offer waits for his answer, after he took an offer, or when
+    the words fit. Logs the action name and the reason only. Never raises."""
+    try:
+        if not globals().get("ACTION_TOPIC_GATE", True):
+            return None
+        if str(name or "").strip().lower() not in _action_fit.TOPIC_ACTIONS:
+            return None
+        user_text = _turn_user_text()
+        if not user_text:
+            return None
+        if (_reply_prompt_pending() or _turn_accepted_offer()
+                or _turn_offer_open()):
+            return None
+        reason = _action_fit.action_topic_missing(
+            name, user_text, _action_topic_context(user_text))
+        if not reason:
+            return None
+        print(f"  [action-topic] dropped {name} ({reason}) - asking sir "
+              f"to repeat")
+        _followup_keep_for_reply("action-topic")   # his repeat needs no wake word
+        return _TERMINAL_FAILURE_PREFIX + UNCLEAR_CUE
+    except Exception as _e:
+        print(f"  [action-topic] check failed: {type(_e).__name__}")
+        return None
+
+
 def _action_aliases_on() -> bool:
     """ACTION_ALIASES (core.config; v3 W04): the exact alias table, the
     autocorrect verb-clash guard and the spoken friendly labels. A missing
@@ -44834,6 +44978,14 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
                 results.append((name, _misfit, False))
                 return ""
 
+        # Action topic (v3.0.10, ACTION_TOPIC_GATE): a read-only status
+        # check whose subject his line never names is not run; JARVIS asks
+        # him to repeat (_action_topic_refusal).
+        _off_topic = _action_topic_refusal(name)
+        if _off_topic:
+            results.append((name, _off_topic, False))
+            return ""
+
         if _narrate:
             _narration_step[0] += 1
             try:
@@ -44889,8 +45041,15 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
             # also catches a send_* handler registered under another name
             # (confirm_pending_draft) - see _is_draft_send (2026-10-01).
             res = _run_draft_gated(name, arg, fn)
-            results.append((name, res, name in INFORMATIVE_ACTIONS
-                            and not _browser_bg_started(name, res)))
+            _is_info = (name in INFORMATIVE_ACTIONS
+                        and not _browser_bg_started(name, res))
+            # A pause / resume that plainly worked goes to no follow-up
+            # round (v3.0.10, MEDIA_TOGGLE_NO_FOLLOWUP; _media_toggle_done).
+            if _is_info and _media_toggle_done(name, res):
+                _is_info = False
+                _toggle_lines.append(res)
+                print(f"  [media-toggle] {name} worked - no follow-up round")
+            results.append((name, res, _is_info))
             print(f"  [action] {name}: {res[:120]}{'…' if len(res) > 120 else ''}")
             # Turn grounding ledger: lets a later follow-up round that reads
             # this result back pass the claim validators (no-op outside a
@@ -44970,6 +45129,9 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     # Result hold (2026-10-01): where in `reply` the first tag sits whose
     # result the model has not seen yet - see _result_hold_cut.
     _hold_at: list[tuple[int, str]] = []
+    # Media toggles that worked (MEDIA_TOGGLE_NO_FOLLOWUP): their result line
+    # is spoken when the reply has no prose of its own.
+    _toggle_lines: list[str] = []
 
     def _runner_holding(match):
         n0 = len(results)
@@ -44989,6 +45151,11 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     cleaned = re.sub(r"\s{2,}", " ", cleaned)
     if _hold_at:
         cleaned = _result_hold_cut(reply, cleaned, *_hold_at[0])
+    # A media toggle that worked and a reply with no words of its own
+    # ("[ACTION: pause_music]" alone): its result line is the answer, since
+    # no follow-up round will say anything (MEDIA_TOGGLE_NO_FOLLOWUP).
+    if _toggle_lines and not _hold_at and not re.search(r"\w", cleaned):
+        cleaned = _media_toggle_line(_toggle_lines[0]) or cleaned
     if _head_mode != "off":
         cleaned = _head_hold_apply(cleaned, results, _hold_at,
                                    _ran_before_reply, _head_grounding,

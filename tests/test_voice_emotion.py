@@ -31,8 +31,20 @@ class DetectExcitedTests(unittest.TestCase):
 
 class RouteTests(unittest.TestCase):
     def test_swear_routes_to_stressed(self):
-        self.assertEqual(ve.route_voice_emotion("what the fuck is going on")["mood"],
-                         "stressed")
+        # With an exclamation mark; a lone swear word is not stress since
+        # v3.0.10 (VOICE_MOOD_SWEAR_ALONE_STRESSED False).
+        self.assertEqual(
+            ve.route_voice_emotion("what the fuck is going on!")["mood"],
+            "stressed")
+
+    def test_lone_swear_is_casual_unless_old_rule(self):
+        self.assertEqual(
+            ve.route_voice_emotion("what the fuck is going on")["mood"],
+            "casual")
+        with mock.patch("core.config.VOICE_MOOD_SWEAR_ALONE_STRESSED", True):
+            self.assertEqual(
+                ve.route_voice_emotion("what the fuck is going on")["mood"],
+                "stressed")
 
     def test_excited_routes_to_excited(self):
         r = ve.route_voice_emotion("this is amazing")

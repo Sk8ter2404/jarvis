@@ -52,7 +52,11 @@ class DetectToneTests(unittest.TestCase):
         self.assertEqual(td.detect_tone("this is amazing"), "excited")
 
     def test_stressed_on_swear(self):
-        self.assertEqual(td.detect_tone("what the fuck is going on"), "stressed")
+        # A swear word with an exclamation mark is stress; alone it is not
+        # (v3.0.10, VOICE_MOOD_SWEAR_ALONE_STRESSED False - see
+        # LoneSwearTests).
+        self.assertEqual(td.detect_tone("what the fuck is going on!"),
+                         "stressed")
 
     def test_rushed_on_urgency(self):
         self.assertEqual(td.detect_tone("do it now please"), "rushed")
@@ -127,9 +131,14 @@ class ContextGatedStillTests(unittest.TestCase):
         self.assertIsNone(td.detect_tone(self.REPORT))
 
     def test_swear_plus_bare_still_is_not_frustrated(self):
-        # Swearing alone is 'stressed'; 'still' no longer upgrades it.
-        self.assertEqual(td.detect_tone("damn, I'm still having USB issues"),
-                         "stressed")
+        # 'still' no longer upgrades a swear word to frustrated. Since v3.0.10
+        # a lone swear word is no tone at all (VOICE_MOOD_SWEAR_ALONE_STRESSED
+        # False); with the old rule it is 'stressed'.
+        self.assertIsNone(td.detect_tone("damn, I'm still having USB issues"))
+        with mock.patch("core.config.VOICE_MOOD_SWEAR_ALONE_STRESSED", True):
+            self.assertEqual(
+                td.detect_tone("damn, I'm still having USB issues"),
+                "stressed")
 
     def test_still_after_a_failed_turn_is_frustrated(self):
         self.assertEqual(td.detect_tone(self.REPORT, prev_turn_failed=True),
@@ -295,6 +304,63 @@ class RepeatRequestTests(unittest.TestCase):
                 with self.subTest(text=text):
                     self.assertFalse(td.is_repeat_request(text))
                     self.assertEqual(td.detect_tone(text), "frustrated")
+
+
+
+class LoneSwearTests(unittest.TestCase):
+    """v3.0.10 (VOICE_MOOD_SWEAR_ALONE_STRESSED False): live 2026-10-29
+    18:53:36 a jokey line with one swear word was 'stressed', which muted
+    proactive speech for 15 min and fired the lights reflex. A swear word
+    needs another stress sign; "say <X>" carries no tone at all
+    (VOICE_MOOD_QUOTED_WORDS_IGNORED)."""
+
+    def setUp(self):
+        p = mock.patch.object(td, "_is_late_night_hour", return_value=False)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_lone_swear_is_no_tone(self):
+        for text in ("You can pod my shit.", "well that's a damn shame",
+                     "what the fuck is going on"):
+            with self.subTest(text=text):
+                self.assertIsNone(td.detect_tone(text))
+
+    def test_swear_with_another_sign_still_counts(self):
+        self.assertEqual(td.detect_tone("what the fuck is going on!"),
+                         "stressed")
+        self.assertEqual(td.detect_tone("damn it, just do it"), "frustrated")
+        self.assertEqual(td.detect_tone("stop it now!!"), "stressed")
+
+    def test_old_rule_behind_the_flag(self):
+        with mock.patch("core.config.VOICE_MOOD_SWEAR_ALONE_STRESSED", True):
+            self.assertEqual(td.detect_tone("You can pod my shit."),
+                             "stressed")
+
+    def test_quote_request_carries_no_tone(self):
+        for text in ("Jarvis, say fuck off.", "say damn it!!",
+                     "can you say shit", "I want you to say hell no!",
+                     "repeat after me: bloody hell!",
+                     "have the robot say fuck yes"):
+            with self.subTest(text=text):
+                self.assertTrue(td.is_quote_request(text))
+                self.assertIsNone(td.detect_tone(text))
+
+    def test_quote_request_off_is_the_old_path(self):
+        with mock.patch("core.config.VOICE_MOOD_QUOTED_WORDS_IGNORED",
+                        False),                 mock.patch("core.config.VOICE_MOOD_SWEAR_ALONE_STRESSED",
+                           True):
+            self.assertEqual(td.detect_tone("Jarvis, say fuck off."),
+                             "stressed")
+
+    def test_not_a_quote_request(self):
+        for text in ("say that again, you idiot", "say it again damn it",
+                     "I said say it", "damn it, say something",
+                     "repeat yourself", "what did you say", ""):
+            with self.subTest(text=text):
+                self.assertFalse(td.is_quote_request(text))
+        self.assertFalse(td.is_quote_request(None))
+        self.assertEqual(td.detect_tone("say it again damn it"),
+                         "frustrated")
 
 
 if __name__ == "__main__":
