@@ -17965,6 +17965,9 @@ def _log_turn_flags() -> None:
         for k in _TURN_FLAG_KEYS:
             if k in g:
                 v = g[k]
+                if k == "PLAY_MUSIC_TRANSPORT_WORDS":
+                    # Both switches it reads (v3.0.9): never a stale value.
+                    v = _play_music_transport_on()
                 if k == "STT_ENGINE" and g.get("_stt_parakeet") is not None:
                     v = g["_stt_parakeet"].engine_setting(v)
                 tok = _turn_flag_token(v)
@@ -22999,16 +23002,28 @@ _LOCAL_NEVER_GUESS_GUARD = (
 )
 
 
+def _play_music_transport_on() -> bool:
+    """PLAY_MUSIC_TRANSPORT_WORDS as this turn sees it (v3.0.9): this
+    module's global (the value the [turn-flags] line prints, the way
+    NOTE_CLAIM_CHECK is read) AND core.config's (what core.actions reads) -
+    off when either is off, so the log and the behaviour cannot disagree.
+    Never raises (an error reads as off)."""
+    try:
+        if not bool(globals().get("PLAY_MUSIC_TRANSPORT_WORDS", True)):
+            return False
+        import core.config as _cfg_pm
+        return bool(getattr(_cfg_pm, "PLAY_MUSIC_TRANSPORT_WORDS", True))
+    except Exception:
+        return False
+
+
 def _play_music_transport_hint() -> str:
     """The one line under play_music in the local cheat sheet (v3.0.9,
     PLAY_MUSIC_TRANSPORT_WORDS): live 2026-10-29 19:12 "Resume movie." was
     written as play_music, resume. "" with the flag off (the old sheet
-    exactly). Read when the sheet is built (it is cached). Never raises."""
-    try:
-        import core.config as _cfg_pm
-        if not bool(getattr(_cfg_pm, "PLAY_MUSIC_TRANSPORT_WORDS", True)):
-            return ""
-    except Exception:
+    exactly). The sheet cache is keyed on this flag too, so a live flip
+    rebuilds it. Never raises."""
+    if not _play_music_transport_on():
         return ""
     return ("      resume / pause / next are resume_music / pause_music / "
             "next_song, never play_music\n")
@@ -23034,8 +23049,11 @@ def _local_cheatsheet() -> str:
         _n_actions = len(ACTIONS)
     except Exception:               # a broken registry must not break the prompt
         _n_actions = -1
+    # Keyed on the transport flag too (v3.0.9): its hint line must leave the
+    # sheet as soon as PLAY_MUSIC_TRANSPORT_WORDS goes off, not at a restart.
+    _cache_key = (_n_actions, _play_music_transport_on())
     cached = _LOCAL_CHEATSHEET_CACHE[0]
-    if isinstance(cached, tuple) and cached[0] == _n_actions:
+    if isinstance(cached, tuple) and cached[0] == _cache_key:
         return cached[1]
     common = (
         "\n\n=== CONTROLLING THE PC ===\n"
@@ -23131,7 +23149,7 @@ def _local_cheatsheet() -> str:
         "=== END PC CONTROL ===\n"
     )
     out = common + allnames + tail
-    _LOCAL_CHEATSHEET_CACHE[0] = (_n_actions, out)
+    _LOCAL_CHEATSHEET_CACHE[0] = (_cache_key, out)
     return out
 
 
@@ -36987,11 +37005,10 @@ def _screen_route_reply(text: str) -> "str | None":
 def _video_transport_route_reply(text: str) -> "str | None":
     """The resume_music / pause_music token core.dispatcher.
     video_transport_route claims ``text`` with, when PLAY_MUSIC_TRANSPORT_
-    WORDS is on (read live from core.config) and the action is registered;
-    else None. Never raises."""
+    WORDS is on (_play_music_transport_on, read live) and the action is
+    registered; else None. Never raises."""
     try:
-        import core.config as _cfg_vt
-        if not bool(getattr(_cfg_vt, "PLAY_MUSIC_TRANSPORT_WORDS", True)):
+        if not _play_music_transport_on():
             return None
         from core.dispatcher import video_transport_route as _vt_route
         tok = _vt_route(text)

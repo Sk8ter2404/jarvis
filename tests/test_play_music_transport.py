@@ -43,12 +43,22 @@ RESUME_ARGS = (
     "resume this video", "please resume", "resume please",
     "resume, sir", "Jarvis, resume the movie.", "resume the movie please sir",
     "hey jarvis resume", "  resume  ",
+    # Review 2026-10-29: more transport forms the brain writes.
+    "resume again", "resume the movie in chrome", "resume the youtube video",
+    "resume the paused movie", "resume the tv show", "resume netflix",
+    "resume youtube", "resume chrome", "continue the video on youtube",
+    '"resume"', "'resume'", '"Resume"', "(resume)", "“resume”",
+    "it", "that", "It.",
 )
 PAUSE_ARGS = (
     "pause", "Pause", "stop", "pause the movie", "pause movie",
     "pause it", "stop the music", "pause playback", "please pause",
     "pause, sir", "stop the video please",
+    "stop playing", "pause playing", "hold it", '"pause"',
+    "pause the movie in chrome",
 )
+NEXT_ARGS = ("next", "skip", "next song", "next track", "skip this song",
+             "skip it", "Next.", '"next"')
 # Real queries: a song search, exactly as before.
 QUERY_ARGS = (
     "Resume by Jenevieve", "song:Resume", "song: Resume", "artist:Continue",
@@ -57,6 +67,9 @@ QUERY_ARGS = (
     "the movie", "play the movie Inception", "resume the movie soundtrack",
     "pause by the band", "stop this train", "Don't Stop Believin'",
     "Unpause Me", "library:resume",
+    "Start Me Up", "Unstoppable", "The Movie Song", "Play That Song",
+    "Play It Again", "Stop the Music - Ella", "Hold On", "the movie",
+    "Next to Me",
 )
 
 
@@ -70,6 +83,11 @@ class TransportArgOpTests(unittest.TestCase):
         for arg in PAUSE_ARGS:
             with self.subTest(arg=arg):
                 self.assertEqual(D.transport_arg_op(arg), "pause")
+
+    def test_every_next_form(self):
+        for arg in NEXT_ARGS:
+            with self.subTest(arg=arg):
+                self.assertEqual(D.transport_arg_op(arg), "next")
 
     def test_real_queries_are_not_transport(self):
         for arg in QUERY_ARGS:
@@ -132,8 +150,11 @@ class PlayMusicTransportTests(unittest.TestCase):
                                   return_value="Resumed Chrome, sir.")
         self.pause = self._patch(A, "_act_pause_music",
                                  return_value="Paused Chrome, sir.")
+        self.next = self._patch(A, "_act_next_song",
+                                return_value="Skipped, sir.")
         self.search = self._patch(A, "_act_apple_music",
                                   return_value="streamed via apple music")
+        self.said = self._patch(A, "_turn_said", return_value="")
 
     def _patch(self, *a, **k):
         p = mock.patch.object(*a, **k)
@@ -168,6 +189,49 @@ class PlayMusicTransportTests(unittest.TestCase):
         self.search.assert_not_called()
         self.resume.assert_not_called()
 
+    def test_every_next_form_runs_next_song(self):
+        for arg in NEXT_ARGS:
+            with self.subTest(arg=arg):
+                self.next.reset_mock()
+                self.assertEqual(_quiet(A._act_play_music, arg),
+                                 "Skipped, sir.")
+                self.next.assert_called_once_with()
+        self.search.assert_not_called()
+
+    def test_a_title_asked_for_by_name_is_still_a_song(self):
+        # Review 2026-10-29: "Carry On" / "Stop" / "Play" are real songs.
+        for said, arg in (("Jarvis play Carry On.", "Carry On"),
+                          ("play Stop by the Spice Girls", "Stop"),
+                          ("play Carry On and set a 5 minute timer",
+                           "Carry On"),
+                          ("put on Start Again", "Start Again"),
+                          ("queue up Pause from Pitbull", "Pause"),
+                          ("play Resume", '"Resume"'),
+                          ("Jarvis, play Play.", "Play")):
+            with self.subTest(said=said):
+                self.said.return_value = said
+                self.search.reset_mock()
+                self.assertEqual(_quiet(A._act_play_music, arg),
+                                 "streamed via apple music")
+                self.search.assert_called_once()
+        self.resume.assert_not_called()
+        self.pause.assert_not_called()
+        self.next.assert_not_called()
+
+    def test_the_turn_words_keep_the_live_case_a_resume(self):
+        for said, arg in (("Jarvis Resume movie.", "resume"),
+                          ("", "resume"),
+                          ("Jarvis play", "play"),
+                          ("play it", "it"),
+                          ("play the song after resume", "resume")):
+            with self.subTest(said=said, arg=arg):
+                self.said.return_value = said
+                self.resume.reset_mock()
+                self.assertEqual(_quiet(A._act_play_music, arg),
+                                 "Resumed Chrome, sir.")
+                self.resume.assert_called_once_with()
+        self.search.assert_not_called()
+
     def test_real_queries_still_search_apple_music(self):
         cases = {
             "Resume by Jenevieve": "Resume by Jenevieve",
@@ -190,6 +254,8 @@ class PlayMusicTransportTests(unittest.TestCase):
         self._patch(cfg, "PLAY_MUSIC_TRANSPORT_WORDS", False)
         for arg, query in (("resume", "resume"), ("pause", "pause"),
                            ("continue the movie", "continue the movie"),
+                           ("next", "next"), ("it", "it"),
+                           ('"resume"', '"resume"'),
                            ("song:Resume", "Resume")):
             with self.subTest(arg=arg):
                 self.search.reset_mock()
@@ -198,6 +264,7 @@ class PlayMusicTransportTests(unittest.TestCase):
                 self.search.assert_called_once_with(query)
         self.resume.assert_not_called()
         self.pause.assert_not_called()
+        self.next.assert_not_called()
 
     def test_a_raising_classifier_falls_back_to_the_search(self):
         self._patch(D, "transport_arg_op", side_effect=RuntimeError("boom"))

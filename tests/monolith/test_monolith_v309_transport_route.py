@@ -82,6 +82,24 @@ class VideoTransportRouteTurnTests(_Base):
         got = self._quiet(self.bc._utterance_route_reply, LIVE) or ""
         self.assertNotIn("resume_music", got)
 
+    def test_the_monolith_global_off_is_the_route_off(self):
+        # Review 2026-10-29: the switch the [turn-flags] line prints is the
+        # switch the route obeys (read like NOTE_CLAIM_CHECK).
+        self._p(self.bc, "PLAY_MUSIC_TRANSPORT_WORDS", False, create=True)
+        self.assertIsNone(
+            self._quiet(self.bc._video_transport_route_reply, LIVE))
+        self.assertFalse(self.bc._play_music_transport_on())
+        import core.actions as A
+        self.assertFalse(A._play_music_transport_on())
+
+    def test_turn_flags_line_prints_the_value_in_effect(self):
+        self._p(self.bc, "PLAY_MUSIC_TRANSPORT_WORDS", True, create=True)
+        self._p(cfg, "PLAY_MUSIC_TRANSPORT_WORDS", False)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.bc._log_turn_flags()
+        self.assertIn("PLAY_MUSIC_TRANSPORT_WORDS=False", buf.getvalue())
+
     def test_unregistered_action_no_route(self):
         del self._actions["resume_music"]
         self.assertIsNone(
@@ -109,6 +127,17 @@ class CheatSheetHintTests(_Base):
         lines = sheet.splitlines()
         i = lines.index(line)
         self.assertIn("[ACTION: play_music,", lines[i - 1])
+
+    def test_a_live_flip_rebuilds_the_cached_sheet(self):
+        # Review 2026-10-29: the cache is keyed on the flag too.
+        bc = self.bc
+        self._p(bc, "_LOCAL_CHEATSHEET_CACHE", [None])
+        self._p(cfg, "PLAY_MUSIC_TRANSPORT_WORDS", True, create=True)
+        self.assertIn(HINT, bc._local_cheatsheet())
+        self._p(cfg, "PLAY_MUSIC_TRANSPORT_WORDS", False)
+        self.assertNotIn(HINT, bc._local_cheatsheet())
+        self._p(cfg, "PLAY_MUSIC_TRANSPORT_WORDS", True)
+        self.assertIn(HINT, bc._local_cheatsheet())
 
     def test_flag_off_is_the_old_sheet(self):
         self._p(cfg, "PLAY_MUSIC_TRANSPORT_WORDS", False)

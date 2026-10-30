@@ -266,9 +266,11 @@ def close_front_tab_route(utterance) -> bool:
 # Apple Music for "resume", opened a song called "Resume" and spent 45 s
 # failing to confirm it; the movie stayed paused. Two pure checks:
 #   * transport_arg_op(arg): a play_music ARGUMENT that is only a transport
-#     request ("resume", "continue the movie", "unpause it", "pause") ->
-#     'resume' / 'pause'; core.actions._act_play_music then runs
-#     resume_music / pause_music (the Windows media session first);
+#     request ("resume", "continue the movie", "unpause it", "pause",
+#     "next song") -> 'resume' / 'pause' / 'next'; core.actions.
+#     _act_play_music then runs resume_music / pause_music / next_song (the
+#     Windows media session first) unless the owner's own words this turn
+#     were "play <that title>";
 #   * video_transport_route(utterance): a WHOLE "resume / unpause / continue
 #     the movie / video / show / episode / film" (or "pause the movie") ->
 #     [ACTION: resume_music] / [ACTION: pause_music], so the brain is not
@@ -276,20 +278,35 @@ def close_front_tab_route(utterance) -> bool:
 # A real query ("Resume by <artist>", "song:Resume", "play Earth Song",
 # "continue by <artist>") matches neither. The switch lives with the callers.
 _TRANSPORT_FILLER = r"(?:please|sir|jarvis|(?:hey|ok|okay)\s+jarvis)"
+_TRANSPORT_TAIL_FILLER = r"(?:please|sir|jarvis|now)"
 _TRANSPORT_RESUME_VERB = (
     r"(?:resume(?:\s+playing)?|un-?\s?pause|play|start\s+again|"
     r"keep\s+playing|(?:continue|carry\s+on)(?:\s+(?:with|playing))?)")
-_TRANSPORT_PAUSE_VERB = r"(?:pause|stop)"
+_TRANSPORT_PAUSE_VERB = (r"(?:(?:pause|stop)(?:\s+playing)?|"
+                         r"hold\s+(?:it|that))")
+_TRANSPORT_NEXT_VERB = (r"(?:next(?:\s+(?:song|track))?|"
+                        r"skip(?:\s+(?:(?:this|the)\s+)?(?:song|track)|"
+                        r"\s+(?:it|this))?)")
+_TRANSPORT_PLACE = (r"(?:chrome|the\s+browser|youtube|netflix|hulu|max|"
+                    r"disney\+?|prime(?:\s+video)?)")
 _TRANSPORT_OBJECT = (
-    r"(?:(?:the|my|this)\s+)?"
-    r"(?:movie|video|show|episode|film|music|song|track|playback|media|"
-    r"audio|stream)|it|that")
+    r"(?:(?:(?:the|my|this)\s+)?(?:paused\s+)?"
+    r"(?:movie|video|youtube\s+video|(?:tv\s+)?show|episode|film|music|"
+    r"song|track|playback|media|audio|stream)"
+    r"(?:\s+(?:in|on)\s+" + _TRANSPORT_PLACE + r")?"
+    r"|it|that|" + _TRANSPORT_PLACE + r")")
 _TRANSPORT_ARG_RE = re.compile(
     r"^(?:" + _TRANSPORT_FILLER + r"\s+)*"
     r"(?:(?P<resume>" + _TRANSPORT_RESUME_VERB + r")"
-    r"|(?P<pause>" + _TRANSPORT_PAUSE_VERB + r"))"
+    r"|(?P<pause>" + _TRANSPORT_PAUSE_VERB + r")"
+    r"|(?P<next>" + _TRANSPORT_NEXT_VERB + r"))"
+    # "resume again" right after the verb only ("Play It Again" is a song).
+    r"(?:\s+again)?"
     r"(?:\s+(?:" + _TRANSPORT_OBJECT + r"))?"
-    r"(?:\s+" + _TRANSPORT_FILLER + r")*$")
+    r"(?:\s+" + _TRANSPORT_TAIL_FILLER + r")*$")
+# One wrapping pair of quotes / brackets ('"resume"', "(resume)").
+_TRANSPORT_WRAP_RE = re.compile(
+    r"""^\s*(?:"(.*)"|'(.*)'|\((.*)\)|\[(.*)\]|<(.*)>)\s*$""", re.S)
 # The route: video words only, and no bare "play" / "stop" ("play the movie
 # <title>" is a request, "stop the movie" may mean close it).
 _VIDEO_NOUN = (r"(?:(?:the|my|this)\s+)?"
@@ -302,25 +319,37 @@ _VIDEO_TRANSPORT_RE = re.compile(
 
 
 def _transport_norm(text) -> str:
-    """Lower case, accents off ("resumé" -> "resume"), sentence punctuation
+    """Lower case, accents off ("resumé" -> "resume"), one wrapping pair of
+    quotes / brackets off ('"Resume"' -> "resume"), sentence punctuation
     and extra spaces gone. A field colon ("song:") stays."""
     s = unicodedata.normalize("NFKD", str(text or ""))
     s = "".join(c for c in s if not unicodedata.combining(c))
-    s = s.replace("’", "'").lower()
+    s = s.replace("’", "'").replace("“", '"').replace("”", '"')
+    m = _TRANSPORT_WRAP_RE.match(s)
+    if m:
+        s = next(g for g in m.groups() if g is not None)
+    s = s.lower()
     s = re.sub(r"[.,!?;]+", " ", s)
     return " ".join(s.split())
 
 
 def transport_arg_op(arg) -> str | None:
-    """'resume' / 'pause' when the WHOLE play_music argument is only a
-    transport request, else None (a song query). Never raises."""
+    """'resume' / 'pause' / 'next' when the WHOLE play_music argument is
+    only a transport request, else None (a song query). A bare "it" /
+    "that" (the brain's play_music, it for "play it") is 'resume'; "the
+    movie" stays a query. Never raises."""
     try:
         if not isinstance(arg, str):
             return None
-        m = _TRANSPORT_ARG_RE.match(_transport_norm(arg))
+        norm = _transport_norm(arg)
+        if norm in ("it", "that"):
+            return "resume"
+        m = _TRANSPORT_ARG_RE.match(norm)
         if not m:
             return None
-        return "resume" if m.group("resume") else "pause"
+        if m.group("resume"):
+            return "resume"
+        return "pause" if m.group("pause") else "next"
     except Exception:
         return None
 

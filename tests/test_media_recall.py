@@ -44,6 +44,29 @@ class RecordTests(unittest.TestCase):
         self.assertEqual(M.recall_route("play it again", now=NOW + 60),
                          "[ACTION: youtube_play, famous last words]")
 
+    def test_a_transport_argument_is_not_the_song_to_replay(self):
+        # v3.0.9 review: play_music, resume ran resume_music, not a song.
+        from unittest import mock
+        from core import config as cfg
+        with mock.patch.object(cfg, "PLAY_MUSIC_TRANSPORT_WORDS", True,
+                               create=True):
+            M.record("play_music", "Earth Song", now=NOW)
+            M.record("play_music", "resume", now=NOW + 1)
+            M.record("play_music", "pause the movie", now=NOW + 2)
+            self.assertEqual(M.recall_route("play my song from earlier",
+                                            now=NOW + 60),
+                             "[ACTION: play_music, Earth Song]")
+
+    def test_flag_off_a_transport_argument_is_remembered_as_before(self):
+        from unittest import mock
+        from core import config as cfg
+        with mock.patch.object(cfg, "PLAY_MUSIC_TRANSPORT_WORDS", False):
+            M.record("play_music", "Earth Song", now=NOW)
+            M.record("play_music", "resume", now=NOW + 1)
+            self.assertEqual(M.recall_route("play my song from earlier",
+                                            now=NOW + 60),
+                             "[ACTION: play_music, resume]")
+
     def test_an_old_or_missing_request_leaves_it_to_the_model(self):
         self.assertIsNone(M.recall_route("play my song from earlier", now=NOW))
         M.record("youtube_play", "famous last words", now=NOW)
