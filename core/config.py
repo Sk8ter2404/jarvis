@@ -1331,8 +1331,10 @@ MEDIA_AEC_BACKEND          = "nlms"
 # MEDIA_AEC_DELAY_MAX_S (-300 .. +600 ms), a realign that would leave that
 # range is rejected and counted, a drift correction is clipped into it, and
 # an echo "out of the filter's reach" needs two agreeing measurements like
-# any other realign. False: the old unbounded path exactly. Applies on the
-# next start.
+# any other realign; the confirming measure runs one 4 s window later (not at
+# the slow 10 s cadence), and three rejections in a row log one
+# "[media-aec] echo path outside the bounds" line (a speaker path over
+# 600 ms). False: the old unbounded path exactly. Applies on the next start.
 MEDIA_AEC_DELAY_BOUNDS     = True
 # skills/wake_listener.py's own detector autostart (its own InputStream; off:
 # it collides with record_speech on the same WASAPI device). Its ONE default
@@ -1920,9 +1922,16 @@ PRINT_STATUS_HONEST = True
 # line); a finish line is stale only when a new job is running (RUNNING /
 # PREPARE / PAUSE) or the printer's job id changed, never for a file-name
 # change alone; every drop is logged with its reason; and the companion's
-# follow-on offer is spoken only right after its finish line was. False: the
-# old check exactly (a second module copy; FINISH and the same file name, or
-# drop), unlogged, and the offer queued on its own. Read live.
+# follow-on offer is spoken only right after its finish line was. Review
+# 10-29: a job id is compared only with one from the same report key (a push
+# carrying only subtask_id is not a new job); a finish line passed but not
+# spoken (duplicate, TTS failure) and a new print both clear the offer's
+# stamp; when bambu_monitor queued no finish line at all the companion waits
+# 20 s and then speaks the full announcement itself; and the companion leaves
+# out its "queue a cooldown timer" offer when the monitor's head already asks
+# about the bed cooling. False: the old check exactly (a second module copy;
+# FINISH and the same file name, or drop), unlogged, and the offer queued on
+# its own. Read live.
 FINISH_LINE_KEEP = True
 # PRINT_MILESTONE_SUPERSEDE (bool, skills/bambu_monitor milestones,
 # skills/proactive_print_companion milestone line): live 2026-10-28 21:58:39
@@ -1932,6 +1941,15 @@ FINISH_LINE_KEEP = True
 # replaces an older one that was never spoken. False: each line queues on its
 # own (the old behaviour). Read live.
 PRINT_MILESTONE_SUPERSEDE = True
+# PENDING_REQUEUE_SUPERSEDE (bool, bobert_companion._requeue_pending_speech):
+# v3.0.10 review of the 10-28 21:58 case - while a drain holds the claimed
+# queue (the owner-away hold speaking an exempt timer line), a newer 50 %
+# milestone lands in a fresh queue file and cannot remove the held 25 %; the
+# requeue merged both back. True (default): a requeued entry whose supersede
+# family is also on a newer queued entry is dropped and logged ("[pending]
+# replaced ..."), for every supersede family. False: the old merge exactly.
+# Read live.
+PENDING_REQUEUE_SUPERSEDE = True
 # PRINT_MILESTONE_ONE_LINE (bool, skills/proactive_print_companion,
 # skills/bambu_h2d_voice_companion): live 2026-10-28 21:58 four lines in 11 s
 # for two milestones, the companion's ending in made-up faults ("a hiccup in
@@ -3021,8 +3039,14 @@ TV_DETECT_ENABLED = True
 # person moving at the desk). True (default): with no TV rectangle the
 # decider learns the room's idle motion (the median of its last 120 readings
 # that did not qualify) and a reading must beat it by 3.0 to count, half that
-# while ON (hysteresis); a calibrated region is untouched. The real cure is
-# still his "calibrate the tv region". False: the fixed 4.0 floor exactly.
+# while ON (hysteresis); a calibrated region is untouched. Only truly idle
+# readings are learned (verdict OFF, motion under 4.0) and the floor is capped
+# at 7.0, so a playing TV's quiet scenes cannot ratchet it up until the TV
+# never reads ON. Residual, stated honestly: replaying the 122 logged ON
+# motions as 25 s bursts cuts the flips about 54 % (205 -> 94), not to zero;
+# about 40 % of those bursts move harder than the learned ~6.45 floor. The
+# real cure is still his "calibrate the tv region". False: the fixed 4.0
+# floor exactly.
 TV_DETECT_ADAPTIVE_BASELINE = True
 
 

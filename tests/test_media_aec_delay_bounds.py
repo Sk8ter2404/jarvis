@@ -129,6 +129,63 @@ class DelayBoundsTests(unittest.TestCase):
         self.assertTrue(np.array_equal(outs[0][0], outs[1][0]))
         self.assertTrue(np.array_equal(outs[0][1], outs[1][1]))
 
+    def _held(self, bounds):
+        # A drift-known, not-converged canceller at the slow cadence sees
+        # one far-early lag: it is held for confirmation.
+        aec = ap.MediaEchoCanceller(FakeRef(np.zeros(SR)), delay_bounds=bounds)
+        rng = np.random.default_rng(5)
+        aec._x_hist[:] = rng.standard_normal(aec._hist_n)
+        aec._mic_hist[:] = rng.standard_normal(aec._hist_n)
+        aec._hist_fill = aec._hist_n
+        aec.stats["drift_updates"] = 1
+        aec._last_drift_step = 0.0
+        aec._k = 100 * SR
+        aec._next_measure = aec._k + int(ap.MEDIA_AEC_DELAY_EVERY_S * SR)
+        with mock.patch.object(ap, "gcc_phat_lag",
+                               return_value=(-0.25 * SR, 0.5)):
+            aec._measure_delay()
+        self.assertEqual(aec.stats["realigns"], 0)
+        self.assertIsNotNone(aec._gcc_last)
+        return aec
+
+    def test_a_held_lag_is_confirmed_one_window_later(self):
+        # Review 10-29: confirming at the slow 10 s cadence left a real path
+        # change uncancelled ~20 s.
+        aec = self._held(True)
+        self.assertEqual(aec._next_measure,
+                         aec._k + int(ap.MEDIA_AEC_DELAY_WINDOW_S * SR))
+
+    def test_flag_off_the_cadence_is_untouched(self):
+        aec = ap.MediaEchoCanceller(FakeRef(np.zeros(SR)), delay_bounds=False)
+        rng = np.random.default_rng(5)
+        aec._x_hist[:] = rng.standard_normal(aec._hist_n)
+        aec._mic_hist[:] = rng.standard_normal(aec._hist_n)
+        aec._hist_fill = aec._hist_n
+        aec._k = 100 * SR
+        nxt = aec._k + int(ap.MEDIA_AEC_DELAY_EVERY_S * SR)
+        aec._next_measure = nxt
+        # A reachable late lag is held on the old path too.
+        lag = aec.margin + 0.1 * SR
+        with mock.patch.object(ap, "gcc_phat_lag", return_value=(lag, 0.5)):
+            aec._measure_delay()
+        self.assertEqual(aec._next_measure, nxt)
+
+    def test_rejections_in_a_row_log_once(self):
+        import contextlib
+        import io
+        aec = ap.MediaEchoCanceller(FakeRef(np.zeros(SR)), delay_bounds=True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            for _ in range(ap.MEDIA_AEC_REJECT_LOG_AFTER + 3):
+                aec._realign(-0.7 * SR)
+        log = buf.getvalue()
+        self.assertEqual(log.count("echo path outside the"), 1)
+        self.assertEqual(aec.stats["realign_rejected"],
+                         ap.MEDIA_AEC_REJECT_LOG_AFTER + 3)
+        # A successful realign resets the run (no second line anyway).
+        aec._realign(0.05 * SR)
+        self.assertEqual(aec._rejected_run, 0)
+
     def test_the_flag_is_read_from_config(self):
         with mock.patch.object(config, "MEDIA_AEC_DELAY_BOUNDS", True,
                                create=True):

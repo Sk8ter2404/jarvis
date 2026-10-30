@@ -99,6 +99,53 @@ class FinishLineKeepTests(_MonitorBase):
         self.assertFalse(ok)
         self.assertIn("job id changed", log)
 
+    def test_a_job_id_from_another_report_key_is_not_a_new_job(self):
+        # Review 10-29: a push carrying only subtask_id replaced the stored
+        # task_id and the line was dropped while the printer said FINISH.
+        self.flag("FINISH_LINE_KEEP", True)
+        self.mod._task_id_key[0] = "task_id"
+        self.state(gcode_state="FINISH", filename="cube.3mf", task_id="111")
+        tag = self.mod._finish_tag("cube")
+        self.assertEqual(tag, "bambu_finish:cube|job=111")
+        for gs in ("FINISH", "IDLE"):
+            with self.subTest(state=gs):
+                self.state(gcode_state=gs, task_id="222")
+                self.mod._task_id_key[0] = "subtask_id"
+                self.assertTrue(self.sv(tag)[0])
+        # A tag queued from a subtask_id compares with a subtask_id only.
+        self.state(gcode_state="FINISH", task_id="222")
+        self.mod._task_id_key[0] = "subtask_id"
+        tag2 = self.mod._finish_tag("cube")
+        self.assertEqual(tag2, "bambu_finish:cube|job=subtask_id:222")
+        self.assertTrue(self.sv(tag2)[0])
+        self.state(task_id="333")
+        ok, log = self.sv(tag2)
+        self.assertFalse(ok)
+        self.assertIn("job id changed", log)
+
+    def test_the_report_key_is_recorded(self):
+        self.mod._task_id_key[0] = None
+        msg = types.SimpleNamespace(payload=json.dumps(
+            {"print": {"gcode_state": "FINISH", "subtask_id": "222"}}
+        ).encode("utf-8"))
+        with mock.patch.object(self.mod, "_handle_state_change"),              contextlib.redirect_stdout(io.StringIO()):
+            self.mod._on_message(None, None, msg)
+        with self.mod._state_lock:
+            self.assertEqual(self.mod._state.get("task_id"), "222")
+        self.assertEqual(self.mod._task_id_key[0], "subtask_id")
+
+    def test_unspoken_and_a_new_print_clear_the_offer_stamp(self):
+        self.flag("FINISH_LINE_KEEP", True)
+        self.state(gcode_state="FINISH", filename="cube.3mf")
+        self.assertTrue(self.sv("bambu_finish:cube")[0])
+        self.mod.note_finish_unspoken()
+        self.assertFalse(self.sv("bambu_finish_offer:")[0])
+        self.assertTrue(self.sv("bambu_finish:cube")[0])
+        self.state(gcode_state="RUNNING", filename="next.3mf", mc_percent=1)
+        with mock.patch.object(self.mod, "_enqueue_speech"),              contextlib.redirect_stdout(io.StringIO()):
+            self.mod._handle_state_change()
+        self.assertEqual(self.mod._finish_line_passed_at[0], 0.0)
+
     def test_flag_off_is_the_old_check_exactly(self):
         self.flag("FINISH_LINE_KEEP", False)
         self.state(gcode_state="FINISH", filename="cube.3mf", task_id="111")
@@ -311,6 +358,60 @@ class CompanionTests(unittest.TestCase):
     def test_flag_off_the_offer_queues_on_its_own(self):
         self.flag("FINISH_LINE_KEEP", False)
         self.assertEqual(self.offer_call().kwargs, {})
+
+    def test_no_head_from_the_monitor_speaks_the_full_line_after_a_wait(self):
+        # Review 10-29: the monitor skipped an "unwitnessed" FINISH, the
+        # offer-only line was dropped, and the finish went unsaid.
+        self.flag("FINISH_LINE_KEEP", True)
+        mod = self.load()
+        bm = sys.modules["skill_bambu_monitor"]
+        bm._last_finish_announced_at = [0.0]
+        mod._saw_running_this_print[0] = True
+        with mock.patch.object(mod, "_enqueue_speech") as enq,              mock.patch.object(mod, "_light_skill_available",
+                               return_value=False),              mock.patch.object(mod, "_timer_skill_available",
+                               return_value=True),              mock.patch.object(mod, "_record_print_outcome"),              contextlib.redirect_stdout(io.StringIO()) as out:
+            with mock.patch.object(mod.time, "time", return_value=1000.0):
+                mod._maybe_announce_completion_offer({"filename": "Part.3mf"})
+            enq.assert_not_called()                 # waiting for the head
+            self.assertFalse(mod._announced_completion_offer[0])
+            with mock.patch.object(mod.time, "time",
+                                   return_value=1000.0
+                                   + mod.FINISH_HEAD_WAIT_S + 1):
+                mod._maybe_announce_completion_offer({"filename": "Part.3mf"})
+        enq.assert_called_once()
+        line = enq.call_args.args[0]
+        self.assertIn("Print complete, sir", line)
+        self.assertIn("queue a cooldown timer", line)
+        self.assertEqual(enq.call_args.kwargs, {})
+        self.assertIn("queued no finish line", out.getvalue())
+
+    def test_the_monitor_head_queued_keeps_the_offer_only_line(self):
+        self.flag("FINISH_LINE_KEEP", True)
+        mod = self.load()
+        sys.modules["skill_bambu_monitor"]._last_finish_announced_at = [5.0]
+        mod._saw_running_this_print[0] = True
+        with mock.patch.object(mod, "_enqueue_speech") as enq,              mock.patch.object(mod, "_light_skill_available",
+                               return_value=True),              mock.patch.object(mod, "_timer_skill_available",
+                               return_value=True),              mock.patch.object(mod, "_record_print_outcome"):
+            mod._maybe_announce_completion_offer({"filename": "Part.3mf"})
+        enq.assert_called_once()
+        # The head already asks about the bed cooling: no second
+        # "cooldown timer" offer for one ambiguous "yes".
+        self.assertEqual(enq.call_args.args[0],
+                         "Shall I dim the workshop lights for you, sir?")
+        self.assertEqual(enq.call_args.kwargs,
+                         {"still_valid": "bambu_finish_offer:"})
+
+    def test_timer_only_offer_is_silent_when_the_monitor_owns_the_head(self):
+        self.flag("FINISH_LINE_KEEP", True)
+        mod = self.load()
+        with mock.patch.object(mod, "_light_skill_available",
+                               return_value=False),              mock.patch.object(mod, "_timer_skill_available",
+                               return_value=True):
+            self.assertEqual(mod._completion_offer_line("Part"), "")
+            self.flag("FINISH_LINE_KEEP", False)
+            self.assertEqual(mod._completion_offer_line("Part"),
+                             "Shall I queue a cooldown timer for you, sir?")
 
     def test_enqueue_passes_the_tags_and_survives_an_old_announcer(self):
         mod = self.load()

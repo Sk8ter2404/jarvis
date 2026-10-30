@@ -401,7 +401,7 @@ def _timer_skill_available() -> bool:
     return True
 
 
-def _completion_offer_line(pretty_filename: str) -> str:
+def _completion_offer_line(pretty_filename: str, own_head: bool = False) -> str:
     """Compose the FINISH offer based on which downstream skills are live.
 
     Degrades silently per-feature: no light skill loaded → no dim mention;
@@ -413,16 +413,25 @@ def _completion_offer_line(pretty_filename: str) -> str:
     trail-behind), and return "" when there's nothing to offer so the user
     doesn't hear the same completion announced twice. Only when
     bambu_monitor is absent do we own the full announcement ourselves.
+
+    ``own_head`` (FINISH_LINE_KEEP, v3.0.10 review): bambu_monitor is loaded
+    but queued no finish line for this print - compose the full head too.
+    With FINISH_LINE_KEEP on and bambu_monitor owning the head, the
+    cooldown-timer offer is left out: the head already asks "Shall I notify
+    you when the bed has cooled?", and a "yes" to two different offers back
+    to back was ambiguous (10-28 22:26).
     """
+    bambu_announces = _get_bambu_module() is not None and not own_head
     has_lights = _light_skill_available()
     has_timer  = _timer_skill_available()
+    if has_timer and bambu_announces and _flag_on("FINISH_LINE_KEEP"):
+        has_timer = False
     offers: list[str] = []
     if has_lights:
         offers.append("dim the workshop lights")
     if has_timer:
         offers.append("queue a cooldown timer")
 
-    bambu_announces = _get_bambu_module() is not None
     if bambu_announces:
         if not offers:
             return ""
@@ -579,6 +588,7 @@ def _reset_per_print_state() -> None:
     _milestone_detected_at.clear()
     _milestone_announced.clear()
     _announced_completion_offer[0]  = False
+    _finish_seen_at[0]              = 0.0
     _warned_historical_failure[0]   = False
     _vision_samples.clear()
 
@@ -629,6 +639,29 @@ def _maybe_warn_historical_failure(state: dict) -> None:
     )
 
 
+# FINISH_LINE_KEEP (v3.0.10 review): how long the companion waits, after it
+# first sees FINISH, for bambu_monitor to queue its own finish line before it
+# speaks the full announcement itself (the monitor skips a FINISH it did not
+# "witness", e.g. a gcode_file name in place of subtask_name). The hook fires
+# right after the monitor's handling and the poll every 15 s, so this spans
+# at least one more call.
+FINISH_HEAD_WAIT_S = 20.0
+_finish_seen_at: list = [0.0]
+
+
+def _monitor_head_queued(bm) -> "bool | None":
+    """Did bambu_monitor queue a finish line for this print? True / False, or
+    None when it cannot tell (an older monitor: assume it did, the old
+    behaviour). Never raises."""
+    try:
+        stamp = getattr(bm, "_last_finish_announced_at", None)
+        if not isinstance(stamp, list) or not stamp:
+            return None
+        return float(stamp[0] or 0.0) > 0.0
+    except Exception:
+        return None
+
+
 def _maybe_announce_completion_offer(state: dict) -> None:
     if _announced_completion_offer[0]:
         return
@@ -638,14 +671,30 @@ def _maybe_announce_completion_offer(state: dict) -> None:
         return
     fname  = state.get("filename") or _current_filename[0] or ""
     pretty = _strip_filename(fname)
-    line = _completion_offer_line(pretty)
+    bm = _get_bambu_module()
+    keep = bm is not None and _flag_on("FINISH_LINE_KEEP")
+    own_head = False
+    if keep and _monitor_head_queued(bm) is False:
+        # FINISH_LINE_KEEP: the monitor queued no head (yet). Wait a little
+        # for it; past that, speak the full announcement ourselves - an
+        # offer-only line would be dropped and the finish go unsaid.
+        now = time.time()
+        if not _finish_seen_at[0]:
+            _finish_seen_at[0] = now
+        if now - _finish_seen_at[0] < FINISH_HEAD_WAIT_S:
+            return
+        print("  [print_companion] bambu_monitor queued no finish line - "
+              "speaking the full announcement")
+        own_head = True
+    line = (_completion_offer_line(pretty, own_head=True) if own_head
+            else _completion_offer_line(pretty))
     # Empty line means bambu_monitor already owns the completion
     # announcement and we have no offer to trail it with — stay quiet.
     if line:
         # FINISH_LINE_KEEP (v3.0.10): when bambu_monitor owns the head this
         # is only the offer ("Shall I ... for you, sir?"); the drain speaks
         # it only right after its finish line, never on its own.
-        if _get_bambu_module() is not None and _flag_on("FINISH_LINE_KEEP"):
+        if keep and not own_head:
             _enqueue_speech(line, still_valid="bambu_finish_offer:")
         else:
             _enqueue_speech(line)

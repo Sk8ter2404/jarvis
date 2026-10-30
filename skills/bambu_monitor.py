@@ -598,6 +598,47 @@ _FINISH_JOB_SEP = "|job="
 _FINISH_OFFER_TAG = "bambu_finish_offer:"
 FINISH_OFFER_WINDOW_S = 600.0
 _finish_line_passed_at: list = [0.0]
+# Which report key the stored _state["task_id"] came from ("task_id",
+# "subtask_id" or "job_id"): a FINISH report carrying only a subtask_id is
+# not a changed job id, so the job-id rule compares like with like.
+_task_id_key: list = [None]
+
+
+def _job_ref() -> str:
+    """The current job id as carried in a finish tag: "<id>" when it came
+    from task_id (or the key is unknown), else "<key>:<id>"; "" when none.
+    Never raises."""
+    try:
+        with _state_lock:
+            tid = _state.get("task_id")
+            key = _task_id_key[0]
+        if not tid:
+            return ""
+        if key and key != "task_id":
+            return f"{key}:{tid}"
+        return str(tid)
+    except Exception:
+        return ""
+
+
+def _split_job_ref(ref: str) -> tuple:
+    """("task_id", "111") from "111"; ("subtask_id", "222") from
+    "subtask_id:222". Never raises."""
+    try:
+        key, sep, val = str(ref).rpartition(":")
+        return (key, val) if sep else ("task_id", str(ref))
+    except Exception:
+        return ("task_id", str(ref))
+
+
+def note_finish_unspoken() -> None:
+    """FINISH_LINE_KEEP: the drain passed a finish line's check but did not
+    speak it (a duplicate, or TTS failed): its follow-on offer must not be
+    spoken on its own. Never raises."""
+    try:
+        _finish_line_passed_at[0] = 0.0
+    except Exception:
+        pass
 
 
 def _finish_tag(fname: str) -> str:
@@ -607,10 +648,9 @@ def _finish_tag(fname: str) -> str:
     try:
         if not _flag_on("FINISH_LINE_KEEP"):
             return tag
-        with _state_lock:
-            tid = _state.get("task_id")
-        if tid:
-            tag += f"{_FINISH_JOB_SEP}{tid}"
+        ref = _job_ref()
+        if ref:
+            tag += f"{_FINISH_JOB_SEP}{ref}"
     except Exception:
         pass
     return tag
@@ -633,12 +673,17 @@ def _finish_line_still_valid(tag: str) -> bool:
         with _state_lock:
             gs = (_state.get("gcode_state") or "").upper()
             cur = _strip_filename(_state.get("filename") or "")
-            cur_tid = str(_state.get("task_id") or "")
+        cur_tid = _job_ref()
         why = ""
         if gs in _NEW_JOB_STATES:
             why = "a new job is under way"
-        elif want_tid and cur_tid and cur_tid != want_tid:
-            why = "the printer's job id changed"
+        elif want_tid and cur_tid:
+            # Like with like: an id from a different report key (only a
+            # subtask_id in this push) is not a new job.
+            wk, wv = _split_job_ref(want_tid)
+            ck, cv = _split_job_ref(cur_tid)
+            if wk == ck and wv != cv:
+                why = "the printer's job id changed"
         if why:
             print(f"  [bambu] finish line stale ({why}): state={gs or '-'} "
                   f"file={cur or '-'} want={want or '-'}")
@@ -948,6 +993,7 @@ def _on_message(client, userdata, msg) -> None:
         for ikey in ("task_id", "subtask_id", "job_id"):
             if report.get(ikey) not in (None, "", "0", 0):
                 _state["task_id"] = str(report[ikey])
+                _task_id_key[0] = ikey
                 break
         # Track chamber temperature samples for swing detection. Only
         # record genuine readings (>1 °C) so a missing-sensor zero doesn't
@@ -1030,6 +1076,8 @@ def _handle_state_change() -> None:
         _milestone_had_eta.clear()
         _announced_error_codes.clear()
         _last_finish_announced_at[0] = 0.0
+        # A previous print's spoken head cannot vouch for this print's offer.
+        _finish_line_passed_at[0] = 0.0
         _announced_start[0] = False
         _announced_layer1[0] = False
         _post_finish_bed_watch[0] = False

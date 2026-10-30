@@ -21,6 +21,21 @@ from core import config
 LUMA = 70.0
 
 
+_LOGGED_ON_MOTION = """
+21.8 4.2 6.3 4.1 7.6 10.7 7.0 4.2 18.5 4.3 22.1 4.3
+103.9 4.0 5.4 5.4 4.4 21.1 9.5 4.1 52.8 4.4 4.9 6.8
+7.1 4.0 4.0 10.8 4.6 5.4 4.8 6.4 4.7 5.9 4.7 4.5
+7.1 8.1 6.0 8.9 4.0 5.0 9.2 8.5 22.0 8.7 4.0 4.4
+6.8 5.6 4.4 4.1 39.5 5.7 29.8 6.8 8.4 4.5 3.7 6.5
+12.9 19.4 17.6 34.3 10.0 5.3 5.2 9.3 4.9 4.1 30.5 5.6
+5.2 4.5 6.0 4.3 4.0 8.3 6.0 4.5 5.0 9.7 5.9 9.5
+30.9 5.3 5.1 31.0 5.0 6.8 4.2 4.8 5.0 4.6 18.0 5.4
+4.7 5.2 4.7 6.3 4.4 5.4 4.9 15.6 13.5 14.0 12.0 4.0
+9.9 6.2 57.5 6.2 9.0 5.2 8.4 8.1 4.3 9.0 4.1 5.2
+19.9 4.5
+"""
+
+
 def _room(seconds=600, seed=3):
     """The live room: idle motion alternating 3.3 / 3.6, with a 20-30 s burst
     of 4.2-6.0 (someone moving at the desk) every ~90 s."""
@@ -55,6 +70,8 @@ def _decider(adaptive, calibrated=False):
 class AdaptiveBaselineTests(unittest.TestCase):
 
     def test_people_moving_in_the_room_never_turn_it_on(self):
+        # Bursts of 4.2-6 only; harder bursts still flip it (see the replay
+        # residual test below).
         d = _decider(True)
         self.assertTrue(d.adaptive_baseline)
         flips, t = _feed(d, _room())
@@ -109,6 +126,61 @@ class AdaptiveBaselineTests(unittest.TestCase):
         d.reset()
         self.assertEqual(d._idle_motion, [])
         self.assertEqual(d.delta_threshold(), td.TEMPORAL_DELTA_ON_MIN)
+
+    def test_a_moderate_tv_still_turns_on_after_learning(self):
+        # Review 10-29: learning every non-qualifying reading ratcheted the
+        # floor to ~9.6 and a 4.5-9 TV never read ON.
+        rng = random.Random(1)
+        d = _decider(True)
+        _f, t = _feed(d, [rng.uniform(3.1, 3.9) for _ in range(300)])
+        on_s = 0
+        for _ in range(1800):
+            t += 1.0
+            on_s += d.observe(LUMA, rng.uniform(4.5, 9.0), ts=t)
+        self.assertGreater(on_s, 0.9 * 1800)
+        self.assertLessEqual(d.delta_threshold(),
+                             td.TEMPORAL_DELTA_ON_MIN + td.BASELINE_MARGIN)
+
+    def test_a_tv_with_quiet_scenes_stays_on(self):
+        rng = random.Random(1)
+        d = _decider(True)
+        _f, t = _feed(d, [rng.uniform(3.1, 3.9) for _ in range(300)])
+        tv = []
+        for _ in range(60):
+            tv += [rng.uniform(4, 7) for _ in range(20)]
+            tv += [rng.uniform(8, 25) for _ in range(10)]
+        on_s = 0
+        for m in tv:
+            t += 1.0
+            on_s += d.observe(LUMA, m, ts=t)
+        # 89-98 % ON over seeds 1-7 (flag off ~99 %); the ratcheting floor
+        # this replaces gave ~9 % and then OFF for good.
+        self.assertGreater(on_s, 0.85 * len(tv))
+
+    def test_the_floor_is_capped(self):
+        d = _decider(True)
+        d._idle_motion = [50.0] * td.BASELINE_READINGS
+        self.assertEqual(d.delta_threshold(),
+                         td.TEMPORAL_DELTA_ON_MIN + td.BASELINE_MARGIN)
+
+    def test_replay_of_the_logged_on_motions_residual(self):
+        # The 122 motion values logged with "TV ON" on 10-28 (numbers only),
+        # each replayed as a 25 s burst (+-15 %) after 300 s of 3.1-3.9 idle.
+        # Stated honestly: the adaptive floor cuts the flips about half
+        # (205 -> 94 on this seed), NOT to zero - ~40 % of the live bursts
+        # move harder than the learned floor. Calibrating the TV region is
+        # the real cure.
+        logged = [float(x) for x in _LOGGED_ON_MOTION.split()]
+        self.assertEqual(len(logged), 122)
+        rng = random.Random(1)
+        seq = []
+        for v in logged:
+            seq += [rng.uniform(3.1, 3.9) for _ in range(300)]
+            seq += [v * rng.uniform(0.85, 1.15) for _ in range(25)]
+        off_flips, _t = _feed(_decider(False), seq)
+        on_flips, _t = _feed(_decider(True), seq)
+        self.assertGreater(off_flips, 150)
+        self.assertLess(on_flips, 0.6 * off_flips)
 
     def test_a_calibrated_region_never_adapts(self):
         d = _decider(True, calibrated=True)

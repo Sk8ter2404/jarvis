@@ -145,6 +145,14 @@ VERDICT_MIN_DWELL_S = 20.0
 # (hysteresis: a playing screen's quiet scene does not drop it). Until
 # BASELINE_MIN_READINGS idle readings exist the fixed floor applies. A
 # calibrated TV rectangle never uses it (the crop leaves the room out).
+# Only TRULY idle readings are learned (verdict OFF and motion under the
+# fixed floor), and the floor never rises above TEMPORAL_DELTA_ON_MIN +
+# BASELINE_MARGIN: learning every non-qualifying reading let a playing TV's
+# quieter scenes ratchet the floor upward until the TV never read ON.
+# Residual (replay of the 122 logged 10-28 ON motions as 25 s bursts over a
+# 3.1-3.9 idle room): flips fall about 54 % (205 -> 94), not to zero; about
+# 40 % of the live bursts move harder than the learned floor (~6.45). The
+# 20 s dwell still applies; calibrating the TV region is the real cure.
 BASELINE_READINGS = 120
 BASELINE_MIN_READINGS = 30
 BASELINE_MARGIN = 3.0
@@ -312,7 +320,10 @@ class TVDecider:
                    else (vals[mid - 1] + vals[mid]) / 2.0)
             margin = BASELINE_MARGIN * (BASELINE_HOLD_FRACTION if self._on
                                         else 1.0)
-            return max(self.delta_min, med + margin)
+            # Capped: the floor can never climb past the fixed floor plus
+            # one margin, whatever was learned.
+            return min(max(self.delta_min, med + margin),
+                       self.delta_min + BASELINE_MARGIN)
         except Exception:
             return self.delta_min
 
@@ -325,9 +336,13 @@ class TVDecider:
         if self.adaptive_baseline:
             q = frame_qualifies(brightness, temporal_delta,
                                 self.bright_min, self.delta_threshold())
-            if not q and temporal_delta is not None:
+            # Learn only truly idle readings: verdict OFF and motion under
+            # the fixed floor (a playing TV's quiet scenes must not count).
+            if not q and not self._on and temporal_delta is not None:
                 try:
-                    self._idle_motion.append(float(temporal_delta))
+                    v = float(temporal_delta)
+                    if v < self.delta_min:
+                        self._idle_motion.append(v)
                 except (TypeError, ValueError):
                     pass
                 del self._idle_motion[:-BASELINE_READINGS]

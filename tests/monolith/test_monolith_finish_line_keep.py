@@ -16,6 +16,8 @@ base) and the REAL bambu_monitor as the live skill. Synthetic lines only.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import sys
 import unittest
 from unittest import mock
@@ -95,6 +97,89 @@ class FinishLineDrainTests(_Base):
         _, log = self._drain()
         self.assertEqual(self.spoke, [])
         self.assertIn("dropped stale announcement", log)
+
+    # ── review 10-29: the offer's stamp only for a head actually spoken ──
+    def test_a_duplicate_head_takes_its_offer_with_it(self):
+        self.flag(True)
+        self.printer(gcode_state="FINISH", filename="cube.3mf", task_id="7")
+        self.bc._mark_speech_spoken(HEAD)          # said a moment ago
+        self.queue_both()
+        _, log = self._drain()
+        self.assertEqual(self.spoke, [])
+        self.assertIn("suppressed duplicate", log)
+        self.assertIn("finish offer dropped", log)
+
+    def test_a_failed_head_takes_its_offer_with_it(self):
+        self.flag(True)
+        self.printer(gcode_state="FINISH", filename="cube.3mf", task_id="7")
+        spoke = self.spoke
+
+        def speak(msg, **k):
+            if msg == HEAD:
+                raise RuntimeError("tts down")
+            spoke.append(msg)
+        self._p(self.bc, "_speak", side_effect=speak)
+        self.queue_both()
+        _, log = self._drain()
+        self.assertEqual(self.spoke, [])
+        self.assertIn("finish offer dropped", log)
+
+    def test_flag_off_the_unspoken_hook_does_nothing(self):
+        self.flag(False)
+        self.bm._finish_line_passed_at[0] = 123.0
+        self.bc._pending_finish_unspoken({"still_valid": "bambu_finish:cube"})
+        self.assertEqual(self.bm._finish_line_passed_at[0], 123.0)
+        self.flag(True)
+        self.bc._pending_finish_unspoken({"still_valid": "other:x"})
+        self.assertEqual(self.bm._finish_line_passed_at[0], 123.0)
+        self.bc._pending_finish_unspoken({"still_valid": "bambu_finish:cube"})
+        self.assertEqual(self.bm._finish_line_passed_at[0], 0.0)
+
+
+@requires_monolith
+class RequeueSupersedeTests(_Base):
+    """PENDING_REQUEUE_SUPERSEDE: a held milestone is replaced by a newer one
+    queued while the drain held the snapshot (10-28 21:58 case)."""
+
+    OLD = {"ts": 1.0, "message": "Print is 25% complete, sir.",
+           "source": "bambu", "supersede": "bambu_milestone"}
+    TIMER = {"ts": 2.0, "message": "Your timer is up, sir.",
+             "source": "timer"}
+    NEW = {"ts": 3.0, "message": "Print is 50% complete, sir.",
+           "source": "bambu", "supersede": "bambu_milestone"}
+
+    def flag(self, value):
+        from core import config
+        self._p(config, "PENDING_REQUEUE_SUPERSEDE", value, create=True)
+
+    def requeue(self):
+        self._write([self.NEW])
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            ok = self.bc._requeue_pending_speech([self.OLD, self.TIMER])
+        self.assertTrue(ok)
+        return [e["message"] for e in self._read()], buf.getvalue()
+
+    def test_the_held_milestone_is_replaced(self):
+        self.flag(True)
+        msgs, log = self.requeue()
+        self.assertEqual(msgs, [self.TIMER["message"], self.NEW["message"]])
+        self.assertIn("[pending] replaced 1 unspoken 'bambu_milestone'", log)
+
+    def test_flag_off_merges_both(self):
+        self.flag(False)
+        msgs, _log = self.requeue()
+        self.assertEqual(msgs, [self.OLD["message"], self.TIMER["message"],
+                                self.NEW["message"]])
+
+
+@requires_monolith
+class TurnFlagKeysTests(_Base):
+    def test_the_lane_f_flags_are_logged(self):
+        for k in ("FINISH_LINE_KEEP", "PRINT_MILESTONE_SUPERSEDE",
+                  "PRINT_MILESTONE_ONE_LINE", "PENDING_REQUEUE_SUPERSEDE",
+                  "MEDIA_AEC_DELAY_BOUNDS", "TV_DETECT_ADAPTIVE_BASELINE"):
+            self.assertIn(k, self.bc._TURN_FLAG_KEYS)
 
 
 if __name__ == "__main__":

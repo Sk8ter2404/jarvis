@@ -872,9 +872,15 @@ MEDIA_AEC_MAX_LEAD_S = 0.200        # ... and this early
 # stats["realign_rejected"]), a drift correction is clipped into it
 # (stats["delay_clamped"]), and an echo "out of the filter's reach" must be
 # confirmed by two measurements in a row like any other realign (a single
-# spurious negative PHAT peak moved it at once).
+# spurious negative PHAT peak moved it at once). The confirming measure is
+# scheduled one DELAY_WINDOW later (fresh audio, independent evidence)
+# instead of the slow 10 s cadence, so a real path change (a Bluetooth
+# speaker) waits ~4 s more, not ~10 s. MEDIA_AEC_REJECT_LOG_AFTER rejected
+# realigns in a row log one "[media-aec] echo path outside the bounds" line
+# per canceller, so a genuinely long speaker path can be diagnosed.
 MEDIA_AEC_DELAY_MIN_S = -0.300
 MEDIA_AEC_DELAY_MAX_S = 0.600
+MEDIA_AEC_REJECT_LOG_AFTER = 3
 MEDIA_AEC_REF_ACTIVE_RMS = 1e-4     # quieter reference = silence
 # How long a block may wait for a reference that has not been written yet
 # (2026-10-19 room recording, offline replay of this class): live, the
@@ -1195,6 +1201,8 @@ class MediaEchoCanceller:
                             MEDIA_AEC_DELAY_MAX_S * self.sr)
             self.stats["realign_rejected"] = 0
             self.stats["delay_clamped"] = 0
+        self._rejected_run = 0           # rejected realigns in a row
+        self._rejected_logged = False    # the one bounds line, per canceller
         self._hist_n = int(self.sr * MEDIA_AEC_DELAY_WINDOW_S)
         self._mic_hist = np.zeros(self._hist_n)
         self._x_hist = np.zeros(self._hist_n)
@@ -1345,7 +1353,22 @@ class MediaEchoCanceller:
             # MEDIA_AEC_DELAY_BOUNDS: no physical echo path is that far off.
             self.stats["realign_rejected"] += 1
             self._gcc_last = None
+            self._rejected_run += 1
+            if (not self._rejected_logged
+                    and self._rejected_run >= MEDIA_AEC_REJECT_LOG_AFTER):
+                self._rejected_logged = True
+                try:
+                    print(f"  [media-aec] echo path outside the "
+                          f"{MEDIA_AEC_DELAY_MIN_S * 1000:+.0f}.."
+                          f"{MEDIA_AEC_DELAY_MAX_S * 1000:+.0f} ms bounds "
+                          f"({self._rejected_run} realigns in a row would "
+                          f"move it to "
+                          f"{(self.delay_wall + step) * 1000.0 / self.sr:+.0f}"
+                          f" ms) - a long-latency speaker?")
+                except Exception:
+                    pass
             return
+        self._rejected_run = 0
         self._A -= step
         self._sess_shift += step
         self.delay_wall += step
@@ -1429,6 +1452,12 @@ class MediaEchoCanceller:
             confirm = reachable or self._bounds is not None
             if confirm and (last is None
                             or abs(last - lag) > 0.002 * self.sr):
+                if self._bounds is not None and self._next_measure is not None:
+                    # MEDIA_AEC_DELAY_BOUNDS: confirm on fresh audio one
+                    # window later, not at the slow 10 s cadence.
+                    self._next_measure = min(
+                        self._next_measure,
+                        self._k + int(MEDIA_AEC_DELAY_WINDOW_S * self.sr))
                 return                     # confirm it on the next measure
             self._gcc_last = None
             self._realign(err)
