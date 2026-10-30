@@ -1864,6 +1864,29 @@ ACTION_FIT_ROBOT_SPEAK_ENFORCE = True
 # try again?") only a decline counts - "All right." may accept it. False:
 # no rule 7 (the old behaviour). Applies on the next start.
 ACTION_FIT_ACK_REPEAT_ENFORCE = True
+# ACTION_TOPIC_GATE (bool, v3.0.10; core/action_fit.action_topic_missing) -
+# live 2026-10-29 18:55:45 a misheard short line ("Much more percentage, so
+# I've got") got server_status and 10 s of a server read-out nobody asked
+# for. True (default): a read-only status check of the home server or the
+# printer (server_status, check_print, how_is_the_print, print_details) runs
+# only when sir's line or the turns just before it name its subject
+# ("server", "unraid", "disks", "parity" ...; "print", "printer", "bambu",
+# "percent", "how long" ...); otherwise it does not run, JARVIS says "Sorry,
+# sir, I didn't catch that." and his repeat needs no wake word. Never while a
+# prompt or JARVIS's offer waits for his answer; never a control action.
+# "Is the server up?", "how's the print?", "check the printer" all run. Works
+# whatever ACTION_FIT_MODE says. False: no such check (the old behaviour).
+# Read live.
+ACTION_TOPIC_GATE = True
+# ACTION_TOPIC_SHARED_SKIP (bool, v3.0.10 review) - a check ACTION_TOPIC_GATE
+# drops in a reply that holds other actions too ("[ACTION: weather]
+# [ACTION: server_status]" for "what's the weather and give me a status
+# update"). True (default): it is a plain skip, not a terminal "didn't catch
+# that", so the other results are still read back and the chain runs on;
+# a lone dropped check still asks him to repeat. False: always the terminal
+# line (the first v3.0.10 behaviour; the weather result was never read).
+# Read live.
+ACTION_TOPIC_SHARED_SKIP = True
 
 # --- Chain loop guard (v3 W21, 2026-10-27; core/loop_guard.py) ---------
 # LOOP_GUARD_MODE - the follow-up loop already stops a chain on a repeated
@@ -1935,6 +1958,17 @@ ACK_CLAIM_NO_FOLLOWUP = True
 # him ...), memory claims (NOTE_CLAIM_CHECK) or offers. False: such promises
 # are spoken as before. Applies on the next start.
 SELF_CHANGE_PROMISE_CHECK = True
+# RECALL_ACTION_GROUNDING (bool, v3.0.10, core/recall_actions) - live
+# 2026-10-29 18:54:51: 14 s after the robot's speak action ran ("The robot
+# said it, sir."), sir asked, surprised, whether it had been sent to the
+# robot, and JARVIS called it "a bit of a misinterpretation". True (default):
+# when his line asks about, or reacts with surprise to, what just happened
+# ("did you ...", "wait, what?", "huh", "was that ...", "... sent it to the
+# robot?"), that turn's prompt lists the actions that ran in the last 60 s
+# (up to 3, about 300 characters) with what they answered, and tells the
+# model to say plainly what ran and never deny it. Nothing changes on any
+# other turn. False: no such note (the old behaviour). Read live.
+RECALL_ACTION_GROUNDING = True
 # VERBATIM_CONTENT_RESULTS (bool, v3.0.8, bobert_companion
 # _action_result_failed): live 2026-10-28 19:47 "what's new" - the changelog
 # summary said fixes as fixes ("no longer fails"), its words read as a failed
@@ -1972,6 +2006,17 @@ BROWSER_TASK_BACKGROUND = True
 # with no brain round. A real query ("Resume by <artist>", "song:Resume")
 # is still a search. False: the old path exactly. Read live.
 PLAY_MUSIC_TRANSPORT_WORDS = True
+# MEDIA_TOGGLE_NO_FOLLOWUP (bool, v3.0.10, bobert_companion
+# _media_toggle_done) - live 2026-10-29 18:53:21 "pause movie": pause_music
+# answered "paused Chrome, sir", the reply was held for a second model round
+# and "Understood, sir. I've paused Chrome, sir." played 7.3 s after he
+# spoke. True (default): a pause_music / resume_music that plainly worked
+# ("paused <app>, sir", "resumed <app>, sir", "<app> is already paused /
+# playing, sir") goes to no second round; the reply's own words are spoken,
+# or that result line when the reply had none. A failure or "nothing seems
+# to be playing" still goes back to the model. False: the old path exactly
+# (every pause / resume result read back by a second round). Read live.
+MEDIA_TOGGLE_NO_FOLLOWUP = True
 
 # ─── v3.0.9 lane B (live 2026-10-28 on 3.0.7) ─────────────────────────────
 # SITE_NAME_SPOKEN_FORMS (bool, core/actions._website_name_url and
@@ -2170,6 +2215,46 @@ NIGHT_QUIET_ENABLED = True
 # to about one casual reply in four. Anything else is treated as "dry". Set via
 # user_settings.json; applies to the next prompt build.
 HUMOR_MODE = "dry"
+
+# ─── Stressed-mood reflex (core/tone_detector, core/emotion_tracker,
+#     adapters/voice_mood_response; v3.0.10) ─────────────────────────────
+# Live 2026-10-28 22:33:59 and 2026-10-29 18:53:36-18:57:07: six turns were
+# labelled 'stressed' on one swear word alone ("[emotion] stressed
+# (phrase=<swear> excl=0 clipped=False)"), two of them "Jarvis, say <a
+# swear>". Each one muted his proactive lines for 15 min, sent "dim all
+# lights to 15% warm 2700K" (the plugs cannot dim: 20-41 s later it came back
+# as a "Status, sir - ..." read of every device) and told the model "dimming
+# is already in motion" and to open with "Understood, sir. I'll keep it
+# brief." A real 'stressed' label still mutes proactive lines for 15 min.
+# VOICE_MOOD_SWEAR_ALONE_STRESSED (bool) - False (default): one swear word
+#   with no other stress sign (no '!', not a clipped command, no stress word
+#   such as "stop" / "ugh", no loud or fast voice) is not stress. True: it is
+#   (the old rule).
+VOICE_MOOD_SWEAR_ALONE_STRESSED = False
+# VOICE_MOOD_QUOTED_WORDS_IGNORED (bool) - True (default): in a "say /
+#   repeat / quote X" request ("Jarvis, say <X>", "repeat after me <X>",
+#   "have him say <X>") the words are the line to say and carry no mood, the
+#   same as "say that again". False: they count like any other words (the
+#   old behaviour).
+VOICE_MOOD_QUOTED_WORDS_IGNORED = True
+# VOICE_MOOD_CALMING_LIGHTS - the lights reflex on a 'stressed' label.
+#   'off'      (default) no smart-home call at all;
+#   'dimmable' a dim is sent only when the device catalog lists a light that
+#              can dim and something can reach it (a controller skill and a
+#              LAN address or Alexa entity), at most once per 15 min. NOT
+#              yet proven on this hardware: it still sends the generic "dim
+#              all lights" (which can end in a status read), so the prompt
+#              never claims the lights are dimming;
+#   'legacy'   the old path exactly: a dim on every stressed turn whenever
+#              the catalog has any device.
+#   Anything else reads as 'off'. Applies on the next stressed turn.
+VOICE_MOOD_CALMING_LIGHTS = "off"
+# VOICE_MOOD_HONEST_ADDENDUM (bool) - True (default): the stressed prompt
+#   note asks for a short, calm reply with no canned opener, and mentions the
+#   lights only when a dim was really sent this turn. False: the old note
+#   exactly (the "Understood, sir. I'll keep it brief." opener and "dimming
+#   is already in motion").
+VOICE_MOOD_HONEST_ADDENDUM = True
 
 # ─── Timesheet-hours reminder (skills/hours_reminder.py) ─────────────────
 # Pay periods run Monday-Sunday, two weeks at a time, and the hours for a

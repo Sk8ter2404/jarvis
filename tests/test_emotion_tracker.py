@@ -221,6 +221,12 @@ class FocusedTests(unittest.TestCase):
         # imperative, see FrustratedTests.test_swear_plus_clipped_imperative.)
         r = et.classify_emotion("fix the damn bug in the click handler", DAY)
         self.assertNotEqual(r.label, "focused")
+        # v3.0.10: a lone swear word is no stress either
+        # (VOICE_MOOD_SWEAR_ALONE_STRESSED False); True keeps the old label.
+        self.assertIsNone(r.label)
+        with mock.patch("core.config.VOICE_MOOD_SWEAR_ALONE_STRESSED", True):
+            r = et.classify_emotion("fix the damn bug in the click handler",
+                                    DAY)
         self.assertEqual(r.label, "stressed")
 
 
@@ -334,6 +340,61 @@ class ContextGatedStillTests(unittest.TestCase):
         self.assertNotIn("Do NOT explain. Act.", add)
         self.assertIn("clarifying question", add)
         self.assertIn("diagnostic", add)
+
+
+
+class LoneSwearTests(unittest.TestCase):
+    """v3.0.10: live 2026-10-29 six turns logged "[emotion] stressed
+    (phrase=<swear> excl=0 clipped=False)". A lone swear word is not stress
+    (VOICE_MOOD_SWEAR_ALONE_STRESSED False) and "say <X>" carries no mood
+    (VOICE_MOOD_QUOTED_WORDS_IGNORED)."""
+
+    def test_lone_swear_is_not_stressed(self):
+        for text in ("You can pod my shit.", "well that's a damn shame"):
+            with self.subTest(text=text):
+                self.assertNotEqual(et.classify_emotion(text, DAY).label,
+                                    "stressed")
+
+    def test_say_request_is_not_stressed(self):
+        for text in ("Jarvis, say fuck off.", "Jarvis, say shit!!"):
+            with self.subTest(text=text):
+                self.assertIsNone(et.classify_emotion(text, DAY).label)
+
+    def test_stress_signs_still_count(self):
+        self.assertEqual(et.classify_emotion("Stop it now!", DAY).label,
+                         "stressed")
+        self.assertEqual(et.classify_emotion("oh shit!", DAY).label,
+                         "stressed")
+        self.assertEqual(et.classify_emotion("ugh, this damn thing", DAY).label,
+                         "stressed")
+        loud = ProsodyHints(hour=14, rms=0.1, rms_baseline=0.02)
+        self.assertEqual(
+            et.classify_emotion("well that's a damn shame", loud).label,
+            "stressed")
+        fast = ProsodyHints(hour=14, speech_rate_wps=4.2)
+        self.assertEqual(
+            et.classify_emotion("well that's a damn shame", fast).label,
+            "stressed")
+
+    def test_quoted_words_carry_no_mood_at_all(self):
+        # v3.0.10 review: excitement and tiredness in a quoted line do not
+        # count either (the tone detector already returns None for these).
+        for text in ("Say yes or no damn it",
+                     "Jarvis say I love it, this is great",
+                     "Repeat after me, I'm exhausted"):
+            with self.subTest(text=text):
+                self.assertIsNone(et.classify_emotion(text, DAY).label)
+
+    def test_old_rules_behind_the_flags(self):
+        with mock.patch("core.config.VOICE_MOOD_SWEAR_ALONE_STRESSED", True):
+            self.assertEqual(
+                et.classify_emotion("You can pod my shit.", DAY).label,
+                "stressed")
+            with mock.patch("core.config.VOICE_MOOD_QUOTED_WORDS_IGNORED",
+                            False):
+                self.assertEqual(
+                    et.classify_emotion("Jarvis, say fuck off.", DAY).label,
+                    "stressed")
 
 
 if __name__ == "__main__":

@@ -13,11 +13,15 @@ of merely logging the label. Side effects:
      2700K') via core.smart_home_router.smart_home_control in a daemon
      thread. The LLM response path is never blocked by Hue/Govee latency
      or device unavailability — failures are logged and dropped.
+     Since v3.0.10 only as VOICE_MOOD_CALMING_LIGHTS says: 'off' (default)
+     sends nothing, 'dimmable' needs a reachable catalog light that can dim
+     and waits 15 min between dims, 'legacy' is the old path.
 
   3. Returns an extra system-prompt addendum the caller stacks onto
      sys_prompt_now, instructing the LLM to open with a brief deferential
      acknowledgement ("Understood, sir. I'll keep it brief.") and to keep
-     the response short.
+     the response short. Since v3.0.10 (VOICE_MOOD_HONEST_ADDENDUM) the
+     note forces no opener and mentions the lights only when a dim was sent.
 
 The TTS preset shift to a calmer/slower variant is already handled by the
 existing 'stressed' entry in bobert_companion._USER_TONE_TTS (selected by
@@ -46,6 +50,28 @@ STRESS_DEFERENTIAL_ADDENDUM = (
     "No humour, no embellishments, no follow-up questions unless strictly "
     "necessary. Smart-home dimming is already in motion; do not narrate it."
 )
+
+# v3.0.10 (VOICE_MOOD_HONEST_ADDENDUM): the same register with no forced
+# opener and no claim about the lights. Live 2026-10-28 22:34:00 and
+# 2026-10-29 18:54:37 the model opened with the canned "Understood, sir.
+# I'll keep it brief." and the prompt said "dimming is already in motion"
+# while the smart-home call only read device status. The lights line is added
+# (STRESS_LIGHTS_NOTE) only when a dim was really sent this turn.
+STRESS_HONEST_ADDENDUM = (
+    "\n\n[Voice-mood response: stressed]\n"
+    "User audio cues suggest acute stress. Keep it short: deliver the "
+    "response in ≤1 short sentence, calm and plain. No humour, no "
+    "embellishments, no follow-up questions unless strictly necessary."
+)
+STRESS_LIGHTS_NOTE = " The lights are being dimmed; do not narrate it."
+
+# VOICE_MOOD_CALMING_LIGHTS modes (core/config.py): 'off' never dims,
+# 'dimmable' dims only with a reachable catalog device that can dim and at
+# most once per CALMING_LIGHTS_COOLDOWN_SECS, 'legacy' is the old path.
+CALMING_LIGHTS_MODES = ("off", "dimmable", "legacy")
+CALMING_LIGHTS_COOLDOWN_SECS = 15 * 60
+# time.monotonic() of the last dim sent in 'dimmable' mode (0.0 = none yet).
+_last_dim_sent_at = [0.0]
 
 # Single-shot daemon-thread guard. Prevents a runaway burst of identical
 # smart-home calls when the user fires several stressed utterances back to
@@ -89,6 +115,83 @@ def _smart_home_catalog_ready() -> bool:
     except Exception:
         return False
     return bool(catalog and catalog.get("devices"))
+
+
+def _calming_lights_mode() -> str:
+    """VOICE_MOOD_CALMING_LIGHTS (core/config.py) normalised to one of
+    CALMING_LIGHTS_MODES, read at call time. Anything else, or any trouble
+    reading it, is 'off' (no call). Never raises."""
+    try:
+        from core import config as _cfg
+        mode = str(getattr(_cfg, "VOICE_MOOD_CALMING_LIGHTS", "off"))
+        mode = mode.strip().lower()
+    except Exception:
+        return "off"
+    return mode if mode in CALMING_LIGHTS_MODES else "off"
+
+
+def _honest_addendum_on() -> bool:
+    """VOICE_MOOD_HONEST_ADDENDUM (core/config.py), default True; True on any
+    trouble reading it. Never raises."""
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, "VOICE_MOOD_HONEST_ADDENDUM", True))
+    except Exception:
+        return True
+
+
+def _has_reachable_dimmable(catalog) -> bool:
+    """True when the catalog lists a device that can dim ('dim' in its
+    capabilities) and that something can reach: a controller skill (named,
+    or from its brand) and a LAN address or an Alexa entity. On/off plugs,
+    cameras and scenes never count. Never raises (False)."""
+    try:
+        from core import smart_home_router  # local import: avoids cycles
+        brand_skill = getattr(smart_home_router, "_controller_for", None)
+        for d in (catalog or {}).get("devices") or []:
+            if not isinstance(d, dict):
+                continue
+            caps = [str(c).strip().lower()
+                    for c in (d.get("capabilities") or [])]
+            if "dim" not in caps:
+                continue
+            skill = d.get("controller_skill") or (
+                brand_skill(str(d.get("brand") or ""))
+                if callable(brand_skill) else None)
+            if skill and (d.get("lan_ip") or d.get("alexa_entity_id")):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _kick_calming_lights(now: float | None = None) -> bool:
+    """The calming-lights dispatch as VOICE_MOOD_CALMING_LIGHTS says. True
+    only when a dim was SENT on this call. 'off' (default) sends nothing;
+    'dimmable' sends one only when a reachable dimmable device is in the
+    catalog, none is in flight and the cooldown has run out; 'legacy' is
+    _kick_smart_home exactly. Never raises (False)."""
+    try:
+        mode = _calming_lights_mode()
+        if mode == "legacy":
+            return _kick_smart_home()
+        if mode != "dimmable":
+            return False
+        t = time.monotonic() if now is None else float(now)
+        last = float(_last_dim_sent_at[0] or 0.0)
+        if last and t - last < CALMING_LIGHTS_COOLDOWN_SECS:
+            return False
+        if _smart_home_in_flight.is_set():
+            return False
+        from core import smart_home_router  # local import: avoids cycles
+        if not _has_reachable_dimmable(smart_home_router._ensure_catalog()):
+            return False
+        _last_dim_sent_at[0] = t
+        return _kick_smart_home()
+    except Exception as err:
+        print(f"  [voice-mood] calming-lights check failed: "
+              f"{type(err).__name__}")
+        return False
 
 
 def _kick_smart_home() -> bool:
@@ -170,10 +273,21 @@ def apply_voice_mood_response(
         except Exception as err:
             print(f"  [voice-mood] memory persist failed: {err}")
 
-    dimming = _kick_smart_home()
+    # v3.0.10: VOICE_MOOD_CALMING_LIGHTS decides whether a dim is sent, and
+    # VOICE_MOOD_HONEST_ADDENDUM drops the canned opener and mentions the
+    # lights only when one was. Both at their old values = the old path.
+    dimming = _kick_calming_lights()
     lights_note = "; dimming lights" if dimming else ""
     print(
         f"  [voice-mood] stressed → proactive suppression "
         f"for {STRESS_SUPPRESSION_SECS // 60} min{lights_note}"
     )
-    return STRESS_DEFERENTIAL_ADDENDUM
+    if not _honest_addendum_on():
+        return STRESS_DEFERENTIAL_ADDENDUM
+    # A 'dimmable' dim is not yet proven on this hardware and its result
+    # lands 20-40 s later (v3.0.10 review: the generic "dim all lights" can
+    # end in a status read), so the prompt claims nothing about the lights;
+    # only 'legacy' keeps the lights line.
+    claim_lights = dimming and _calming_lights_mode() == "legacy"
+    return STRESS_HONEST_ADDENDUM + (STRESS_LIGHTS_NOTE if claim_lights
+                                     else "")

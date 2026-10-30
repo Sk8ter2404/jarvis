@@ -45,6 +45,10 @@ _URGENCY_WORDS = (
     "now", "just", "finally", "hurry", "quick", "quickly", "asap",
     "immediately", "already",
 )
+# The _URGENCY_WORDS that are urgency on their own; the rest ("now", "just",
+# "finally", "already") are mostly filler. Used only by the swear + urgency
+# rule when VOICE_MOOD_SWEAR_ALONE_STRESSED is False (v3.0.10).
+_REAL_URGENCY_WORDS = ("hurry", "quick", "quickly", "asap", "immediately")
 
 # Words that signal push-back ONLY in context. 'still' used to be a plain
 # urgency word, so "I'm still having USB issues" -- the owner REPORTING a
@@ -283,6 +287,71 @@ def is_repeat_request(text) -> bool:
         return False
 
 
+def _config_flag(name: str, old: bool) -> bool:
+    """A core.config bool read at CALL time (tests patch core.config). Any
+    trouble reading it - no package on sys.path when run as a script - keeps
+    ``old``, the behaviour before the flag. Never raises."""
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, name, old))
+    except Exception:
+        return old
+
+
+def swear_alone_stressed() -> bool:
+    """VOICE_MOOD_SWEAR_ALONE_STRESSED (core/config.py): True = one swear word
+    on its own is stress (the old rule); False (default) = it needs another
+    stress signal. Shared with core.emotion_tracker. Never raises."""
+    return _config_flag("VOICE_MOOD_SWEAR_ALONE_STRESSED", True)
+
+
+def quoted_words_ignored() -> bool:
+    """VOICE_MOOD_QUOTED_WORDS_IGNORED (core/config.py): True (default) = the
+    words of a "say / repeat / quote X" request carry no mood. Shared with
+    core.emotion_tracker. Never raises."""
+    return _config_flag("VOICE_MOOD_QUOTED_WORDS_IGNORED", False)
+
+
+# A request to SAY something (live 2026-10-29 18:54:35 and 18:55:16 "Jarvis,
+# say <a swear>."): the words are the line to be said, not how he feels, so
+# a swear word or "!" inside it is no stress. The WHOLE line has to open with
+# the ask, courtesy and "Jarvis" allowed before it: "say <X>", "can you say
+# <X>", "I want you to say <X>", "repeat after me <X>", "quote <X>", "have
+# him / the robot say <X>". "I said, say it" and "damn it, say something"
+# open with something else and are classified as before.
+_QUOTE_LEAD = (r"(?:(?:hey|ok|okay|so|and|um+|uh+|well|jarvis|please|now|"
+               r"just|sir|go on)\s+)*")
+_QUOTE_ASK = (r"(?:(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?"
+              r"(?:just\s+)?(?:i\s+(?:just\s+)?want\s+you\s+to\s+)?"
+              r"(?:say|repeat\s+after\s+me|quote)"
+              r"|(?:make|have|let|get|tell)\s+(?:him|her|it|them|"
+              r"(?:the|my)\s+[a-z']+(?:\s+[a-z']+)?)\s+(?:to\s+)?"
+              r"(?:say|quote))")
+# "say that / it again", "repeat yourself" ask for JARVIS's last line: a
+# repeat request (with a marker after it, push-back), never a quoted line.
+# Bare "repeat <X>", "read out", "recite", "pronounce" and "say something /
+# anything" quote no words ("Repeat the last command, damn it!" is stress),
+# so they are not quote requests and are classified as before.
+_QUOTE_REQUEST_RE = re.compile(
+    r"^" + _QUOTE_LEAD + _QUOTE_ASK
+    + r"\s+(?!(?:that|it|this|again|yourself|what|one more|once more|"
+    r"something|anything)\b)\S")
+
+
+def is_quote_request(text) -> bool:
+    """True when the whole utterance asks for words to be SAID ("Jarvis, say
+    <X>", "repeat after me <X>", "have him say <X>"; see the block comment).
+    A request to repeat JARVIS's last line is is_repeat_request, not this.
+    Never raises."""
+    try:
+        t = _clean(text)
+        if not t or len(t) > 200:
+            return False
+        return _QUOTE_REQUEST_RE.match(t) is not None
+    except Exception:
+        return False
+
+
 def detect_tone(user_text: str, prev_user_text: str | None = None,
                 prev_turn_failed: bool = False) -> str | None:
     """Classify the emotional tone of a transcribed user utterance.
@@ -323,6 +392,10 @@ def detect_tone(user_text: str, prev_user_text: str | None = None,
     # tone at all (only the time-of-day fallback below still applies).
     if is_repeat_request(clean):
         return "late_night" if _is_late_night_hour() else None
+    # "Jarvis, say <X>" (VOICE_MOOD_QUOTED_WORDS_IGNORED, v3.0.10): the words
+    # are the line to say, so they carry no tone; only the clock still does.
+    if quoted_words_ignored() and is_quote_request(clean):
+        return "late_night" if _late_night_tone_applies() else None
 
     def _has_any(phrases) -> bool:
         for p in phrases:
@@ -363,14 +436,29 @@ def detect_tone(user_text: str, prev_user_text: str | None = None,
     # response strategy differs; excited fires before stressed because both can
     # carry exclamation marks but excitement pairs them with positive markers
     # and no swearing / clipped-imperative pattern.
+    # Swear + urgency. With VOICE_MOOD_SWEAR_ALONE_STRESSED False (v3.0.10;
+    # live 2026-10-29 18:55:35 "I just want to say it, sir ... <swear>" came
+    # out frustrated -> mood stressed -> 15-min mute) the filler words "just",
+    # "now", "finally", "already" do not count with a swear ("holy <swear> it
+    # finally works" is joy): it needs a real urgency word or a clipped
+    # command (a swear with a '!' is 'stressed' below, the same mood).
+    # True = any _URGENCY_WORDS word, the old rule exactly.
+    if swear_alone_stressed():
+        swear_urgency = has_urgency
+    else:
+        swear_urgency = _has_any(_REAL_URGENCY_WORDS)
     if (has_repeat or similar_to_last or gated_pushback
-            or (has_swear and (has_urgency or is_clipped))):
+            or (has_swear and (swear_urgency or is_clipped))):
         return "frustrated"
 
     if (has_excited or exclaimed_positive) and not has_swear and not is_clipped:
         return "excited"
 
-    if has_swear or excl_count >= 2 or (is_clipped and excl_count >= 1):
+    # One swear word with nothing else (VOICE_MOOD_SWEAR_ALONE_STRESSED False,
+    # v3.0.10; live 2026-10-29 18:53:36 a jokey line) is no stress: it needs
+    # an exclamation mark too. Swear + urgency / clipped is 'frustrated' above.
+    swear_stress = has_swear and (excl_count >= 1 or swear_alone_stressed())
+    if swear_stress or excl_count >= 2 or (is_clipped and excl_count >= 1):
         return "stressed"
 
     if has_urgency or is_clipped:

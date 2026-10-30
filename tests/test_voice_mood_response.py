@@ -235,6 +235,18 @@ class KickSmartHomeTests(_RouterInjectingBase):
 # apply_voice_mood_response — the top-level entry point
 # ─────────────────────────────────────────────────────────────────────────
 class ApplyVoiceMoodResponseTests(_RouterInjectingBase):
+    """The old path: VOICE_MOOD_CALMING_LIGHTS 'legacy' and
+    VOICE_MOOD_HONEST_ADDENDUM False (the v3.0.10 defaults are pinned in
+    HonestStressedResponseTests)."""
+
+    def setUp(self):
+        super().setUp()
+        for key, val in (("VOICE_MOOD_CALMING_LIGHTS", "legacy"),
+                         ("VOICE_MOOD_HONEST_ADDENDUM", False)):
+            p = mock.patch(f"core.config.{key}", val)
+            p.start()
+            self.addCleanup(p.stop)
+
     def test_no_route_is_noop(self):
         self.assertEqual(vmr.apply_voice_mood_response(None, "hi"), "")
 
@@ -320,6 +332,110 @@ class ApplyVoiceMoodResponseTests(_RouterInjectingBase):
         # The suppression line is present but WITHOUT the dimming suffix.
         self.assertIn("proactive suppression", joined)
         self.assertNotIn("dimming lights", joined)
+
+
+def _catalog_router(devices, calls):
+    """A fake router whose catalog is ``devices`` and whose
+    smart_home_control records each command in ``calls``."""
+    mod = types.ModuleType("core.smart_home_router")
+    mod._ensure_catalog = lambda: {"devices": list(devices)}
+    mod._controller_for = lambda brand: ("sh_kasa" if "tp-link" in
+                                         brand.lower() else None)
+
+    def smart_home_control(cmd):
+        calls.append(cmd)
+        return "ok"
+    mod.smart_home_control = smart_home_control
+    return mod
+
+
+_PLUG = {"name": "Desk Plug", "brand": "TP-Link", "type": "plug",
+         "capabilities": ["on_off"], "lan_ip": "lan"}
+_DIM_LIGHT = {"name": "Lamp", "brand": "TP-Link", "type": "light",
+              "capabilities": ["dim", "on_off"], "lan_ip": "lan"}
+
+
+class HonestStressedResponseTests(_RouterInjectingBase):
+    """v3.0.10: live 2026-10-28 22:33:59 and 2026-10-29 18:54:35 a stressed
+    turn sent "dim all lights ..." to on/off plugs (it came back as a status
+    read 20-41 s later) and the prompt claimed "dimming is already in
+    motion" and forced the "I'll keep it brief" opener."""
+
+    def setUp(self):
+        super().setUp()
+        vmr._last_dim_sent_at[0] = 0.0
+        self.addCleanup(vmr._last_dim_sent_at.__setitem__, 0, 0.0)
+
+    def _apply(self):
+        with mock.patch("builtins.print"):
+            out = vmr.apply_voice_mood_response({"mood": "stressed"}, "x")
+        self._join_lights_thread()
+        return out
+
+    def test_default_sends_no_dim_and_claims_none(self):
+        calls = []
+        self._inject_router(_catalog_router([_PLUG, _DIM_LIGHT], calls))
+        out = self._apply()
+        self.assertEqual(calls, [])
+        self.assertEqual(out, vmr.STRESS_HONEST_ADDENDUM)
+        self.assertNotIn("dimming", out)
+        self.assertNotIn("keep it brief", out)
+
+    def test_dimmable_mode_skips_plugs_only_catalog(self):
+        calls = []
+        self._inject_router(_catalog_router([_PLUG, dict(_PLUG)], calls))
+        with mock.patch("core.config.VOICE_MOOD_CALMING_LIGHTS", "dimmable"):
+            out = self._apply()
+        self.assertEqual(calls, [])
+        self.assertNotIn("dimm", out)
+
+    def test_dimmable_mode_sends_once_per_cooldown(self):
+        calls = []
+        self._inject_router(_catalog_router([_PLUG, _DIM_LIGHT], calls))
+        with mock.patch("core.config.VOICE_MOOD_CALMING_LIGHTS", "dimmable"):
+            first = self._apply()
+            second = self._apply()
+        self.assertEqual(len(calls), 1)
+        # v3.0.10 review: a 'dimmable' dim is unproven, so no lights claim.
+        self.assertEqual(first, vmr.STRESS_HONEST_ADDENDUM)
+        self.assertEqual(second, vmr.STRESS_HONEST_ADDENDUM)
+
+    def test_dimmable_mode_again_after_cooldown(self):
+        calls = []
+        self._inject_router(_catalog_router([_DIM_LIGHT], calls))
+        with mock.patch("core.config.VOICE_MOOD_CALMING_LIGHTS", "dimmable"):
+            self.assertTrue(vmr._kick_calming_lights(now=1000.0))
+            self._join_lights_thread()
+            self.assertFalse(vmr._kick_calming_lights(now=1000.0 + 60))
+            self.assertTrue(vmr._kick_calming_lights(
+                now=1000.0 + vmr.CALMING_LIGHTS_COOLDOWN_SECS + 1))
+            self._join_lights_thread()
+        self.assertEqual(len(calls), 2)
+
+    def test_unreachable_or_odd_records_do_not_count(self):
+        no_path = dict(_DIM_LIGHT, lan_ip="")
+        no_skill = dict(_DIM_LIGHT, brand="Mystery")
+        self._inject_router(_catalog_router([], []))
+        self.assertFalse(vmr._has_reachable_dimmable(
+            {"devices": [no_path, no_skill, "junk", {"capabilities": None}]}))
+        self.assertFalse(vmr._has_reachable_dimmable(None))
+        self.assertTrue(vmr._has_reachable_dimmable({"devices": [_DIM_LIGHT]}))
+
+    def test_unknown_mode_reads_as_off(self):
+        calls = []
+        self._inject_router(_catalog_router([_DIM_LIGHT], calls))
+        with mock.patch("core.config.VOICE_MOOD_CALMING_LIGHTS", "maybe"):
+            self.assertFalse(vmr._kick_calming_lights())
+        self.assertEqual(calls, [])
+
+    def test_mute_still_set_for_a_real_stressed_label(self):
+        self._inject_router(_catalog_router([], []))
+        store = {}
+        with mock.patch("builtins.print"):
+            vmr.apply_voice_mood_response(
+                {"mood": "stressed"}, "x", load_memory=lambda: dict(store),
+                save_memory=lambda m: (store.clear(), store.update(m)))
+        self.assertGreater(store[vmr.MEMORY_KEY], time.time())
 
 
 if __name__ == "__main__":

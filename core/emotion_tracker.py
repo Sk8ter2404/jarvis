@@ -38,6 +38,11 @@ from typing import Optional
 # One definition of "repeating himself", shared with the tone detector so the
 # two classifiers cannot drift apart on it. Stdlib-only, import-light.
 from core.tone_detector import is_repeat_request, is_restatement
+# v3.0.10: "say <X>" carries no mood, and a lone swear word is not stress
+# (VOICE_MOOD_QUOTED_WORDS_IGNORED / VOICE_MOOD_SWEAR_ALONE_STRESSED, read at
+# call time, the same switches the tone detector reads).
+from core.tone_detector import (is_quote_request, quoted_words_ignored,
+                                swear_alone_stressed)
 # NIGHT_QUIET_ENABLED (read at call time) gates the time-only 'tired' read.
 from core.night_quiet import night_quiet_enabled
 
@@ -344,6 +349,21 @@ def classify_emotion(
     # prosody and the time of day still count. Same rule as
     # core.tone_detector.is_repeat_request, which it shares.
     repeat_request = is_repeat_request(clean)
+    # "Jarvis, say <X>" (v3.0.10, live 2026-10-29 18:54:35 and 18:55:16): the
+    # words are the line to say, not his mood - the same as a repeat request.
+    # None of the quoted words count, excitement and tiredness included (the
+    # same as core.tone_detector.detect_tone): only the clock fallback at the
+    # end still applies.
+    if (not repeat_request and quoted_words_ignored()
+            and is_quote_request(clean)):
+        try:
+            if night_quiet_enabled():
+                hour = p.hour if p.hour is not None else _current_hour()
+                if _in_late_night_band(hour) and n_words <= 8:
+                    return _build("tired", f"time=late_night hour={hour}")
+        except Exception:
+            pass
+        return _EMPTY
     if repeat_request:
         frust_phrase = swear_phrase = stress_phrase = None
         clipped = False
@@ -365,7 +385,17 @@ def classify_emotion(
     # Word-choice: profanity or stress vocabulary.
     # Sentence-length: clipped (≤3 words) with at least one exclamation.
     # Prosody: sudden volume spike or notably fast cadence.
-    if stress_phrase or (excl_count >= 2 and not exc_phrase) or (clipped and excl_count >= 1):
+    # A lone swear word (v3.0.10, VOICE_MOOD_SWEAR_ALONE_STRESSED False; live
+    # 2026-10-29 18:53:36 a jokey line, logged "phrase=<swear> excl=0
+    # clipped=False") is not stress: no intensifier, no '!', not clipped, no
+    # loud spike or fast cadence. Any of those with it still is.
+    stress_gate = stress_phrase
+    if (stress_phrase and swear_phrase and excl_count == 0 and not clipped
+            and not loud_spike and not fast_rate
+            and _has_any_phrase(clean, _STRESS_INTENSIFIERS) is None
+            and not swear_alone_stressed()):
+        stress_gate = None
+    if stress_gate or (excl_count >= 2 and not exc_phrase) or (clipped and excl_count >= 1):
         return _build(
             "stressed",
             f"phrase={stress_phrase!r} excl={excl_count} clipped={clipped}",
