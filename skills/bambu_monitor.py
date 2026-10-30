@@ -442,6 +442,124 @@ def _stale_prefix(last_update: float) -> str:
     except Exception:
         return ""
 
+
+# ── v3.0.9 lane B: a full status on connect, honest status replies ────────
+# Live 2026-10-28 21:18 "how much longer [on my] print?" -> check_print said
+# "Printing '<name>', sir." with no layer, percent or time, and the brain
+# then said it could not see the time remaining. Two causes, both fixed
+# behind core.config flags (read live):
+#   BAMBU_PUSHALL_ON_CONNECT - the printer pushes only the fields that
+#     change, and a full status ("pushall", read-only) was asked for only
+#     after 5 silent minutes; now once right after every (re)connect.
+#   PRINT_STATUS_HONEST - the printer names the time left mc_remaining_time
+#     and the layer count total_layer_num, which were never read (the
+#     overlay state on file: layer 334, percent 100, total_layer and
+#     mc_remaining null); and the replies say percent / layer / time left,
+#     FINISH / FAILED / PAUSE / PREPARE plainly, and why a figure is missing.
+_PRINTER_KEY_ALIASES = (("mc_remaining_time", "mc_remaining"),
+                        ("total_layer_num", "total_layer"))
+# The one request JARVIS ever sends the printer: "send me your full status".
+_PUSHALL_PAYLOAD = {"pushing": {"sequence_id": "0", "command": "pushall"}}
+_NO_ETA_TAIL = " - the printer hasn't sent its time estimate yet, sir."
+
+
+def _flag_on(name: str) -> bool:
+    """A v3.0.9 core.config flag, read live (default True). Never raises."""
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, name, True))
+    except Exception:
+        return True
+
+
+def _request_pushall(client, serial: str) -> bool:
+    """Ask the printer for its full status (the read-only pushall request on
+    device/<serial>/request). True when it was handed to paho. Never
+    raises."""
+    try:
+        if client is None or not serial:
+            return False
+        client.publish(f"device/{serial}/request",
+                       json.dumps(_PUSHALL_PAYLOAD))
+        print("  [bambu] asked the printer for a full status (pushall)")
+        return True
+    except Exception as e:
+        print(f"  [bambu] pushall on connect failed: {e}")
+        return False
+
+
+def _int_or_none(v):
+    try:
+        return int(float(v)) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _honest_status_reply(with_temps: bool) -> str:
+    """check_print (``with_temps`` False) / how_is_the_print (True) with
+    PRINT_STATUS_HONEST on: what the printer is doing, percent, layer and
+    time left from the snapshot, and the reason when a figure is missing.
+    Never raises (on a fault, the no-status reply)."""
+    try:
+        with _state_lock:
+            snap = dict(_state)
+        last_update = snap.get("last_update") or 0.0
+        if not last_update:
+            return _no_status_reply()
+        pre = _stale_prefix(last_update)
+        gcode_state = str(snap.get("gcode_state") or "").upper()
+        layer = _int_or_none(snap.get("layer_num"))
+        total = _int_or_none(snap.get("total_layer"))
+        pct = _int_or_none(snap.get("mc_percent"))
+        remaining = _int_or_none(snap.get("mc_remaining"))
+        fname = _strip_filename(snap.get("filename") or "")
+        of_name = f" of '{fname}'" if fname else ""
+        temp_tail = ""
+        if with_temps:
+            temps = [f"{label} at {t}" for label, t in (
+                ("nozzle", _format_temp(snap.get("nozzle_temper"))),
+                ("bed", _format_temp(snap.get("bed_temper")))) if t]
+            temp_tail = (" — " + " and ".join(temps)) if temps else ""
+
+        if not gcode_state:
+            seen = f" Its last report said layer {layer}." if layer else ""
+            return (pre + "The printer hasn't sent its print state yet, "
+                    f"sir.{seen} Ask again in a moment.")
+        if gcode_state == "IDLE":
+            return pre + "No active print, sir. The printer is idle."
+        if gcode_state == "FINISH":
+            return pre + f"The print{of_name} has finished, sir."
+        if gcode_state == "FAILED":
+            at = f" at layer {layer}" if layer else ""
+            return (pre + f"The print{of_name} failed{at}, sir - it is not "
+                    "printing now.")
+        if gcode_state in ("PREPARE", "SLICING", "INIT"):
+            what = f" to print '{fname}'" if fname else ""
+            return (pre + f"The printer is getting ready{what}, sir - "
+                    "heating and levelling - so it hasn't sent its time "
+                    "estimate yet.")
+
+        where = []
+        if pct is not None:
+            where.append("just starting" if pct <= 0 else f"{pct} percent done")
+        if layer and total:
+            where.append(f"layer {layer} of {total}")
+        elif layer:
+            where.append(f"on layer {layer}")
+        if gcode_state == "PAUSE":
+            spot = (", " + ", ".join(where)) if where else ""
+            return (pre + f"The print{of_name} is paused{spot}{temp_tail}, "
+                    "sir.")
+        head = f"Printing '{fname}'" if fname else "Print in progress"
+        parts = [head] + where
+        if remaining is None:
+            return pre + ", ".join(parts) + temp_tail + _NO_ETA_TAIL
+        parts.append(f"about {_format_minutes(remaining)} remaining"
+                     if remaining > 0 else "less than a minute remaining")
+        return pre + ", ".join(parts) + f"{temp_tail}, sir."
+    except Exception:
+        return _no_status_reply()
+
 # Milestone bookkeeping — reset whenever a new print starts so the same
 # print only announces each threshold once.
 _announced_milestones: set      = set()
@@ -708,6 +826,7 @@ def _on_message(client, userdata, msg) -> None:
     except Exception:
         return
     report = payload.get("print", payload)
+    printer_keys = _flag_on("PRINT_STATUS_HONEST")
 
     with _state_lock:
         _state["last_update"] = time.time()
@@ -716,6 +835,12 @@ def _on_message(client, userdata, msg) -> None:
                     "nozzle_temper", "bed_temper", "chamber_temper"):
             if key in report:
                 _state[key] = report[key]
+        # The printer's own names for the time left and the layer count
+        # (PRINT_STATUS_HONEST, v3.0.9): neither was ever read before.
+        if printer_keys:
+            for src, dst in _PRINTER_KEY_ALIASES:
+                if src in report:
+                    _state[dst] = report[src]
         # AMS status keys vary by firmware revision — accept either the
         # 'ams' object or a flat 'ams_status' / 'ams_exist_bits' field.
         for akey in ("ams", "ams_status", "ams_exist_bits"):
@@ -1110,6 +1235,10 @@ def _start_mqtt(ip: str, access: str, serial: str):
             print(f"  [bambu] MQTT connected, subscribing to {topic}")
             _note_conn("connected", f"MQTT session up at {ip}")
             client.subscribe(topic)
+            # A full status now, not after 5 silent minutes: the printer
+            # otherwise sends only what changes (BAMBU_PUSHALL_ON_CONNECT).
+            if _flag_on("BAMBU_PUSHALL_ON_CONNECT"):
+                _request_pushall(client, serial)
         else:
             _mqtt_connected_ok[0] = False
             print(f"  [bambu] MQTT connect failed rc={rc}")
@@ -1374,6 +1503,8 @@ def get_last_print_completion_summary(within_seconds: float = 12 * 3600) -> dict
 
 def register(actions):
     def check_print(_: str = "") -> str:
+        if _flag_on("PRINT_STATUS_HONEST"):
+            return _honest_status_reply(with_temps=False)
         with _state_lock:
             gcode_state = (_state.get("gcode_state") or "").upper()
             layer       = _state.get("layer_num")
@@ -1412,6 +1543,8 @@ def register(actions):
         """Return ETA + current layer + nozzle/bed temps as a one-line
         JARVIS-style reply. Triggered by phrases like 'how's the print'.
         """
+        if _flag_on("PRINT_STATUS_HONEST"):
+            return _honest_status_reply(with_temps=True)
         with _state_lock:
             gcode_state    = (_state.get("gcode_state") or "").upper()
             layer          = _state.get("layer_num")

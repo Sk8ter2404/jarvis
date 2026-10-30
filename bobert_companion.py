@@ -17936,6 +17936,9 @@ _TURN_FLAG_KEYS = (
     "LOOP_GUARD_MODE",
     "CHAIN_PROMISE_CHECK",
     "NOTE_CLAIM_CHECK",
+    # v3.0.9 lane B: site names, one action per offer yes, printer status.
+    "SITE_NAME_SPOKEN_FORMS", "OFFER_YES_ONE_ACTION",
+    "BAMBU_PUSHALL_ON_CONNECT", "PRINT_STATUS_HONEST",
 )
 
 
@@ -43296,15 +43299,79 @@ def _once_per_turn_arg(arg) -> str:
     return re.sub(r"\s+", " ", str(arg or "")).strip().lower()
 
 
+# ... and no browser agent on top of it (v3.0.9, OFFER_YES_ONE_ACTION): live
+# 2026-10-28 21:12:56 "Yes, go ahead." accepted "Shall I search for it on the
+# web instead?"; web_search opened Google and the follow-up round then ran
+# browse_for as well - a paid, minute-long browser agent nobody asked for. A
+# yes runs the ONE action the offer named. So once a web_search / open_url
+# ran this turn, the search-and-read agents (and their aliases) are refused
+# unless his words, or the offer he said yes to, asked for reading,
+# summarising, comparing, research or buying - what only the agent does.
+_SEARCH_THEN_AGENT_ACTIONS = ("browse_for", "browser_task", "browser_do",
+                              "browser_run")
+_AGENT_ASK_RE = re.compile(
+    r"\b(?:read(?:\s+up)?|reading|summari[sz](?:e|es|ing)|summary|compare|"
+    r"comparing|research|dig\s+into|look\s+into|find\s+out|cheapest|"
+    r"best\s+price|buy|purchase|order|book|fill\s+(?:in|out)|"
+    r"browser\s+agent|top\s+(?:three|3|five|5)\s+results)\b",
+    re.IGNORECASE)
+
+
+def _offer_yes_one_action_on() -> bool:
+    """OFFER_YES_ONE_ACTION as a bool (default True). Never raises."""
+    try:
+        return bool(globals().get("OFFER_YES_ONE_ACTION", True))
+    except Exception:
+        return True
+
+
+def _agent_asked_this_turn() -> bool:
+    """True when this turn's words - the owner's, or the offer he said yes
+    to - ask for what only the browser agent does (_AGENT_ASK_RE). Outside a
+    turn: True (nothing refused). Never raises (True)."""
+    try:
+        frame = getattr(_turn_grounding, "frame", None)
+        if frame is None:
+            return True
+        said = " ".join(str(t or "") for t in (
+            frame.get("user_text"), frame.get("accepted_offer")))
+        return bool(_AGENT_ASK_RE.search(said))
+    except Exception:
+        return True
+
+
+def _agent_on_search_refusal(name, ran_before, ran_here) -> str:
+    """The refusal result for a browser agent (_SEARCH_THEN_AGENT_ACTIONS or
+    an alias) after a web_search / open_url already ran this turn (an
+    earlier round: ``ran_before``; this reply: ``ran_here``), or "" to let it
+    run. OFFER_YES_ONE_ACTION False: always "". Never raises."""
+    try:
+        if not _offer_yes_one_action_on():
+            return ""
+        if not _same_handler_as(name, _SEARCH_THEN_AGENT_ACTIONS):
+            return ""
+        searched = (any(_once_per_turn_kind(n) for n in ran_before or ())
+                    or bool(ran_here))
+        if not searched or _agent_asked_this_turn():
+            return ""
+        return ("refused: a web search already ran this turn and its page is "
+                "open - he asked for that one action, not the browser agent "
+                "as well. Say the page is open, or ask whether he wants it "
+                "read.")
+    except Exception:
+        return ""
+
+
 def _once_per_turn_refusal(name, arg, ran_before, ran_here) -> str:
     """The refusal result for a web_search / open_url that must not run
     again this turn, or "" to let it run. ``ran_before``: action names that
     ran successfully in EARLIER rounds of this turn; ``ran_here``: (kind,
-    arg) pairs run by the current reply so far. Never raises."""
+    arg) pairs run by the current reply so far. A browser agent after one
+    of them: _agent_on_search_refusal. Never raises."""
     try:
         kind = _once_per_turn_kind(name)
         if not kind:
-            return ""
+            return _agent_on_search_refusal(name, ran_before, ran_here)
         if any(_once_per_turn_kind(n) == kind for n in ran_before or ()):
             return (f"refused: {kind} already ran earlier this turn and its "
                     f"page is still open - running it again only opens "

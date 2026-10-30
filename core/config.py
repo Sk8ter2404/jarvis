@@ -1778,6 +1778,49 @@ CAPABILITIES_SHORT_OVERVIEW = True
 # result as before. Read live.
 BROWSER_TASK_BACKGROUND = True
 
+# ─── v3.0.9 lane B (live 2026-10-28 on 3.0.7) ─────────────────────────────
+# SITE_NAME_SPOKEN_FORMS (bool, core/actions._website_name_url and
+# _act_launch_app): live 21:12 "open Makers World on main monitor" ran
+# open_on_monitor "main | Makers World", which tried to launch a program
+# ("could not launch Makers World: [WinError 2]") and JARVIS offered a web
+# search. True (default): a spoken plural / possessive form of a known site
+# ("makers world", "maker's world", "makerworld") finds it in the site table,
+# launch_app (open_app) opens a known site in the browser before it tries a
+# program, and a name that is still not found says "not found as an app on
+# this PC". Nothing is guessed: an unknown name is never made into a URL.
+# False: only the exact table spelling, launch_app never checks the site
+# table and the raw launch error is returned (the old behaviour). Read live.
+SITE_NAME_SPOKEN_FORMS = True
+# OFFER_YES_ONE_ACTION (bool, bobert_companion._once_per_turn_refusal): live
+# 21:12:56 "Yes, go ahead." to "Shall I search for it on the web instead?"
+# ran web_search (Google opened) AND the follow-up round then ran browse_for -
+# a paid browser agent on top of the search: two actions for one yes. True
+# (default): once a web_search / open_url ran this turn, a browse_for /
+# browser_task (or an alias) is refused unless his words, or the offer he said
+# yes to, asked to read, summarise, compare, research or buy. False: both run
+# (the old behaviour). Applies on the next start.
+OFFER_YES_ONE_ACTION = True
+# BAMBU_PUSHALL_ON_CONNECT (bool, skills/bambu_monitor._start_mqtt): the
+# printer only pushes the fields that CHANGE, and the monitor asked for a
+# full status (the read-only "pushall" request) only after 5 silent minutes,
+# so after a restart the layer / percent / time left could stay unknown for
+# a whole print. True (default): one pushall right after every (re)connect.
+# Nothing else is ever sent to the printer. False: no request on connect
+# (the old behaviour). Read live.
+BAMBU_PUSHALL_ON_CONNECT = True
+# PRINT_STATUS_HONEST (bool, skills/bambu_monitor check_print /
+# how_is_the_print / _on_message): live 21:18 "how much longer [on my] print?"
+# got "Printing '<name>', sir." (no layer, percent or time) and then "I can't
+# see the time remaining". The printer reports the time left as
+# mc_remaining_time and the layer count as total_layer_num; the monitor only
+# read mc_remaining / total_layer, so neither ever arrived (every milestone
+# line on file lacks its "Estimated ..." tail). True (default): those field
+# names are read too; check_print and how_is_the_print give percent, layer and
+# time left, say FINISH / FAILED / PAUSE / PREPARE plainly, and when a figure
+# is missing say why ("the printer hasn't sent its time estimate yet, sir").
+# False: the old field names and replies exactly. Read live.
+PRINT_STATUS_HONEST = True
+
 # ─── Routing fixes (v3.0.6, 2026-10-28 human test + misroutes report) ─────
 # TIMER_LABEL_GROUNDING (skills/timer.py grounded_label): live 2026-10-28
 # 17:53 "set a timer for three minutes" became "3 minutes | check the oven"

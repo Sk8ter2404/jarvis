@@ -100,15 +100,51 @@ _WEBSITE_NAME_URLS = {
     "reddit": "https://www.reddit.com", "facebook": "https://www.facebook.com",
     "twitter": "https://x.com", "amazon": "https://www.amazon.com",
     "wikipedia": "https://www.wikipedia.org",
+    # Maker / 3D-printing sites (live 2026-10-28 21:12: "open Makers World on
+    # main monitor" tried to launch a program called "Makers World").
+    "makerworld": "https://makerworld.com/", "maker world": "https://makerworld.com/",
+    "printables": "https://www.printables.com/",
+    "thingiverse": "https://www.thingiverse.com/",
+    "cults": "https://cults3d.com/", "cults3d": "https://cults3d.com/",
+    "cults 3d": "https://cults3d.com/",
 }
 _WEBSITE_NAME_NOISE_RE = re.compile(
     r"^(?:(?:the|a|an|up|open|my)\s+)+|(?:\s+(?:website|web\s*site|site|"
     r"page|com|dot\s+com)|\.com)+$", re.IGNORECASE)
 
 
+def _site_spoken_forms_on() -> bool:
+    """core.config.SITE_NAME_SPOKEN_FORMS, read live (default True). Never
+    raises."""
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, "SITE_NAME_SPOKEN_FORMS", True))
+    except Exception:
+        return True
+
+
+def _website_spoken_variants(s: str) -> list:
+    """The spellings a spoken site name may stand for, in trying order:
+    apostrophes dropped ("maker's world" -> "makers world"), then each word's
+    plural / possessive "s" dropped ("makers world" -> "maker world"), then
+    each of those with the spaces closed up ("makerworld"). Only ever looked
+    up in _WEBSITE_NAME_URLS, so an unknown name stays unknown."""
+    out = []
+    base = re.sub(r"['\u2019`]", "", s)
+    singular = " ".join(w[:-1] if len(w) > 3 and w.endswith("s") else w
+                        for w in base.split())
+    for v in (base, singular):
+        for form in (v, v.replace(" ", "")):
+            if form and form != s and form not in out:
+                out.append(form)
+    return out
+
+
 def _website_name_url(name: str) -> "str | None":
     """The home page for a bare spoken website name ("youtube", "HBO Max",
-    "gmail.com"), else None. Never raises."""
+    "gmail.com"), else None. With SITE_NAME_SPOKEN_FORMS on, a plural or
+    possessive spoken form ("Makers World", "maker's world") finds the same
+    row (_website_spoken_variants). Never raises."""
     try:
         s = " ".join(str(name or "").lower().split())
         for _ in range(3):
@@ -116,7 +152,14 @@ def _website_name_url(name: str) -> "str | None":
             if s2 == s:
                 break
             s = s2
-        return _WEBSITE_NAME_URLS.get(s)
+        url = _WEBSITE_NAME_URLS.get(s)
+        if url or not s or not _site_spoken_forms_on():
+            return url
+        for form in _website_spoken_variants(s):
+            url = _WEBSITE_NAME_URLS.get(form)
+            if url:
+                return url
+        return None
     except Exception:
         return None
 
@@ -1373,6 +1416,21 @@ def _unresolved_open_line(name: str) -> str:
         return ""
 
 
+def _launch_failure_line(name, e) -> str:
+    """launch_app's result when nothing could start ``name``. With
+    SITE_NAME_SPOKEN_FORMS on, a name the OS could not find says so in plain
+    words - "not found as an app on this PC" - so the follow-up round does
+    not guess it is installed; "could not launch" stays at the front (a
+    failure for every FAILURE_MARKERS reader). Never raises."""
+    try:
+        if _site_spoken_forms_on() and isinstance(e, FileNotFoundError):
+            return (f"could not launch {name}: not found as an app on this "
+                    f"PC ({e})")
+    except Exception:
+        pass
+    return f"could not launch {name}: {e}"
+
+
 def _act_launch_app(name: str) -> str:
     ask = _unresolved_open_line(name)
     if ask:
@@ -1381,6 +1439,12 @@ def _act_launch_app(name: str) -> str:
     shortcut = _site_shortcut_url(name)
     if shortcut:
         return _act_open_url(shortcut)
+    # ... and so is a known website name ("open Makers World", live
+    # 2026-10-28 21:12), before any program is tried (SITE_NAME_SPOKEN_FORMS).
+    if _site_spoken_forms_on():
+        site = _website_name_url(name)
+        if site:
+            return _act_open_url(site)
     bc = _bc()
     # 0) Apple Music special-case — the web player, like open_apple_music
     #    (2026-10-01, B089: this used to launch the Store app by AUMID, which
@@ -1424,7 +1488,7 @@ def _act_launch_app(name: str) -> str:
                     return f"launched {name}"
                 except Exception:
                     pass
-        return f"could not launch {name}: {e}"
+        return _launch_failure_line(name, e)
 
 
 # Start-menu apps (what Get-StartApps lists): name -> AppUserModelID.
