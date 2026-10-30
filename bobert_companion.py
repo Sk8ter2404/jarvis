@@ -43313,7 +43313,14 @@ _AGENT_ASK_RE = re.compile(
     r"\b(?:read(?:\s+up)?|reading|summari[sz](?:e|es|ing)|summary|compare|"
     r"comparing|research|dig\s+into|look\s+into|find\s+out|cheapest|"
     r"best\s+price|buy|purchase|order|book|fill\s+(?:in|out)|"
-    r"browser\s+agent|top\s+(?:three|3|five|5)\s+results)\b",
+    r"browser\s+agent|top\s+(?:three|3|five|5)\s+results|"
+    # The browser agent's own trigger phrases (core/prompts.py browser_task:
+    # "use the browser to <X>", "have your browser <X>", "autopilot the
+    # browser to <X>") and the asks only it does on an opened page ("find me
+    # a <X>", "go through the top posts"): an outright agent ask is never
+    # refused because an open_url / web_search ran first.
+    r"(?:use|have|get)\s+(?:the|your)\s+browser|autopilot\s+the\s+browser|"
+    r"your\s+browser\s+to|find\s+me|go\s+through)\b",
     re.IGNORECASE)
 
 
@@ -43350,12 +43357,17 @@ def _agent_on_search_refusal(name, ran_before, ran_here) -> str:
             return ""
         if not _same_handler_as(name, _SEARCH_THEN_AGENT_ACTIONS):
             return ""
-        searched = (any(_once_per_turn_kind(n) for n in ran_before or ())
-                    or bool(ran_here))
-        if not searched or _agent_asked_this_turn():
+        kinds = {_once_per_turn_kind(n) for n in ran_before or ()}
+        kinds |= {str(pair[0]) for pair in (ran_here or ())}
+        kinds.discard("")
+        if not kinds or _agent_asked_this_turn():
             return ""
-        return ("refused: a web search already ran this turn and its page is "
-                "open - he asked for that one action, not the browser agent "
+        # Name what actually ran: an open_url alone is "that page already
+        # opened", not "a web search already ran".
+        done = ("a web search already ran this turn and its page is open"
+                if "web_search" in kinds
+                else "that page already opened this turn")
+        return (f"refused: {done} - he asked for that one action, not the browser agent "
                 "as well. Say the page is open, or ask whether he wants it "
                 "read.")
     except Exception:

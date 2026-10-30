@@ -552,6 +552,13 @@ def _honest_status_reply(with_temps: bool) -> str:
                     "sir.")
         head = f"Printing '{fname}'" if fname else "Print in progress"
         parts = [head] + where
+        # A 0 left over from the last FINISH stays in the snapshot until the
+        # printer sends a new estimate (nothing resets it on a new print), so
+        # a 0 is a real "under a minute" only near the end; earlier it is a
+        # missing estimate, not "just starting, less than a minute remaining".
+        if remaining is not None and remaining <= 0 and (pct is None
+                                                         or pct < 95):
+            remaining = None
         if remaining is None:
             return pre + ", ".join(parts) + temp_tail + _NO_ETA_TAIL
         parts.append(f"about {_format_minutes(remaining)} remaining"

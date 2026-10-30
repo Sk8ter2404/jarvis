@@ -104,6 +104,22 @@ class HonestReplyTests(_Base):
         self.assertIn("hasn't sent its time estimate yet, sir", out)
         self.assertNotIn("can't see", out)
 
+    def test_a_zero_left_over_from_the_last_finish_is_no_estimate(self):
+        # Review 10-29: a FINISH leaves mc_remaining at 0 and nothing resets
+        # it when the next print starts, so a question just after "Print
+        # started" read "just starting, less than a minute remaining".
+        self._set(gcode_state="RUNNING", mc_percent=0, layer_num=0,
+                  mc_remaining=0, filename="boat.3mf")
+        out = self.actions["check_print"]("")
+        self.assertIn("just starting", out)
+        self.assertIn("hasn't sent its time estimate yet, sir", out)
+        self.assertNotIn("less than a minute", out)
+        # Near the end a 0 is real.
+        self._set(gcode_state="RUNNING", mc_percent=99, layer_num=0,
+                  mc_remaining=0, filename="boat.3mf")
+        self.assertIn("less than a minute remaining",
+                      self.actions["check_print"](""))
+
     def test_finish_failed_pause_prepare_are_said_plainly(self):
         self._set(gcode_state="FINISH", filename="bracket.3mf")
         self.assertIn("has finished", self.actions["check_print"](""))

@@ -1785,9 +1785,10 @@ BROWSER_TASK_BACKGROUND = True
 # ("could not launch Makers World: [WinError 2]") and JARVIS offered a web
 # search. True (default): a spoken plural / possessive form of a known site
 # ("makers world", "maker's world", "makerworld") finds it in the site table,
-# launch_app (open_app) opens a known site in the browser before it tries a
-# program, and a name that is still not found says "not found as an app on
-# this PC". Nothing is guessed: an unknown name is never made into a URL.
+# launch_app (open_app) opens a known site in the browser once no program,
+# known app or Start-menu app has the name (an installed "YouTube" app still
+# opens as the app), and a name that is still not found says "not found as an
+# app on this PC". Nothing is guessed: an unknown name is never made into a URL.
 # False: only the exact table spelling, launch_app never checks the site
 # table and the raw launch error is returned (the old behaviour). Read live.
 SITE_NAME_SPOKEN_FORMS = True

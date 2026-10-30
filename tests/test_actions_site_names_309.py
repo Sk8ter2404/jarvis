@@ -8,8 +8,8 @@ website, so it was launched as a program ("could not launch Makers World:
 Pinned: the maker / 3D-printing sites are in the site table; with
 SITE_NAME_SPOKEN_FORMS on, the plural / possessive spoken forms ("makers
 world", "maker's world") find the same row, launch_app opens a known site in
-the browser before it tries a program, and a name still not found says "not
-found as an app on this PC"; an unknown name is never made into a URL. With
+the browser once no program or Start-menu app has the name, and a name still
+not found says "not found as an app on this PC"; an unknown name is never made into a URL. With
 the flag off only the exact table spelling matches and the raw launch error
 comes back (the old path). No real launches: os.startfile / Popen and the
 browser open are patched.
@@ -86,16 +86,30 @@ class LaunchAppTests(_FlagBase):
     def _fake_bc(self):
         return mock.MagicMock(_resolve_known_app=lambda n: None)
 
-    def test_a_known_site_opens_before_any_program_is_tried(self):
+    def test_a_known_site_opens_when_no_program_has_the_name(self):
         self._flag(True)
-        with mock.patch.object(act, "_bc", return_value=self._fake_bc()), \
-             mock.patch.object(act.shutil, "which") as which, \
-             mock.patch.object(act.subprocess, "Popen") as popen:
-            out = act._act_launch_app("Makers World")
+        out = self._launch_missing("Makers World")
         self.assertEqual(self.opened, [MAKERWORLD])
         self.assertIn(MAKERWORLD, out)
-        which.assert_not_called()
-        popen.assert_not_called()
+
+    def test_an_installed_app_with_a_sites_name_still_opens_as_the_app(self):
+        # Review 10-29: a Start-menu "YouTube" app launched on the old path;
+        # the site table must not take it over (it is checked last).
+        self._flag(True)
+        missing = FileNotFoundError(2, "The system cannot find the file "
+                                       "specified")
+        with mock.patch.object(act, "_bc", return_value=self._fake_bc()), \
+             mock.patch.object(act.shutil, "which", return_value=None), \
+             mock.patch.object(act.sys, "platform", "win32"), \
+             mock.patch.object(act.os, "startfile", side_effect=missing,
+                               create=True), \
+             mock.patch.object(act, "_start_app_id",
+                               return_value="Example.YouTube!App"), \
+             mock.patch.object(act.subprocess, "Popen") as popen:
+            out = act._act_launch_app("YouTube")
+        self.assertEqual(out, "launched YouTube")
+        self.assertEqual(self.opened, [])
+        popen.assert_called_once()
 
     def _launch_missing(self, name):
         missing = FileNotFoundError(2, "The system cannot find the file "

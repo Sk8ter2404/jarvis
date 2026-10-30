@@ -1439,12 +1439,6 @@ def _act_launch_app(name: str) -> str:
     shortcut = _site_shortcut_url(name)
     if shortcut:
         return _act_open_url(shortcut)
-    # ... and so is a known website name ("open Makers World", live
-    # 2026-10-28 21:12), before any program is tried (SITE_NAME_SPOKEN_FORMS).
-    if _site_spoken_forms_on():
-        site = _website_name_url(name)
-        if site:
-            return _act_open_url(site)
     bc = _bc()
     # 0) Apple Music special-case — the web player, like open_apple_music
     #    (2026-10-01, B089: this used to launch the Store app by AUMID, which
@@ -1488,6 +1482,17 @@ def _act_launch_app(name: str) -> str:
                     return f"launched {name}"
                 except Exception:
                     pass
+        # 4) ... and a known website name ("open Makers World", live
+        #    2026-10-28 21:12) is a page (SITE_NAME_SPOKEN_FORMS). Only once
+        #    no program has the name: an installed app that shares a site's
+        #    name (a Start-menu "YouTube") still opens as the app.
+        try:
+            site = (_website_name_url(name) if _site_spoken_forms_on()
+                    else None)
+        except Exception:
+            site = None
+        if site:
+            return _act_open_url(site)
         return _launch_failure_line(name, e)
 
 

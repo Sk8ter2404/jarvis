@@ -132,6 +132,53 @@ class AgentAskedTests(_Base):
         self.assertEqual(bc._agent_on_search_refusal(
             "see_screen", frozenset({"web_search"}), set()), "")
 
+    def test_the_browser_agents_own_trigger_phrases_let_it_run(self):
+        # Review 10-29: core/prompts.py names "use the browser to <X>",
+        # "have your browser <X>" and "autopilot the browser to <X>" as the
+        # browser_task asks; an open_url / web_search first must not refuse
+        # them.
+        bc = self.bc
+        self._flag(True)
+        for said in ("Jarvis, open Example Shop and use the browser to add "
+                     "earbuds to my cart.",
+                     "Jarvis, have your browser check the weather.",
+                     "Jarvis, autopilot the browser to sign me up.",
+                     "Jarvis, open Example Site and find me a boat model.",
+                     "Jarvis, search Example Forum and go through the top "
+                     "posts."):
+            self._p(bc._turn_grounding, "frame",
+                    {"user_text": said, "ran": set()}, create=True)
+            self.assertEqual(bc._agent_on_search_refusal(
+                "browser_task", frozenset({"web_search"}), set()), "", said)
+
+    def test_open_url_and_use_the_browser_in_one_reply_both_run(self):
+        self._flag(True)
+        self._stub("open_url", "opened https://example.com")
+        self._stub("browser_task", "added the earbuds to the cart")
+        self.brain = lambda prompt: (
+            "[intent:confirmation] On it, sir. [ACTION: open_url, "
+            "example.com] [ACTION: browser_task, add earbuds to my cart]")
+        self._turn("Jarvis, open Example Shop and use the browser to add "
+                   "earbuds to my cart.")
+        self.assertEqual(self.calls["open_url"], ["example.com"])
+        self.assertEqual(self.calls["browser_task"],
+                         ["add earbuds to my cart"])
+
+    def test_an_open_url_alone_is_named_as_a_page_not_a_search(self):
+        bc = self.bc
+        self._flag(True)
+        self._p(bc._turn_grounding, "frame",
+                {"user_text": "Yes, go ahead.", "ran": set()}, create=True)
+        res = bc._agent_on_search_refusal(
+            "browse_for", frozenset({"open_url"}), set())
+        self.assertTrue(res.startswith("refused: that page already opened"),
+                        res)
+        self.assertNotIn("web search", res)
+        res = bc._agent_on_search_refusal(
+            "browse_for", frozenset(), {("open_url", "example.com")})
+        self.assertTrue(res.startswith("refused: that page already opened"),
+                        res)
+
 
 if __name__ == "__main__":
     unittest.main()
