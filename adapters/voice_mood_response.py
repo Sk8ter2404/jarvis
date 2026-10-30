@@ -284,4 +284,10 @@ def apply_voice_mood_response(
     )
     if not _honest_addendum_on():
         return STRESS_DEFERENTIAL_ADDENDUM
-    return STRESS_HONEST_ADDENDUM + (STRESS_LIGHTS_NOTE if dimming else "")
+    # A 'dimmable' dim is not yet proven on this hardware and its result
+    # lands 20-40 s later (v3.0.10 review: the generic "dim all lights" can
+    # end in a status read), so the prompt claims nothing about the lights;
+    # only 'legacy' keeps the lights line.
+    claim_lights = dimming and _calming_lights_mode() == "legacy"
+    return STRESS_HONEST_ADDENDUM + (STRESS_LIGHTS_NOTE if claim_lights
+                                     else "")

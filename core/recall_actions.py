@@ -35,15 +35,26 @@ except Exception:  # pragma: no cover - core.turn_checker is in-tree
         r"(?:(?:when|what|where|why|how|which)\s+)?"
         r"(?:did|didn'?t|have|haven'?t|had)\s+you\b")
 
-# A surprised opener about what just happened: "Wait, what?", "huh", "hold
-# on", "what the ...", "why did ...", "did that / it / he ...", "was that
-# ...", "where did ...", "who said ...". A bare "what" counts only on its own
-# ("what?", "what, ..."), never "what's the weather".
+# A surprised opener about what just happened: "what the ...", "why did
+# ...", "did that / it / he ...", "was that ...", "where did ...", "who said
+# ...". A bare "what" counts only on its own ("what?", "what, ..."), never
+# "what's the weather".
 _SURPRISE_OPEN_RE = re.compile(
     r"^(?:(?:hey|ok(?:ay)?|so|and|um+|uh+|well|jarvis|sir)[,\s]+)*"
-    r"(?:wait|huh|hold on|hang on|what(?=\s*[?!,.]|\s*$)|what the|why did|"
+    r"(?:what(?=\s*[?!,.]|\s*$)|what the|why did|"
     r"why'd|did (?:that|it|he|she|they)|was that|where did|"
     r"who (?:did|said))\b")
+# "Wait", "huh", "hold on", "hang on" also open commands ("hold on, turn it
+# down", "wait, pause it"; v3.0.10 review), so after one of them the line
+# counts only with a "?", a past-tense verb or a recall opener after it
+# ("Wait, what?", "hold on, was that the robot").
+_SOFT_OPEN_RE = re.compile(
+    r"^(?:(?:hey|ok(?:ay)?|so|and|um+|uh+|well|jarvis|sir)[,\s]+)*"
+    r"(?:wait|huh|hold on|hang on)\b[,.!\s]*")
+# "Did you know octopuses have three hearts?" is trivia, not recall.
+_DID_YOU_KNOW_RE = re.compile(
+    r"^(?:(?:hey|ok(?:ay)?|so|and|um+|uh+|well|jarvis|sir)[,\s]+)*"
+    r"did\s+you\s+know\b")
 # A question about something that happened: "?" and a past-tense action verb
 # ("They sent it over to the robot?", "it said that?").
 _PAST_VERB_RE = re.compile(
@@ -63,8 +74,17 @@ def is_recall_question(user_text) -> bool:
         t = _low(user_text)
         if not t or len(t) > 240:
             return False
+        if _DID_YOU_KNOW_RE.match(t):
+            return False
         if _RECALL_ASK_RE.match(t) or _SURPRISE_OPEN_RE.match(t):
             return True
+        soft = _SOFT_OPEN_RE.match(t)
+        if soft:
+            rest = t[soft.end():]
+            return ("?" in t or not rest
+                    or _PAST_VERB_RE.search(rest) is not None
+                    or _RECALL_ASK_RE.match(rest) is not None
+                    or _SURPRISE_OPEN_RE.match(rest) is not None)
         return "?" in t and _PAST_VERB_RE.search(t) is not None
     except Exception:
         return False
@@ -129,8 +149,9 @@ def recall_action_note(user_text, history, now=None,
         lines.reverse()
         return ("\n\n[Recent actions you ran in the last "
                 f"{int(window_s)} s:\n" + "\n".join(lines) + "\n"
-                "He is asking about what just happened. Say plainly what "
-                "ran and what it did; never deny it or call it a "
-                "misunderstanding.]")
+                "If he is asking about what just happened, say plainly "
+                "what ran and what it did; never deny it or call it a "
+                "misunderstanding. If his line is a new request, just do "
+                "it.]")
     except Exception:
         return ""

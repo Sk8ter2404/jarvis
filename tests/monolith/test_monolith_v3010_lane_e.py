@@ -73,12 +73,26 @@ class MediaToggleNoFollowupTests(_LaneEBase):
         self.followup.assert_not_called()
         self.assertEqual(self.spoken, ["Paused Chrome, sir."])
 
-    def test_already_paused_counts_as_done(self):
+    def test_already_paused_still_goes_back_to_the_model(self):
+        # v3.0.10 review: a no-op is not a success - the reply's prose may
+        # claim a change that never happened, so the old hold and round run.
         self.bc.ACTIONS["pause_music"] = (
             lambda a="": "Chrome is already paused, sir")
-        self._run_turn("Very good, sir. [ACTION: pause_music]",
-                       "pause it")
+        self.followup.side_effect = ["Chrome was already paused, sir.", ""]
+        printed = self._run_turn(
+            "Right away, sir. [ACTION: pause_music] I've paused the movie, "
+            "sir.", "pause it")
+        self.followup.assert_called()
+        self.assertNotIn("I've paused the movie", " ".join(self.spoken))
+        self.assertNotIn("[media-toggle]", printed)
+
+    def test_a_tag_only_reply_speaks_the_result_line(self):
+        # v3.0.10 review: "[intent:confirmation] [ACTION: pause_music]"
+        # leaves only a tag _speak strips; the result line is spoken.
+        self._run_turn("[intent:confirmation] [ACTION: pause_music]",
+                       "pause the music")
         self.followup.assert_not_called()
+        self.assertIn("Paused Chrome, sir.", " ".join(self.spoken))
 
     def test_nothing_playing_still_goes_back_to_the_model(self):
         self.bc.ACTIONS["pause_music"] = (
@@ -103,8 +117,8 @@ class MediaToggleNoFollowupTests(_LaneEBase):
         done = self.bc._media_toggle_done
         self.assertTrue(done("pause_music", "paused Chrome, sir"))
         self.assertTrue(done("resume_music", "resumed Chrome, sir"))
-        self.assertTrue(done("resume_music",
-                             "Chrome is already playing, sir"))
+        self.assertFalse(done("resume_music",
+                              "Chrome is already playing, sir"))
         self.assertFalse(done("pause_music", "media play/pause pressed"))
         self.assertFalse(done("pause_music",
                               "Chrome didn't accept that, sir."))
@@ -143,6 +157,26 @@ class ActionTopicGateTests(_LaneEBase):
             {"role": "assistant", "content": "[ACTION: server_status]"})
         self._run_turn("[ACTION: server_status]", "how about now?")
         self.assertEqual(self.server_calls, [""])
+
+    def test_shared_reply_skips_it_and_reads_the_rest(self):
+        # v3.0.10 review: a dropped check beside another action is a plain
+        # skip, so the weather result is still spoken and no "didn't catch
+        # that" lands next to it.
+        printed = self._run_turn(
+            "[ACTION: weather_briefing] [ACTION: server_status]",
+            "what's the weather and give me a status update")
+        self.assertEqual(self.server_calls, [])
+        self.assertNotIn(self.bc.UNCLEAR_CUE, self.spoken)
+        self.assertNotIn("terminal failure reported", printed)
+        self.assertIn("other actions in the reply still run", printed)
+
+    def test_shared_skip_off_is_the_terminal_line(self):
+        self._p(self.bc, "ACTION_TOPIC_SHARED_SKIP", False, create=True)
+        printed = self._run_turn(
+            "[ACTION: weather_briefing] [ACTION: server_status]",
+            "what's the weather and give me a status update")
+        self.assertEqual(self.server_calls, [])
+        self.assertIn("asking sir to repeat", printed)
 
     def test_flag_off_runs_it(self):
         self._p(self.bc, "ACTION_TOPIC_GATE", False, create=True)
@@ -199,7 +233,7 @@ class TurnFlagKeysTests(_LaneEBase):
                     "VOICE_MOOD_QUOTED_WORDS_IGNORED",
                     "VOICE_MOOD_CALMING_LIGHTS", "VOICE_MOOD_HONEST_ADDENDUM",
                     "MEDIA_TOGGLE_NO_FOLLOWUP", "ACTION_TOPIC_GATE",
-                    "RECALL_ACTION_GROUNDING"):
+                    "ACTION_TOPIC_SHARED_SKIP", "RECALL_ACTION_GROUNDING"):
             with self.subTest(key=key):
                 self.assertIn(key, self.bc._TURN_FLAG_KEYS)
                 self.assertTrue(hasattr(self.bc, key))

@@ -1757,6 +1757,15 @@ ACTION_FIT_ACK_REPEAT_ENFORCE = True
 # whatever ACTION_FIT_MODE says. False: no such check (the old behaviour).
 # Read live.
 ACTION_TOPIC_GATE = True
+# ACTION_TOPIC_SHARED_SKIP (bool, v3.0.10 review) - a check ACTION_TOPIC_GATE
+# drops in a reply that holds other actions too ("[ACTION: weather]
+# [ACTION: server_status]" for "what's the weather and give me a status
+# update"). True (default): it is a plain skip, not a terminal "didn't catch
+# that", so the other results are still read back and the chain runs on;
+# a lone dropped check still asks him to repeat. False: always the terminal
+# line (the first v3.0.10 behaviour; the weather result was never read).
+# Read live.
+ACTION_TOPIC_SHARED_SKIP = True
 
 # --- Chain loop guard (v3 W21, 2026-10-27; core/loop_guard.py) ---------
 # LOOP_GUARD_MODE - the follow-up loop already stops a chain on a repeated
@@ -2111,7 +2120,10 @@ VOICE_MOOD_QUOTED_WORDS_IGNORED = True
 #   'off'      (default) no smart-home call at all;
 #   'dimmable' a dim is sent only when the device catalog lists a light that
 #              can dim and something can reach it (a controller skill and a
-#              LAN address or Alexa entity), at most once per 15 min;
+#              LAN address or Alexa entity), at most once per 15 min. NOT
+#              yet proven on this hardware: it still sends the generic "dim
+#              all lights" (which can end in a status read), so the prompt
+#              never claims the lights are dimming;
 #   'legacy'   the old path exactly: a dim on every stressed turn whenever
 #              the catalog has any device.
 #   Anything else reads as 'off'. Applies on the next stressed turn.

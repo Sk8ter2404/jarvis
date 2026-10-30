@@ -37,6 +37,25 @@ class ActionTopicTests(unittest.TestCase):
             with self.subTest(name=name, text=text):
                 self.assertEqual(af.action_topic_missing(name, text), "")
 
+    def test_review_asks_fit(self):
+        # v3.0.10 review: clearly heard asks the first word lists refused.
+        for text in ("is DNS working?", "can you check SSH",
+                     "is the web front end up?",
+                     "are my docker containers up?", "is Nextcloud up?",
+                     "is the swap done yet?", "are the backups ok?",
+                     "is the VM running?",
+                     "how much space do I have left?"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    af.action_topic_missing("server_status", text), "")
+        for text in ("how much longer?", "how far along is it?",
+                     "how's the job going?", "is the plate ready?",
+                     "how's the engraving going",
+                     "what time will it be ready?", "check on the job"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    af.action_topic_missing("check_print", text), "")
+
     def test_print_check_on_the_live_line_fits(self):
         # "percentage" names a print's progress: not blocked.
         self.assertEqual(af.action_topic_missing("check_print", _LIVE), "")

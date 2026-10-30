@@ -396,7 +396,8 @@ class HonestStressedResponseTests(_RouterInjectingBase):
             first = self._apply()
             second = self._apply()
         self.assertEqual(len(calls), 1)
-        self.assertTrue(first.endswith(vmr.STRESS_LIGHTS_NOTE))
+        # v3.0.10 review: a 'dimmable' dim is unproven, so no lights claim.
+        self.assertEqual(first, vmr.STRESS_HONEST_ADDENDUM)
         self.assertEqual(second, vmr.STRESS_HONEST_ADDENDUM)
 
     def test_dimmable_mode_again_after_cooldown(self):

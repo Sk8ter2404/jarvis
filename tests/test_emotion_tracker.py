@@ -376,6 +376,15 @@ class LoneSwearTests(unittest.TestCase):
             et.classify_emotion("well that's a damn shame", fast).label,
             "stressed")
 
+    def test_quoted_words_carry_no_mood_at_all(self):
+        # v3.0.10 review: excitement and tiredness in a quoted line do not
+        # count either (the tone detector already returns None for these).
+        for text in ("Say yes or no damn it",
+                     "Jarvis say I love it, this is great",
+                     "Repeat after me, I'm exhausted"):
+            with self.subTest(text=text):
+                self.assertIsNone(et.classify_emotion(text, DAY).label)
+
     def test_old_rules_behind_the_flags(self):
         with mock.patch("core.config.VOICE_MOOD_SWEAR_ALONE_STRESSED", True):
             self.assertEqual(

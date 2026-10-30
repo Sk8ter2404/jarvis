@@ -36,6 +36,18 @@ class IsRecallQuestionTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(ra.is_recall_question(text))
 
+    def test_commands_after_a_soft_opener_are_not_recall(self):
+        # v3.0.10 review: "wait" / "hold on" open commands too, and "did you
+        # know" is trivia.
+        for text in ("Hold on, turn it down", "Wait, pause it",
+                     "hang on, stop the music",
+                     "wait, play the other song instead",
+                     "Jarvis, did you know octopuses have three hearts?"):
+            with self.subTest(text=text):
+                self.assertFalse(ra.is_recall_question(text))
+                self.assertEqual(ra.recall_action_note(text, [_SPOKE],
+                                                       now=NOW), "")
+
 
 class RecallNoteTests(unittest.TestCase):
     def test_live_case_lists_the_action_and_result(self):

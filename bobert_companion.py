@@ -17977,7 +17977,7 @@ _TURN_FLAG_KEYS = (
     "VOICE_MOOD_SWEAR_ALONE_STRESSED", "VOICE_MOOD_QUOTED_WORDS_IGNORED",
     "VOICE_MOOD_CALMING_LIGHTS", "VOICE_MOOD_HONEST_ADDENDUM",
     "MEDIA_TOGGLE_NO_FOLLOWUP", "ACTION_TOPIC_GATE",
-    "RECALL_ACTION_GROUNDING",
+    "ACTION_TOPIC_SHARED_SKIP", "RECALL_ACTION_GROUNDING",
 )
 
 
@@ -43256,15 +43256,16 @@ def _result_hold_name(new_results) -> str:
 # Chrome, sir", the reply's prose was held ([result-hold]) and a follow-up
 # round said "Understood, sir. I've paused Chrome, sir." - first audio at
 # 7.3 s. A pause / resume that plainly worked ("paused <app>, sir",
-# "resumed <app>, sir", "<app> is already paused / playing, sir") has
-# nothing for the model to read back, so it is not sent to a follow-up round:
-# the reply's own prose is spoken, or the result line when the reply had
-# none. A failure or "nothing seems to be playing" still holds and goes back
-# to the model, as before. MEDIA_TOGGLE_NO_FOLLOWUP False = the old path.
+# "resumed <app>, sir") has nothing for the model to read back, so it is not
+# sent to a follow-up round: the reply's own prose is spoken, or the result
+# line when the reply had none. A failure, "nothing seems to be playing" or
+# "<app> is already paused / playing" (a no-op: the reply's prose may claim
+# a change that never happened, and "already playing" can name another
+# player) still holds and goes back to the model, as before.
+# MEDIA_TOGGLE_NO_FOLLOWUP False = the old path.
 _MEDIA_TOGGLE_ACTIONS = ("pause_music", "resume_music")
 _MEDIA_TOGGLE_DONE_RE = re.compile(
-    r"(?:(?:paused|resumed)\s+\S.*|\S.*\s+is\s+already\s+(?:paused|playing))"
-    r",\s+sir\.?", re.I | re.S)
+    r"(?:paused|resumed)\s+\S.*,\s+sir\.?", re.I | re.S)
 
 
 def _media_toggle_done(name, result) -> bool:
@@ -44464,7 +44465,7 @@ def _action_topic_context(user_text: str) -> list:
     return out
 
 
-def _action_topic_refusal(name: str) -> "str | None":
+def _action_topic_refusal(name: str, n_reply_actions: int = 1) -> "str | None":
     """ACTION_TOPIC_GATE (v3.0.10): the result for a read-only status check
     whose subject sir's line never names (core.action_fit.
     action_topic_missing; live 2026-10-29 18:55:45 "Much more percentage, so
@@ -44472,7 +44473,12 @@ def _action_topic_refusal(name: str) -> "str | None":
     so the check does not run, JARVIS asks him to repeat and no follow-up
     round guesses again. None (run it) outside an owner turn, while a prompt
     or JARVIS's offer waits for his answer, after he took an offer, or when
-    the words fit. Logs the action name and the reason only. Never raises."""
+    the words fit. When the reply holds other actions too
+    (``n_reply_actions`` > 1, ACTION_TOPIC_SHARED_SKIP; v3.0.10 review:
+    "[ACTION: weather] [ACTION: server_status]" lost the weather read-back
+    to the terminal line) it is a plain non-terminal skip
+    (core.action_fit.failure_result) so the other results are still read
+    back. Logs the action name and the reason only. Never raises."""
     try:
         if not globals().get("ACTION_TOPIC_GATE", True):
             return None
@@ -44488,6 +44494,11 @@ def _action_topic_refusal(name: str) -> "str | None":
             name, user_text, _action_topic_context(user_text))
         if not reason:
             return None
+        if (n_reply_actions > 1
+                and globals().get("ACTION_TOPIC_SHARED_SKIP", True)):
+            print(f"  [action-topic] dropped {name} ({reason}) - other "
+                  f"actions in the reply still run")
+            return _action_fit.failure_result(reason)
         print(f"  [action-topic] dropped {name} ({reason}) - asking sir "
               f"to repeat")
         _followup_keep_for_reply("action-topic")   # his repeat needs no wake word
@@ -44757,6 +44768,13 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
                               for m in _ACTION_RE.finditer(reply))
                         if _fit_on else ())
 
+    # Action topic (ACTION_TOPIC_GATE): how many action tokens this reply
+    # holds - a lone off-topic check is terminal, one beside others is not.
+    try:
+        _topic_reply_count = len(_ACTION_RE.findall(reply))
+    except Exception:
+        _topic_reply_count = 1
+
     def _runner(match):
         name = match.group(1).strip().lower()
         arg  = (match.group(2) or "").strip()
@@ -44981,7 +44999,7 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
         # Action topic (v3.0.10, ACTION_TOPIC_GATE): a read-only status
         # check whose subject his line never names is not run; JARVIS asks
         # him to repeat (_action_topic_refusal).
-        _off_topic = _action_topic_refusal(name)
+        _off_topic = _action_topic_refusal(name, _topic_reply_count)
         if _off_topic:
             results.append((name, _off_topic, False))
             return ""
@@ -45154,8 +45172,14 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     # A media toggle that worked and a reply with no words of its own
     # ("[ACTION: pause_music]" alone): its result line is the answer, since
     # no follow-up round will say anything (MEDIA_TOGGLE_NO_FOLLOWUP).
-    if _toggle_lines and not _hold_at and not re.search(r"\w", cleaned):
-        cleaned = _media_toggle_line(_toggle_lines[0]) or cleaned
+    # Only the audible text counts: "[intent:confirmation] [ACTION: ...]"
+    # leaves a tag _speak strips, which would otherwise be silence.
+    if (_toggle_lines and not _hold_at
+            and not re.search(r"\w", _answer_first_audible_lead(cleaned))):
+        _tags = _LEADING_BRACKET_TAGS_RE.match(cleaned or "")
+        _line = _media_toggle_line(_toggle_lines[0])
+        if _line:
+            cleaned = ((_tags.group(0).strip() + " ") if _tags else "") + _line
     if _head_mode != "off":
         cleaned = _head_hold_apply(cleaned, results, _hold_at,
                                    _ran_before_reply, _head_grounding,

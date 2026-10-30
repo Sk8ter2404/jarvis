@@ -45,6 +45,10 @@ _URGENCY_WORDS = (
     "now", "just", "finally", "hurry", "quick", "quickly", "asap",
     "immediately", "already",
 )
+# The _URGENCY_WORDS that are urgency on their own; the rest ("now", "just",
+# "finally", "already") are mostly filler. Used only by the swear + urgency
+# rule when VOICE_MOOD_SWEAR_ALONE_STRESSED is False (v3.0.10).
+_REAL_URGENCY_WORDS = ("hurry", "quick", "quickly", "asap", "immediately")
 
 # Words that signal push-back ONLY in context. 'still' used to be a plain
 # urgency word, so "I'm still having USB issues" -- the owner REPORTING a
@@ -319,16 +323,19 @@ _QUOTE_LEAD = (r"(?:(?:hey|ok|okay|so|and|um+|uh+|well|jarvis|please|now|"
                r"just|sir|go on)\s+)*")
 _QUOTE_ASK = (r"(?:(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?"
               r"(?:just\s+)?(?:i\s+(?:just\s+)?want\s+you\s+to\s+)?"
-              r"(?:say|repeat\s+after\s+me|repeat|quote|recite|read\s+out|"
-              r"pronounce)"
+              r"(?:say|repeat\s+after\s+me|quote)"
               r"|(?:make|have|let|get|tell)\s+(?:him|her|it|them|"
               r"(?:the|my)\s+[a-z']+(?:\s+[a-z']+)?)\s+(?:to\s+)?"
-              r"(?:say|repeat|quote))")
+              r"(?:say|quote))")
 # "say that / it again", "repeat yourself" ask for JARVIS's last line: a
 # repeat request (with a marker after it, push-back), never a quoted line.
+# Bare "repeat <X>", "read out", "recite", "pronounce" and "say something /
+# anything" quote no words ("Repeat the last command, damn it!" is stress),
+# so they are not quote requests and are classified as before.
 _QUOTE_REQUEST_RE = re.compile(
     r"^" + _QUOTE_LEAD + _QUOTE_ASK
-    + r"\s+(?!(?:that|it|this|again|yourself|what|one more|once more)\b)\S")
+    + r"\s+(?!(?:that|it|this|again|yourself|what|one more|once more|"
+    r"something|anything)\b)\S")
 
 
 def is_quote_request(text) -> bool:
@@ -429,8 +436,19 @@ def detect_tone(user_text: str, prev_user_text: str | None = None,
     # response strategy differs; excited fires before stressed because both can
     # carry exclamation marks but excitement pairs them with positive markers
     # and no swearing / clipped-imperative pattern.
+    # Swear + urgency. With VOICE_MOOD_SWEAR_ALONE_STRESSED False (v3.0.10;
+    # live 2026-10-29 18:55:35 "I just want to say it, sir ... <swear>" came
+    # out frustrated -> mood stressed -> 15-min mute) the filler words "just",
+    # "now", "finally", "already" do not count with a swear ("holy <swear> it
+    # finally works" is joy): it needs a real urgency word or a clipped
+    # command (a swear with a '!' is 'stressed' below, the same mood).
+    # True = any _URGENCY_WORDS word, the old rule exactly.
+    if swear_alone_stressed():
+        swear_urgency = has_urgency
+    else:
+        swear_urgency = _has_any(_REAL_URGENCY_WORDS)
     if (has_repeat or similar_to_last or gated_pushback
-            or (has_swear and (has_urgency or is_clipped))):
+            or (has_swear and (swear_urgency or is_clipped))):
         return "frustrated"
 
     if (has_excited or exclaimed_positive) and not has_swear and not is_clipped:

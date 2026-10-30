@@ -328,7 +328,25 @@ class LoneSwearTests(unittest.TestCase):
     def test_swear_with_another_sign_still_counts(self):
         self.assertEqual(td.detect_tone("what the fuck is going on!"),
                          "stressed")
-        self.assertEqual(td.detect_tone("damn it, just do it"), "frustrated")
+        self.assertEqual(td.detect_tone("damn it, hurry up"), "frustrated")
+        self.assertEqual(td.detect_tone("damn it, just do it!"), "stressed")
+
+    def test_filler_urgency_with_a_swear_is_not_frustration(self):
+        # v3.0.10 review: "just" / "now" / "finally" / "already" are filler;
+        # live 2026-10-29 18:55:35 the first line came out frustrated.
+        from core.voice_emotion import route_voice_emotion
+        for text in ("I just want to say it, sir. Or if it's say shit.",
+                     "Holy shit it finally works", "I just love this shit",
+                     "now that is a damn good song",
+                     "damn, already done? nice"):
+            with self.subTest(text=text):
+                self.assertNotIn(td.detect_tone(text),
+                                 ("frustrated", "stressed"))
+                self.assertNotEqual(route_voice_emotion(text)["mood"],
+                                    "stressed")
+        with mock.patch("core.config.VOICE_MOOD_SWEAR_ALONE_STRESSED", True):
+            self.assertEqual(td.detect_tone("Holy shit it finally works"),
+                             "frustrated")
         self.assertEqual(td.detect_tone("stop it now!!"), "stressed")
 
     def test_old_rule_behind_the_flag(self):
@@ -355,9 +373,18 @@ class LoneSwearTests(unittest.TestCase):
     def test_not_a_quote_request(self):
         for text in ("say that again, you idiot", "say it again damn it",
                      "I said say it", "damn it, say something",
-                     "repeat yourself", "what did you say", ""):
+                     "repeat yourself", "what did you say", "",
+                     # v3.0.10 review: these quote no words
+                     "Repeat the last command, damn it!",
+                     "Read out the score, hurry up!",
+                     "recite the poem", "pronounce it for me",
+                     "Can you say something, damn it!"):
             with self.subTest(text=text):
                 self.assertFalse(td.is_quote_request(text))
+        self.assertEqual(td.detect_tone("Repeat the last command, damn it!"),
+                         "stressed")
+        self.assertEqual(td.detect_tone("Can you say something, damn it!"),
+                         "stressed")
         self.assertFalse(td.is_quote_request(None))
         self.assertEqual(td.detect_tone("say it again damn it"),
                          "frustrated")

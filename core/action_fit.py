@@ -674,11 +674,19 @@ def check_rule(user_text, name, arg="",
 # "is the server up?", "how's the print?", "check the printer" all run.
 _SERVER_TOPIC_RE = re.compile(
     r"\b(?:servers?|unraid|nas|array|plex|disks?|drives?|parity|"
-    r"rebuild(?:ing|s)?|tower|storage|home\s*lab)\b", re.I)
+    r"rebuild(?:ing|s)?|tower|storage|home\s*lab|"
+    # v3.0.10 review: what server_status reports (SSH, web front end, Plex,
+    # DNS) and the services on the box, so a clear ask is never refused.
+    r"dns|ssh|web\s*front(?:\s*end)?|services?|docker|containers?|vms?|"
+    r"nextcloud|adguard|backups?|mover|cache|ups|swap|uptime|space)\b", re.I)
 _PRINT_TOPIC_RE = re.compile(
     r"\b(?:print(?:s|er|ers|ing|ed)?|bambu|h2d|nozzle|bed|filament|layers?|"
     r"percent(?:age)?|done|finish(?:ed|es)?|left|long|eta|progress|"
-    r"remaining)\b|%", re.I)
+    r"remaining|"
+    # v3.0.10 review: "how much longer?", "how far along is it?", "how's
+    # the job going?", "is the plate ready?", "how's the engraving going".
+    r"longer|far\s+along|job|plate|laser|engrav\w*|ready|minutes?|hours?|"
+    r"time)\b|%", re.I)
 # action name -> (subject label for the log, the words that name it)
 TOPIC_ACTIONS = {
     "server_status": ("server", _SERVER_TOPIC_RE),

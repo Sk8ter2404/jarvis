@@ -38,9 +38,13 @@ class RouteTests(unittest.TestCase):
             "stressed")
 
     def test_lone_swear_is_casual_unless_old_rule(self):
-        self.assertEqual(
-            ve.route_voice_emotion("what the fuck is going on")["mood"],
-            "casual")
+        # NIGHT_QUIET_ENABLED off: run late in the evening, the clock alone
+        # would route to late_night (v3.0.10 review).
+        with mock.patch("core.config.NIGHT_QUIET_ENABLED", False,
+                        create=True):
+            self.assertEqual(
+                ve.route_voice_emotion("what the fuck is going on")["mood"],
+                "casual")
         with mock.patch("core.config.VOICE_MOOD_SWEAR_ALONE_STRESSED", True):
             self.assertEqual(
                 ve.route_voice_emotion("what the fuck is going on")["mood"],

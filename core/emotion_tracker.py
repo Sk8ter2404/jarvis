@@ -351,9 +351,19 @@ def classify_emotion(
     repeat_request = is_repeat_request(clean)
     # "Jarvis, say <X>" (v3.0.10, live 2026-10-29 18:54:35 and 18:55:16): the
     # words are the line to say, not his mood - the same as a repeat request.
+    # None of the quoted words count, excitement and tiredness included (the
+    # same as core.tone_detector.detect_tone): only the clock fallback at the
+    # end still applies.
     if (not repeat_request and quoted_words_ignored()
             and is_quote_request(clean)):
-        repeat_request = True
+        try:
+            if night_quiet_enabled():
+                hour = p.hour if p.hour is not None else _current_hour()
+                if _in_late_night_band(hour) and n_words <= 8:
+                    return _build("tired", f"time=late_night hour={hour}")
+        except Exception:
+            pass
+        return _EMPTY
     if repeat_request:
         frust_phrase = swear_phrase = stress_phrase = None
         clipped = False
