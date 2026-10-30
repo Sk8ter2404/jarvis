@@ -106,7 +106,7 @@ python tools/update_wizard.py          # --check to just look, --yes to skip the
 
 ## Testing
 
-JARVIS ships with a substantial test suite (**~25,000 tests** across 584 files,
+JARVIS ships with a substantial test suite (**~27,000 tests** across 690 files,
 stdlib `unittest`, no pytest) split into two tiers:
 
 ```powershell
