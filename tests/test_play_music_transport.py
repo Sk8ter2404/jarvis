@@ -155,6 +155,7 @@ class PlayMusicTransportTests(unittest.TestCase):
         self.search = self._patch(A, "_act_apple_music",
                                   return_value="streamed via apple music")
         self.said = self._patch(A, "_turn_said", return_value="")
+        self.offer = self._patch(A, "_turn_taken_offer", return_value="")
 
     def _patch(self, *a, **k):
         p = mock.patch.object(*a, **k)
@@ -232,6 +233,49 @@ class PlayMusicTransportTests(unittest.TestCase):
                 self.resume.assert_called_once_with()
         self.search.assert_not_called()
 
+    def test_an_accepted_song_offer_is_still_a_song(self):
+        # Cross-lane review 2026-10-29: "Yes." to "Shall I play Carry On for
+        # you, sir?" asks for that song; the offer he took counts as his
+        # words.
+        for said, offer, arg in (
+                ("Yes.", "Shall I play Carry On for you, sir?", "Carry On"),
+                ("Yes, go ahead.", "Shall I play Resume, sir?", "Resume"),
+                ("All right.", "Shall I put on Start Again now?",
+                 "Start Again"),
+                ("Yes.", "Shall I play Stop by the Spice Girls?", "Stop")):
+            with self.subTest(offer=offer):
+                self.said.return_value = said
+                self.offer.return_value = offer
+                self.search.reset_mock()
+                self.assertEqual(_quiet(A._act_play_music, arg),
+                                 "streamed via apple music")
+                self.search.assert_called_once_with(arg)
+        self.resume.assert_not_called()
+        self.pause.assert_not_called()
+
+    def test_an_accepted_transport_offer_is_still_a_transport(self):
+        for said, offer, arg in (
+                ("Yes.", "Shall I resume the movie?", "resume"),
+                ("Yes.", "Shall I play it for you, sir?", "it"),
+                ("Yes.", "Shall I play Carry On, the song you liked?",
+                 "Carry On"),
+                ("Yes.", "Shall I play something else, or resume?",
+                 "resume")):
+            with self.subTest(offer=offer):
+                self.said.return_value = said
+                self.offer.return_value = offer
+                self.resume.reset_mock()
+                self.assertEqual(_quiet(A._act_play_music, arg),
+                                 "Resumed Chrome, sir.")
+                self.resume.assert_called_once_with()
+        self.search.assert_not_called()
+
+    def test_a_raising_offer_reader_keeps_the_transport(self):
+        self.offer.side_effect = RuntimeError("boom")
+        self.assertEqual(_quiet(A._act_play_music, "resume"),
+                         "Resumed Chrome, sir.")
+        self.search.assert_not_called()
+
     def test_real_queries_still_search_apple_music(self):
         cases = {
             "Resume by Jenevieve": "Resume by Jenevieve",
@@ -278,6 +322,37 @@ class PlayMusicTransportTests(unittest.TestCase):
             os.path.abspath(__file__))), "core", "config.py")
         with open(path, encoding="utf-8") as f:
             self.assertIn("\nPLAY_MUSIC_TRANSPORT_WORDS = True\n", f.read())
+
+
+class TakenOfferReaderTests(unittest.TestCase):
+    def test_the_monolith_reader_and_its_failures(self):
+        bc = mock.Mock()
+        bc._turn_taken_offer_text.return_value = "Shall I play Resume?"
+        self.assertEqual(A._turn_taken_offer(bc), "Shall I play Resume?")
+        bc._turn_taken_offer_text.side_effect = RuntimeError("boom")
+        self.assertEqual(A._turn_taken_offer(bc), "")
+        bc._turn_taken_offer_text.side_effect = None
+        bc._turn_taken_offer_text.return_value = None
+        self.assertEqual(A._turn_taken_offer(bc), "")
+        with mock.patch.object(A, "_loaded_bc", return_value=None):
+            self.assertEqual(A._turn_taken_offer(), "")
+
+    def test_the_offer_tail(self):
+        for offer, arg, want in (
+                ("Shall I play Carry On for you, sir?", "Carry On", True),
+                ("Shall I play Resume, sir?", "Resume", True),
+                ("Shall I play Resume now?", "Resume", True),
+                ("Shall I play Stop by the Spice Girls?", "Stop", True),
+                ("Shall I resume the movie?", "resume", False),
+                ("Shall I play it?", "it", False),
+                ("Shall I play Carry On, the song you liked?", "Carry On",
+                 False)):
+            with self.subTest(offer=offer):
+                self.assertIs(A._said_play_title(offer, arg, offer=True),
+                              want)
+        # The owner's own words keep the old, stricter tail.
+        self.assertFalse(A._said_play_title(
+            "Shall I play Carry On for you, sir?", "Carry On"))
 
 
 class NothingToResumeTests(unittest.TestCase):

@@ -5116,41 +5116,84 @@ def _play_music_transport_on() -> bool:
         return False
 
 
-def _said_play_title(said: str, arg: str) -> bool:
+# What may follow the title in JARVIS's own offer ("Shall I play Carry On
+# for you, sir?", "Shall I play Resume now?"): courtesy words, then the end
+# of the line - or "by <artist>", "and ...", "or ..." (cross-lane review
+# 2026-10-29).
+_OFFER_TITLE_TAIL_RE = (
+    r"(?:\s+(?:by|from|and|or)\b"
+    r"|(?:\s+(?:for\s+you|for\s+sir|sir|now|again|instead|then|next"
+    r"|right\s+away|straight\s+away))*$)")
+
+
+def _said_play_title(said: str, arg: str, offer: bool = False) -> bool:
     """True when the owner's own words this turn were an explicit "play /
     put on / queue <the whole argument>" ("play Carry On", "play Stop by the
     Spice Girls"): a real song whose title is a transport word. A bare
-    "it" / "that" never counts ("play it" is a transport request). Never
-    raises (an error reads as False)."""
+    "it" / "that" never counts ("play it" is a transport request).
+    ``offer``: ``said`` is the offer the turn took ("Shall I play Carry On
+    for you, sir?"), so courtesy words may follow the title
+    (_OFFER_TITLE_TAIL_RE). Never raises (an error reads as False)."""
     try:
         from core.dispatcher import _transport_norm
         norm_arg = _transport_norm(arg)
         norm_said = _transport_norm(said)
         if not norm_arg or not norm_said or norm_arg in ("it", "that"):
             return False
+        tail = (_OFFER_TITLE_TAIL_RE if offer
+                else r"(?:\s+(?:by|from)\b|$|\s+and\b)")
         return bool(re.search(
             r"\b(?:play|put\s+on|queue(?:\s+up)?)\s+" + re.escape(norm_arg)
-            + r"(?:\s+(?:by|from)\b|$|\s+and\b)", norm_said))
+            + tail, norm_said))
     except Exception:
         return False
 
 
-def _play_music_transport_op(arg: str) -> "str | None":
+def _turn_taken_offer(bc=None) -> str:
+    """The words of JARVIS's offer this owner turn took
+    (bobert_companion._turn_taken_offer_text: a clear yes, or an affirmative
+    acknowledgement while it was open); '' outside one or without the
+    monolith. Never raises."""
+    try:
+        bc = bc if bc is not None else _loaded_bc()
+        fn = getattr(bc, "_turn_taken_offer_text", None) if bc else None
+        offer = fn() if callable(fn) else ""
+        return offer if isinstance(offer, str) else ""
+    except Exception:
+        return ""
+
+
+def _play_music_transport_op(arg: str, log: bool = True) -> "str | None":
     """'resume' / 'pause' / 'next' when PLAY_MUSIC_TRANSPORT_WORDS is on and
     the whole play_music argument is only a transport request
     (core.dispatcher.transport_arg_op), unless the owner's words this turn
     were "play <that argument>" (a song titled "Carry On" / "Stop" is still
-    a song, review 2026-10-29); else None (the song search, exactly as
-    before). Never raises."""
+    a song, review 2026-10-29) or the offer this turn took was (cross-lane
+    review 2026-10-29: "Yes." to "Shall I play Carry On for you, sir?" asks
+    for that song); else None (the song search, exactly as before).
+    ``log`` False keeps it quiet (the action-fit check asks too). Never
+    raises."""
     try:
         if not _play_music_transport_on():
             return None
         from core.dispatcher import transport_arg_op
         op = transport_arg_op(arg)
         if op is not None and _said_play_title(_turn_said(), arg):
-            print("  [play_music] the owner asked for this title by name "
-                  "-> the song search")
+            if log:
+                print("  [play_music] the owner asked for this title by "
+                      "name -> the song search")
             return None
+        if op is not None:
+            try:
+                offered = _said_play_title(_turn_taken_offer(), arg,
+                                           offer=True)
+            except Exception:
+                offered = False
+            if offered:
+                if log:
+                    print("  [play_music] the offer sir took named this "
+                          "title -> the song search")
+                return None
         return op
     except Exception:
         return None

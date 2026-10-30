@@ -44275,6 +44275,29 @@ def _self_change_promise_apply(cleaned: str) -> str:
         return cleaned
 
 
+_ACTION_FIT_TRANSPORT_CANON = {
+    "resume": "resume_music", "pause": "pause_music", "next": "next_song"}
+
+
+def _action_fit_canonical_pair(name, arg) -> tuple:
+    """(name, arg) as action-fit rule 7 compares it: play_music (or a name
+    bound to the same handler) whose whole argument is only a transport
+    request (core.actions._play_music_transport_op - PLAY_MUSIC_TRANSPORT_
+    WORDS on, and not "play <that title>" in sir's words or the offer he
+    took) is the transport action its handler runs: ("resume_music" /
+    "pause_music" / "next_song", ""). Anything else is (name, arg)
+    unchanged. May raise; _action_fit_refusal then uses the raw pairs."""
+    nm = str(name or "").strip().lower()
+    if nm != "play_music":
+        fn = ACTIONS.get(nm)
+        if fn is None or fn is not ACTIONS.get("play_music"):
+            return name, arg
+    from core import actions as _ca_fit
+    op = _ca_fit._play_music_transport_op(str(arg or "").strip(), log=False)
+    canon = _ACTION_FIT_TRANSPORT_CANON.get(op or "")
+    return (canon, "") if canon else (name, arg)
+
+
 def _action_fit_refusal(name: str, arg: str, reply_names=()) -> "str | None":
     """The 'on'-mode failure result for an action that misfits the owner's
     words this turn, else None. 'shadow' logs "[action-fit] would block"
@@ -44295,8 +44318,22 @@ def _action_fit_refusal(name: str, arg: str, reply_names=()) -> "str | None":
             return None
         robot_on = _action_fit_flag("ACTION_FIT_ROBOT_SPEAK_ENFORCE")
         ack_on = _action_fit_flag("ACTION_FIT_ACK_REPEAT_ENFORCE")
+        prior = _action_fit_prior_actions()
+        fit_name, fit_arg = name, arg
+        if ack_on:
+            # Rule 7 compares what RUNS (cross-lane review 2026-10-29):
+            # [ACTION: play_music, pause] after a routed pause_music is the
+            # same pause again. Only the check sees the canonical pairs.
+            try:
+                c_name, c_arg = _action_fit_canonical_pair(name, arg)
+                c_prior = [_action_fit_canonical_pair(n, a)
+                           for n, a in prior]
+                fit_name, fit_arg, prior = c_name, c_arg, c_prior
+            except Exception as _e:
+                print(f"  [action-fit] canonical pair failed: "
+                      f"{type(_e).__name__} - the raw pairs")
         rule, reason = _action_fit.check_rule(
-            user_text, name, arg, _action_fit_prior_actions(), reply_names,
+            user_text, fit_name, fit_arg, prior, reply_names,
             robot_speaker=robot_on, ack_repeat=ack_on,
             accepted_offer=ack_on and _turn_accepted_offer(),
             offer_open=ack_on and _turn_offer_open(),
