@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.9 (2026-10-29)
+
+Fixes from tonight's live log, while you watched a movie. 'Jarvis, say X' is now said by JARVIS himself. The robot speaks only when you name it or ask him to talk ('have the bot say hi', 'make him talk'), and that rule is enforced, not just logged. 'All right' or 'No, not right now' never re-runs the last action, and a stray 'On it' after a no is dropped instead of starting a second round. When JARVIS is about to promise a change to how he works ('I'll build in a pause'), he now says he can't change that himself and notes it for Claude. 'Resume the movie' resumes it; it used to search Apple Music for a song called Resume. A song you name ('play Carry On') still plays. MakerWorld, Printables, Thingiverse and Cults open by name. A yes to 'search for it?' runs one search, and a browser task only runs on top when you asked for the page to be read. 'How much longer on my print?' gives the time left and says finished when it is, and the printer is asked for a full status as soon as JARVIS connects. With the robot skill update that loads at the same restart, JARVIS waits for the robot to finish its line before he speaks.
+
 ## v3.0.8 (2026-10-28)
 
 Faster answers and fewer freezes, from tonight's live checks. 'What's new' says the version and reads the summary once, without a second model round. 'What can you do' names seven skills and offers the rest. Web-browsing tasks run in the background: JARVIS says 'Working on it, sir', stays free to talk, and tells you the result when it is done ('stop' or 'never mind' cancels it). The morning briefing says 'sir' once, and 'I'll hand it to Claude' after a question refers back to that question. A cheaper at-desk face detector runs side by side with the current one and only logs how often they agree, so it can be switched on once it proves itself. A Kinect ghost-skeleton filter and a switch to keep the Claude safety net after November 5 are built but off by default.
