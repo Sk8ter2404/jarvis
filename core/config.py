@@ -1777,6 +1777,19 @@ CAPABILITIES_SHORT_OVERVIEW = True
 # browser agent still uses paid Claude calls either way. False: wait for the
 # result as before. Read live.
 BROWSER_TASK_BACKGROUND = True
+# PLAY_MUSIC_TRANSPORT_WORDS (bool, v3.0.9, core/actions._act_play_music +
+# core/dispatcher.video_transport_route) - live 2026-10-29 19:12 "Jarvis
+# Resume movie." with a movie paused in Chrome: the brain chose play_music,
+# resume; Apple Music opened a song called "Resume", 45 s went by and the
+# movie stayed paused. True (default): a play_music argument that is only a
+# transport word ("resume", "continue the movie", "unpause it", "play",
+# "pause", "stop") runs resume_music / pause_music (the Windows media session
+# first) and speaks that handler's own line - never a search for the word; a
+# whole "resume / unpause / continue the movie / video / show / episode /
+# film" (or "pause the movie") goes straight to resume_music / pause_music
+# with no brain round. A real query ("Resume by <artist>", "song:Resume")
+# is still a search. False: the old path exactly. Read live.
+PLAY_MUSIC_TRANSPORT_WORDS = True
 
 # ─── Routing fixes (v3.0.6, 2026-10-28 human test + misroutes report) ─────
 # TIMER_LABEL_GROUNDING (skills/timer.py grounded_label): live 2026-10-28

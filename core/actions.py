@@ -5029,6 +5029,21 @@ def _act_latency_benchmark(_: str = "") -> str:
 
 # ─── Music: iTunes search-and-play with browser-Apple-Music routing (Phase 4H) ──
 
+def _play_music_transport_op(arg: str) -> "str | None":
+    """'resume' / 'pause' when PLAY_MUSIC_TRANSPORT_WORDS is on and the whole
+    play_music argument is only a transport request
+    (core.dispatcher.transport_arg_op); else None (the song search, exactly
+    as before). Never raises."""
+    try:
+        from core import config as _cfg
+        if not bool(getattr(_cfg, "PLAY_MUSIC_TRANSPORT_WORDS", True)):
+            return None
+        from core.dispatcher import transport_arg_op
+        return transport_arg_op(arg)
+    except Exception:
+        return None
+
+
 def _act_play_music(args: str) -> str:
     """Play a song / artist / album by name.
 
@@ -5051,6 +5066,19 @@ def _act_play_music(args: str) -> str:
     stripped = args.strip()
     if not stripped:
         return "format: play_music, <song/artist/album name>"
+
+    # A transport word is not a song (v3.0.9, PLAY_MUSIC_TRANSPORT_WORDS):
+    # live 2026-10-29 19:12 "Resume movie." became play_music, resume, which
+    # opened a song called "Resume" and left the paused movie paused. Only
+    # the WHOLE argument counts; the handler's own line is the answer (never
+    # a fallback search for the word).
+    op = _play_music_transport_op(stripped)
+    if op == "resume":
+        print("  [play_music] a transport word, not a song -> resume_music")
+        return _act_resume_music()
+    if op == "pause":
+        print("  [play_music] a transport word, not a song -> pause_music")
+        return _act_pause_music()
 
     # `library:` used to FORCE the local iTunes library. That library is gone,
     # so say so honestly, strip the prefix, and stream it via Apple Music.

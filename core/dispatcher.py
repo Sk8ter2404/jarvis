@@ -22,6 +22,7 @@ Public API:
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
@@ -257,6 +258,91 @@ def close_front_tab_route(utterance) -> bool:
         return bool(_CLOSE_TAB_RE.match(s))
     except Exception:
         return False
+
+
+# ── Transport words are not a song (v3.0.9, PLAY_MUSIC_TRANSPORT_WORDS) ───
+# Live 2026-10-29 19:12 "Jarvis Resume movie." while a movie sat paused in
+# Chrome: the brain wrote [ACTION: play_music, resume], play_music searched
+# Apple Music for "resume", opened a song called "Resume" and spent 45 s
+# failing to confirm it; the movie stayed paused. Two pure checks:
+#   * transport_arg_op(arg): a play_music ARGUMENT that is only a transport
+#     request ("resume", "continue the movie", "unpause it", "pause") ->
+#     'resume' / 'pause'; core.actions._act_play_music then runs
+#     resume_music / pause_music (the Windows media session first);
+#   * video_transport_route(utterance): a WHOLE "resume / unpause / continue
+#     the movie / video / show / episode / film" (or "pause the movie") ->
+#     [ACTION: resume_music] / [ACTION: pause_music], so the brain is not
+#     asked at all. Music words stay with the brain (it gets those right).
+# A real query ("Resume by <artist>", "song:Resume", "play Earth Song",
+# "continue by <artist>") matches neither. The switch lives with the callers.
+_TRANSPORT_FILLER = r"(?:please|sir|jarvis|(?:hey|ok|okay)\s+jarvis)"
+_TRANSPORT_RESUME_VERB = (
+    r"(?:resume(?:\s+playing)?|un-?\s?pause|play|start\s+again|"
+    r"keep\s+playing|(?:continue|carry\s+on)(?:\s+(?:with|playing))?)")
+_TRANSPORT_PAUSE_VERB = r"(?:pause|stop)"
+_TRANSPORT_OBJECT = (
+    r"(?:(?:the|my|this)\s+)?"
+    r"(?:movie|video|show|episode|film|music|song|track|playback|media|"
+    r"audio|stream)|it|that")
+_TRANSPORT_ARG_RE = re.compile(
+    r"^(?:" + _TRANSPORT_FILLER + r"\s+)*"
+    r"(?:(?P<resume>" + _TRANSPORT_RESUME_VERB + r")"
+    r"|(?P<pause>" + _TRANSPORT_PAUSE_VERB + r"))"
+    r"(?:\s+(?:" + _TRANSPORT_OBJECT + r"))?"
+    r"(?:\s+" + _TRANSPORT_FILLER + r")*$")
+# The route: video words only, and no bare "play" / "stop" ("play the movie
+# <title>" is a request, "stop the movie" may mean close it).
+_VIDEO_NOUN = (r"(?:(?:the|my|this)\s+)?"
+               r"(?:movie|video|show|episode|film)")
+_VIDEO_TRANSPORT_RE = re.compile(
+    r"^(?:(?P<resume>resume|un-?\s?pause|continue(?:\s+with)?|"
+    r"carry\s+on\s+with|keep\s+playing)"
+    r"|(?P<pause>pause))\s+" + _VIDEO_NOUN
+    + r"(?:\s+(?:please|sir|now))*$")
+
+
+def _transport_norm(text) -> str:
+    """Lower case, accents off ("resumé" -> "resume"), sentence punctuation
+    and extra spaces gone. A field colon ("song:") stays."""
+    s = unicodedata.normalize("NFKD", str(text or ""))
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = s.replace("’", "'").lower()
+    s = re.sub(r"[.,!?;]+", " ", s)
+    return " ".join(s.split())
+
+
+def transport_arg_op(arg) -> str | None:
+    """'resume' / 'pause' when the WHOLE play_music argument is only a
+    transport request, else None (a song query). Never raises."""
+    try:
+        if not isinstance(arg, str):
+            return None
+        m = _TRANSPORT_ARG_RE.match(_transport_norm(arg))
+        if not m:
+            return None
+        return "resume" if m.group("resume") else "pause"
+    except Exception:
+        return None
+
+
+def video_transport_route(utterance) -> str | None:
+    """``"[ACTION: resume_music]"`` / ``"[ACTION: pause_music]"`` for a WHOLE
+    "resume / unpause / continue the movie / video / show / episode / film"
+    or "pause the movie" (a leading wake word / "can you" / "please"
+    included), else None. Never raises."""
+    try:
+        if not isinstance(utterance, str) or not utterance.strip():
+            return None
+        s = _transport_norm(utterance)
+        s = _YT_WAKE_LEAD_RE.sub("", s, count=1)
+        s = " ".join(_strip_lead_filler(s).split())
+        m = _VIDEO_TRANSPORT_RE.match(s)
+        if not m:
+            return None
+        return ("[ACTION: resume_music]" if m.group("resume")
+                else "[ACTION: pause_music]")
+    except Exception:
+        return None
 
 
 # ── Screen routes (2026-10-05) ────────────────────────────────────────────

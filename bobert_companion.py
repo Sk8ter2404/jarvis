@@ -17936,6 +17936,7 @@ _TURN_FLAG_KEYS = (
     "LOOP_GUARD_MODE",
     "CHAIN_PROMISE_CHECK",
     "NOTE_CLAIM_CHECK",
+    "PLAY_MUSIC_TRANSPORT_WORDS",
 )
 
 
@@ -22998,6 +22999,21 @@ _LOCAL_NEVER_GUESS_GUARD = (
 )
 
 
+def _play_music_transport_hint() -> str:
+    """The one line under play_music in the local cheat sheet (v3.0.9,
+    PLAY_MUSIC_TRANSPORT_WORDS): live 2026-10-29 19:12 "Resume movie." was
+    written as play_music, resume. "" with the flag off (the old sheet
+    exactly). Read when the sheet is built (it is cached). Never raises."""
+    try:
+        import core.config as _cfg_pm
+        if not bool(getattr(_cfg_pm, "PLAY_MUSIC_TRANSPORT_WORDS", True)):
+            return ""
+    except Exception:
+        return ""
+    return ("      resume / pause / next are resume_music / pause_music / "
+            "next_song, never play_music\n")
+
+
 def _local_cheatsheet() -> str:
     """A COMPACT action reference that REPLACES the ~18k-token PC_CONTROL_PROMPT
     for local-model calls.
@@ -23030,6 +23046,7 @@ def _local_cheatsheet() -> str:
         + _LOCAL_NEVER_GUESS_GUARD +
         "\nMost-used actions (classic iTunes is GONE — the Apple Music app + music.apple.com are the player):\n"
         "  [ACTION: play_music, <artist/song/album>]   play a song/artist/album on Apple Music (music.apple.com)\n"
+        + _play_music_transport_hint() +
         "  [ACTION: play_playlist, <name>]   play ANY named playlist — streams it via Apple Music ('shuffle ' prefix shuffles). Use this for every 'play my/the <name> playlist', NOT apple_music.\n"
         "  [ACTION: list_playlists]   (points sir to the Apple Music app)   [ACTION: shuffle_library]   shuffle music via Apple Music\n"
         "  [ACTION: open_apple_music]   open Apple Music (the web player)   [ACTION: music_status]   is Apple Music open / what's playing\n"
@@ -36967,6 +36984,26 @@ def _screen_route_reply(text: str) -> "str | None":
     return tok
 
 
+def _video_transport_route_reply(text: str) -> "str | None":
+    """The resume_music / pause_music token core.dispatcher.
+    video_transport_route claims ``text`` with, when PLAY_MUSIC_TRANSPORT_
+    WORDS is on (read live from core.config) and the action is registered;
+    else None. Never raises."""
+    try:
+        import core.config as _cfg_vt
+        if not bool(getattr(_cfg_vt, "PLAY_MUSIC_TRANSPORT_WORDS", True)):
+            return None
+        from core.dispatcher import video_transport_route as _vt_route
+        tok = _vt_route(text)
+    except Exception:
+        return None
+    m = _ROUTE_TOKEN_RE.match(tok) if tok else None
+    if not m or m.group(1) not in ACTIONS:
+        return None
+    print(f"  [route] video transport -> {m.group(1)}")
+    return tok
+
+
 def _utterance_route_reply(text: str) -> "str | None":
     """The action token a registered route claims ``text`` with, or None.
     Never raises; a failing or malformed route is logged and skipped.
@@ -37012,6 +37049,14 @@ def _utterance_route_reply(text: str) -> "str | None":
     if _yt_tok:
         print("  [route] play on YouTube -> youtube_play")
         return _yt_tok
+    # BUILT-IN route (v3.0.9, PLAY_MUSIC_TRANSPORT_WORDS): a whole "resume /
+    # continue the movie / video / show" or "pause the movie" -> resume_music
+    # / pause_music (core.dispatcher.video_transport_route). Live 2026-10-29
+    # 19:12 "Jarvis Resume movie." became play_music, resume: a song called
+    # "Resume" opened and the paused movie stayed paused.
+    _vt_tok = _video_transport_route_reply(text)
+    if _vt_tok:
+        return _vt_tok
     # "Play my song from earlier" (live 2026-10-26 20:08: the brain played a
     # track literally titled "Earlier"): the last media request, replayed.
     try:
