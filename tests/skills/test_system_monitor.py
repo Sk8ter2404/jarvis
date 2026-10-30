@@ -697,7 +697,9 @@ class SystemMonitorRamEscalationTests(unittest.TestCase):
                             ("RAM_ALERT_NAME_USERS", True),
                             ("RAM_REALERT_RISE_PTS", 3.0),
                             ("RAM_REARM_BELOW_PCT", 85.0),
-                            ("RAM_ALERT_BOOT_QUIET_S", 600)):
+                            ("RAM_ALERT_BOOT_QUIET_S", 600),
+                            ("RAM_REARM_HOLD_S", 900),
+                            ("RAM_REALERT_CRITICAL_PCT", 98.0)):
             p = mock.patch.object(cfg, name, value, create=True)
             p.start()
             self.addCleanup(p.stop)
@@ -735,7 +737,68 @@ class SystemMonitorRamEscalationTests(unittest.TestCase):
         self.assertEqual(self._run([91, 92, 93]), [91])
 
     def test_falling_below_the_rearm_line_rearms(self):
+        # Two readings under 85 an hour apart: a sustained stay re-arms.
+        self.assertEqual(self._run([91, 84, 84, 91]), [91, 91])
+
+    def test_one_dip_under_the_rearm_line_does_not_rearm(self):
+        # v3.0.10 review: the live hourly bump dips to 84.7 % right after it
+        # peaks; one reading under 85 is no re-arm (RAM_REARM_HOLD_S).
+        t = 1_700_000_000.0
+        self.assertTrue(self.mod._ram_should_alert(91.0, t))
+        self.mod._last_ram_alert_at[0] = t
+        self.assertFalse(self.mod._ram_should_alert(84.7, t + 700))
+        self.assertFalse(self.mod._ram_should_alert(91.0, t + 1400))
+        self.assertEqual(self.mod._ram_last_spoken_pct[0], 91.0)
+
+    def test_rearm_hold_zero_rearms_on_the_first_dip(self):
+        self.cfg.RAM_REARM_HOLD_S = 0
         self.assertEqual(self._run([91, 84, 91]), [91, 91])
+
+    def test_a_flap_every_five_minutes_is_at_most_one_an_hour(self):
+        # v3.0.10 review (sim_ram.py): 84 <-> 91 every 5 min for 2 h gave
+        # 12 alerts; 3.0.9 gave 2.
+        seq = [91.0 if i % 2 == 0 else 84.0 for i in range(24)]
+        self.assertLessEqual(len(self._run(seq, gap=300)), 2)
+
+    def test_a_rearmed_alert_waits_out_the_hour_from_the_last_alert(self):
+        t0 = 1_700_000_000.0
+        self.assertTrue(self.mod._ram_should_alert(91.0, t0))
+        self.mod._last_ram_alert_at[0] = t0
+        self.mod._ram_should_alert(89.0, t0 + 600)      # latched: holds
+        self.mod._ram_should_alert(84.0, t0 + 1200)
+        self.mod._ram_should_alert(84.0, t0 + 2200)     # re-armed
+        self.assertIsNone(self.mod._ram_last_spoken_pct[0])
+        self.assertEqual(self.pulse._last_abnormal_alert["ram"], t0)
+        self.assertFalse(self.mod._ram_should_alert(91.0, t0 + 2400))
+        self.assertTrue(self.mod._ram_should_alert(91.0, t0 + 3700))
+
+    def test_a_pulse_line_spoken_first_latches_the_monitor(self):
+        # v3.0.10 review: the pulse spoke at its 88 %; the monitor's claim
+        # fails, and it latches so the pulse's next hourly line is held too.
+        t = 1_700_000_000.0
+        self.pulse._last_abnormal_alert["ram"] = t - 100
+        self.assertFalse(self.mod._ram_should_alert(92.0, t))
+        self.assertEqual(self.mod._ram_last_spoken_pct[0], 92.0)
+        self.mod._ram_should_alert(89.0, t + self.HOUR)
+        self.assertEqual(self.pulse._last_abnormal_alert["ram"],
+                         t + self.HOUR)
+
+    def test_live_96_6_then_98_6_speaks_the_critical_tier_once(self):
+        # Live 2026-10-29 20:09 96.6 %, then 98.6 / 98.9 / 99.2 % to 20:19.
+        t = 1_700_000_000.0
+        self.assertTrue(self.mod._ram_should_alert(96.6, t))
+        self.mod._last_ram_alert_at[0] = t
+        self.assertTrue(self.mod._ram_should_alert(98.6, t + 300))
+        self.mod._last_ram_alert_at[0] = t + 300
+        self.assertFalse(self.mod._ram_should_alert(98.9, t + 420))
+        self.assertFalse(self.mod._ram_should_alert(99.2, t + 900))
+
+    def test_critical_tier_off(self):
+        self.cfg.RAM_REALERT_CRITICAL_PCT = 0
+        t = 1_700_000_000.0
+        self.assertTrue(self.mod._ram_should_alert(96.6, t))
+        self.mod._last_ram_alert_at[0] = t
+        self.assertFalse(self.mod._ram_should_alert(98.6, t + 300))
 
     def test_the_rise_still_waits_out_the_ten_minute_cooldown(self):
         self.assertEqual(self._run([91, 96], gap=60), [91])
@@ -747,7 +810,7 @@ class SystemMonitorRamEscalationTests(unittest.TestCase):
         self.assertEqual(self.pulse._last_abnormal_alert["ram"], t)
 
     def test_its_own_hold_stamp_does_not_block_its_next_claim(self):
-        self._run([91, 84])              # alerted, then re-armed
+        # A hold stamp left while armed (the boot quiet's) is no claim.
         self.mod._hold_shared_ram_slot(1_700_000_000.0 + 2.5 * self.HOUR)
         t = 1_700_000_000.0 + 2.6 * self.HOUR
         self.assertTrue(self.mod._ram_should_alert(91.0, t))
@@ -798,6 +861,22 @@ class SystemMonitorRamEscalationTests(unittest.TestCase):
         enq = self._loop([95.0, 95.0], [base, base + 130, base + 300])
         enq.assert_not_called()
         self.assertEqual(self.pulse._last_abnormal_alert["ram"], base + 300)
+
+    def test_boot_quiet_holds_the_pulse_only_while_high(self):
+        # v3.0.10 review: under the pulse's 88 % nothing is stamped.
+        base = 1_700_000_000.0
+        self._loop([80.0], [base, base + 300])
+        self.assertNotIn("ram", self.pulse._last_abnormal_alert)
+
+    def test_the_boot_quiet_gives_the_pulse_its_stamp_back(self):
+        # v3.0.10 review: the quiet stamped the pulse's slot every poll, so
+        # its hourly cooldown ran ~70 min from boot; the old stamp is back
+        # once the quiet ends.
+        base = 1_700_000_000.0
+        self.pulse._last_abnormal_alert["ram"] = base - 2 * self.HOUR
+        self._loop([89.0, 89.0], [base, base + 300, base + 700])
+        self.assertEqual(self.pulse._last_abnormal_alert["ram"],
+                         base - 2 * self.HOUR)
 
     def test_after_the_boot_quiet_it_alerts(self):
         base = 1_700_000_000.0

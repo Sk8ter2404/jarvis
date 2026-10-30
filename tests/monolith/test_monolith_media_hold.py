@@ -45,8 +45,11 @@ class _MediaBase(_Base):
         self._p(self.bc, "MEDIA_HOLD_ENABLED", True, create=True)
         self._p(self.bc, "MEDIA_HOLD_LINGER_S", 30, create=True)
         self._p(self.bc, "MEDIA_HOLD_MAX_S", 1800, create=True)
+        self._p(self.bc, "MEDIA_HOLD_SIGNAL_CACHE_S", 0, create=True)
+        self._p(self.bc, "MEDIA_HOLD_PASS_ASKED", True, create=True)
         self._cell("_media_hold_seen_at", 0.0)
         self._cell("_media_hold_since", 0.0)
+        self._cell("_media_hold_signal_cache", 0.0)
 
     def _stop_video(self, after_s=None):
         self.video[0] = False
@@ -96,9 +99,13 @@ class MovieTests(_MediaBase):
         self._write([self._e(OFFER, "anticipation")])
         self._drain()
         self.assertEqual(self.spoke, [])
-        self.mono[0] += self.bc.MEDIA_HOLD_MAX_S + 1
-        self._owner_spoke(60)
-        self._drain()
+        # The drain asks on every pass while a line is held (v3.0.10 review:
+        # a gap with no asks starts a new hold).
+        step = 25
+        for _ in range(self.bc.MEDIA_HOLD_MAX_S // step + 1):
+            self.mono[0] += step
+            self._owner_spoke(60)
+            self._drain()
         self.assertEqual(self.spoke, [OFFER], "the cap released the line")
         # Still the same show: a new line is spoken (the hold is spent)...
         self._write([self._e(CREDITS, "credits")])
@@ -113,6 +120,55 @@ class MovieTests(_MediaBase):
         self.mono[0] += 1
         self._drain()
         self.assertEqual(self.spoke, [OFFER, CREDITS])
+
+    def test_a_later_video_after_a_gap_with_no_checks_is_held(self):
+        # v3.0.10 review (sim_media.py): video A held a line, the queue then
+        # emptied (he walked away, a cap release), so no drain asked for an
+        # hour; video B's line was never held because the hold's start was
+        # still video A's.
+        self._write([self._e(OFFER, "anticipation")])
+        self._drain()
+        self.assertEqual(self.spoke, [])
+        self._write([])
+        self.mono[0] += 3600
+        self._owner_spoke(60)
+        self._write([self._e(CREDITS, "credits")])
+        _, log = self._drain()
+        self.assertEqual(self.spoke, [], "spoken over video B")
+
+    def test_a_result_he_asked_for_speaks_through_the_hold(self):
+        # v3.0.10 review: "find the cheapest flight" ran in the background,
+        # he started a video; the browser result used to wait 30 min and
+        # come out as a recap fragment.
+        asked = dict(self._e("I found three flights, sir.", "browser"),
+                     history_text="I found three flights: ...")
+        self._write([self._e(CREDITS, "credits"), asked])
+        self._drain()
+        self.assertEqual(self.spoke, ["I found three flights, sir."])
+        self.assertEqual([e["source"] for e in self._read()], ["credits"])
+
+    def test_pass_asked_off_holds_the_result_too(self):
+        self._p(self.bc, "MEDIA_HOLD_PASS_ASKED", False)
+        asked = dict(self._e("I found three flights, sir.", "browser"),
+                     history_text="I found three flights: ...")
+        self._write([asked])
+        self._drain()
+        self.assertEqual(self.spoke, [])
+
+    def test_the_signal_is_cached_between_drain_passes(self):
+        # v3.0.10 review: each read can be a synchronous media-session
+        # refresh; a held line made every drain pass read it.
+        self._p(self.bc, "MEDIA_HOLD_SIGNAL_CACHE_S", 5)
+        sig = self._p(self.bc, "_media_hold_signal", return_value=True)
+        self._write([self._e(OFFER, "anticipation")])
+        self._drain()
+        self.mono[0] += 2
+        self._drain()
+        self.assertEqual(sig.call_count, 1)
+        self.mono[0] += 5
+        self._drain()
+        self.assertEqual(sig.call_count, 2)
+        self.assertEqual(self.spoke, [])
 
     def test_kill_switch_is_the_3_0_9_drain(self):
         self._p(self.bc, "MEDIA_HOLD_ENABLED", False)
@@ -134,6 +190,70 @@ class MovieTests(_MediaBase):
         self._write([self._e(OFFER, "anticipation")])
         self._drain()
         self.assertEqual(self.spoke, [OFFER])
+
+
+@requires_monolith
+class ArrivalQuietTests(MonolithGlobalsTestCase):
+    """v3.0.10 review (ARRIVAL_QUIET_ALL_MOMENTS): inside the quiet period
+    after the arrival briefing, the other moment-lines are not queued and
+    no spontaneous remark starts. The real proactive_announce, its queue
+    file in a temp dir."""
+
+    def setUp(self):
+        import os
+        import tempfile
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, tmp, True)
+        self.path = os.path.join(tmp, "pending_speech.json")
+        self._p(self.bc, "__file__", os.path.join(tmp, "bobert_companion.py"))
+        self._p(self.bc, "focus_mode_active", return_value=False)
+        self._p(self.bc, "ARRIVAL_QUIET_ALL_MOMENTS", True, create=True)
+        import core.arrival_quiet as aq
+        self.quiet = [True]
+        self._p(aq, "arrival_quiet_active",
+                side_effect=lambda now=None: self.quiet[0])
+
+    def _p(self, *args, **kwargs):
+        patcher = mock.patch.object(*args, **kwargs)
+        m = patcher.start()
+        self.addCleanup(patcher.stop)
+        return m
+
+    def _queued(self):
+        import json
+        import os
+        if not os.path.exists(self.path):
+            return []
+        with open(self.path, encoding="utf-8") as f:
+            return [e["source"] for e in json.load(f)]
+
+    def test_a_wellness_nudge_is_not_queued_behind_the_briefing(self):
+        self.assertFalse(self.bc.proactive_announce(
+            "Hydration, perhaps, sir?", source="wellness"))
+        self.assertEqual(self._queued(), [])
+
+    def test_status_and_urgent_lines_are_still_queued(self):
+        self.assertTrue(self.bc.proactive_announce(CREDITS, source="credits"))
+        self.assertTrue(self.bc.proactive_announce(
+            "Posture, sir.", source="posture", urgent=True))
+        self.assertEqual(self._queued(), ["credits", "posture"])
+
+    def test_after_the_quiet_it_is_queued(self):
+        self.quiet[0] = False
+        self.assertTrue(self.bc.proactive_announce(
+            "Hydration, perhaps, sir?", source="wellness"))
+        self.assertEqual(self._queued(), ["wellness"])
+
+    def test_switch_off_is_the_first_rule(self):
+        self._p(self.bc, "ARRIVAL_QUIET_ALL_MOMENTS", False)
+        self.assertTrue(self.bc.proactive_announce(
+            "Hydration, perhaps, sir?", source="wellness"))
+        self.assertEqual(self._queued(), ["wellness"])
+
+    def test_no_spontaneous_remark_inside_the_quiet(self):
+        self._p(self.bc, "PROACTIVE_ENABLED", True)
+        self._p(self.bc, "_game_quiet_active", return_value=False)
+        self.assertFalse(self.bc.should_be_proactive())
 
 
 @requires_monolith
@@ -183,6 +303,48 @@ class SignalTests(MonolithGlobalsTestCase):
         tv = mock.MagicMock()
         tv.is_tv_on.return_value = True
         sys.modules["skill_tv_detect"] = tv
+        self.assertTrue(self._sig())
+
+    def _tv(self, calibrated):
+        tv = mock.MagicMock()
+        tv.is_tv_on.return_value = True
+        if calibrated is None:
+            tv._store.return_value = None
+        else:
+            tv._store.return_value.is_calibrated.return_value = calibrated
+        sys.modules["skill_tv_detect"] = tv
+
+    def test_an_uncalibrated_tv_detector_does_not_count(self):
+        # v3.0.10 review: no data/tv_region.json live; the whole-view
+        # detector turned ON 123 times while he worked at the desk.
+        self._p(self.bc, "MEDIA_HOLD_TV_NEEDS_REGION", True, create=True)
+        self._tv(False)
+        self.assertFalse(self._sig())
+        self._tv(None)
+        self.assertFalse(self._sig())
+        self._tv(True)
+        self.assertTrue(self._sig())
+
+    def test_tv_needs_region_off_counts_it_uncalibrated(self):
+        self._p(self.bc, "MEDIA_HOLD_TV_NEEDS_REGION", False, create=True)
+        self._tv(False)
+        self.assertTrue(self._sig())
+
+    def test_a_song_in_any_player_is_music(self):
+        # v3.0.10 review: Groove / Amazon Music read as "Media Player".
+        self._p(self.bc, "MEDIA_HOLD_ALBUM_IS_MUSIC", True, create=True)
+        for app in ("Media Player", "VLC", "TIDAL"):
+            self.snap[0] = {"app": app, "title": "Song", "artist": "Band",
+                            "album": "Record", "playing": True}
+            self.assertFalse(self._sig(), app)
+        self.snap[0] = {"app": "VLC", "title": "Film", "artist": "",
+                        "album": "", "playing": True}
+        self.assertTrue(self._sig())
+
+    def test_album_is_music_off_is_the_first_rule(self):
+        self._p(self.bc, "MEDIA_HOLD_ALBUM_IS_MUSIC", False, create=True)
+        self.snap[0] = {"app": "Media Player", "title": "Song",
+                        "artist": "Band", "album": "Record", "playing": True}
         self.assertTrue(self._sig())
 
     def test_a_broken_probe_is_not_a_video(self):

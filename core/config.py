@@ -1130,11 +1130,37 @@ PRESENCE_STALE_STATUS_S      = 600
 #   camera detector flips ON / OFF every few seconds during a film).
 # MEDIA_HOLD_MAX_S: a hold longer than this releases, so a show that runs for
 #   hours cannot hold the queue for ever; it re-arms once the media stops.
+#   (v3.0.10 review: a signal after a gap of more than the linger with no
+#   check - the queue was empty, or he was away - starts a new hold, so the
+#   cap is per backlog, not once a day.)
 # False = the 3.0.9 hold exactly (no media reason). Set via
 # user_settings.json; applies on the next start.
+# Known gap: music played in a browser tab on YouTube ("play X on YouTube")
+#   publishes no album, so it reads as a video and holds the queue.
 MEDIA_HOLD_ENABLED  = True
 MEDIA_HOLD_LINGER_S = 30
 MEDIA_HOLD_MAX_S    = 1800
+# v3.0.10 review of the media hold (live log 2026-10-28/29):
+# MEDIA_HOLD_TV_NEEDS_REGION True (default): the camera TV detector counts
+#   only once a TV rectangle is calibrated (data/tv_region.json). There is
+#   none live, so it watched the whole webcam view and turned ON 123 times
+#   in a day while he worked at the desk (12:12-12:20, 14:18-14:37) - about
+#   163 minutes of false "media playing". False: it counts uncalibrated too.
+# MEDIA_HOLD_PASS_ASKED True (default): a result he asked for (a background
+#   browser answer: it carries history_text) speaks through the media hold
+#   as in 3.0.9, instead of waiting up to 30 min and coming out as a recap
+#   fragment. False: it waits like any status line.
+# MEDIA_HOLD_ALBUM_IS_MUSIC True (default): a session that publishes an
+#   artist AND an album is music in any player (Groove / Amazon Music read
+#   as "Media Player", VLC, TIDAL), not only the Apple Music / Spotify /
+#   iTunes apps. False: only those apps and the web player are music.
+# MEDIA_HOLD_SIGNAL_CACHE_S: the video signal (a media-session read plus a
+#   window scan) is re-read at most this often while a line is held; it was
+#   read on every drain pass. 0 = every pass.
+MEDIA_HOLD_TV_NEEDS_REGION = True
+MEDIA_HOLD_PASS_ASKED      = True
+MEDIA_HOLD_ALBUM_IS_MUSIC  = True
+MEDIA_HOLD_SIGNAL_CACHE_S  = 5
 
 # Arrival spacing (v3.0.10, core/arrival_quiet.py). Live 2026-10-29 07:21-07:23
 # he walked in to a "while you were away" recap, the morning briefing, a
@@ -1151,6 +1177,13 @@ MEDIA_HOLD_MAX_S    = 1800
 # Set via user_settings.json; read live.
 ARRIVAL_QUIET_MINUTES     = 10
 SCREEN_WATCH_RESET_ON_AWAY = True
+# ARRIVAL_QUIET_ALL_MOMENTS True (default, v3.0.10 review): the quiet period
+#   also covers the other moment-lines (wellness, posture, banter, greet,
+#   night owl, screen remarks: proactive_announce does not queue them; the
+#   skill may try again later) and the idle proactive remark
+#   (should_be_proactive). Urgent lines are never held. False: only the
+#   stretch nudge and the anticipation offers wait. Applies on the next start.
+ARRIVAL_QUIET_ALL_MOMENTS = True
 
 # Device dialogues (core/dialogue.py): a skill that owns a talking device can
 # run a short scripted back-and-forth between JARVIS and it through the
@@ -1672,6 +1705,18 @@ RAM_ALERT_ESCALATE_ONLY = True
 RAM_REALERT_RISE_PTS    = 3.0
 RAM_REARM_BELOW_PCT     = 85.0
 RAM_ALERT_BOOT_QUIET_S  = 600
+# v3.0.10 review (replaying data/self_diagnostic.json, 2026-10-29): the live
+# hourly bump dips to 84.7 % right after it peaks, so the latch re-armed after
+# almost every bump; and from 96.6 % at 20:09 the climb to 99.2 % by 20:19
+# stayed silent (a 2.6-point rise).
+# RAM_REARM_HOLD_S: the reading must stay under RAM_REARM_BELOW_PCT this many
+#   seconds before the alert re-arms; a re-armed alert also waits out the
+#   shared hourly slot again. 0 = re-arm on the first reading under it.
+# RAM_REALERT_CRITICAL_PCT: once per latch, the first reading at or over this
+#   speaks again whatever the rise (the 10-min cooldown does not apply).
+#   0 = no critical tier.
+RAM_REARM_HOLD_S         = 900
+RAM_REALERT_CRITICAL_PCT = 98.0
 
 # ─── Two-sentence shutdown asks the overnight question (v3 W08) ─────────
 # "Jarvis, shut down. No overnight protocol." (live 2026-10-19 20:26:04) is

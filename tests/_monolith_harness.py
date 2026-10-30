@@ -334,6 +334,7 @@ _MONOLITH_RESTORE_NAMES = (
     # leaked stamp would hold or release a LATER test's queue), and the
     # owner turn's voice-context stamp (TTS_TURN_CONTEXT_TTL_S).
     "_media_hold_seen_at", "_media_hold_since", "_last_turn_ctx_at",
+    "_media_hold_signal_cache",
     "_face_detect_last", "_face_presence_trackers", "_face_presence_fp",
     # "What was the first thing I asked" (v2.0.148): the session's opening
     # owner utterances. A test that recorded one would make a LATER test's
@@ -911,6 +912,15 @@ class MonolithGlobalsTestCase(unittest.TestCase):
         # first monolith test (an import-time Kinect pump, a light-tier test)
         # may have left history in the process-wide camera gate.
         _reset_camera_gate(bc)
+        # v3.0.10 review (ARRIVAL_QUIET_ALL_MOMENTS): an earlier skill test
+        # that fired the arrival briefing must not keep this test's
+        # moment-lines and spontaneous remarks quiet.
+        try:
+            _aq = sys.modules.get("core.arrival_quiet")
+            if _aq is not None:
+                _aq._arrived_at[0] = 0.0
+        except Exception:
+            pass
         _before = dict(vars(bc))
         try:
             return super().run(result)

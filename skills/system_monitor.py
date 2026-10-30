@@ -63,6 +63,15 @@ _last_ram_alert_at = [0.0]
 # own hourly line while it stays latched (0.0 = none).
 _ram_last_spoken_pct: list = [None]
 _ram_hold_stamp = [0.0]
+# v3.0.10 review: when the reading first went under RAM_REARM_BELOW_PCT while
+# latched (0.0 = not under it; RAM_REARM_HOLD_S), and the pulse's own "ram"
+# stamp from before the boot quiet began stamping it (None = not saved), put
+# back when the quiet ends (_end_boot_ram_hold).
+_ram_below_since = [0.0]
+_ram_boot_saved: list = [None]
+# The pulse's own RAM-line stamp when this monitor latched behind it (0.0 =
+# none), so a re-arm hands the slot back at the right time.
+_ram_pulse_said_at = [0.0]
 
 # ─── naming the CPU culprit (2026-10-02) ─────────────────────────────────
 # The key _top_processes / _window_culprit use for JARVIS's own process.
@@ -262,29 +271,137 @@ def _hold_shared_ram_slot(now: float) -> None:
         pass
 
 
+def _boot_hold_ram_slot(ram_pct: float, now: float) -> None:
+    """The boot quiet's hold on the pulse's "ram" slot (v3.0.10 review): the
+    pulse's own stamp is saved before the first hold, and the slot is
+    stamped only while the reading is at the pulse's RAM_ABNORMAL_PCT or
+    over (under it the pulse would not speak anyway). Never raises."""
+    pulse = sys.modules.get("skill_system_pulse")
+    lock = getattr(pulse, "_alert_lock", None)
+    stamps = getattr(pulse, "_last_abnormal_alert", None)
+    if lock is None or not isinstance(stamps, dict):
+        return
+    try:
+        if ram_pct < float(getattr(pulse, "RAM_ABNORMAL_PCT", 88.0)):
+            return
+        with lock:
+            if _ram_boot_saved[0] is None:
+                _ram_boot_saved[0] = float(stamps.get("ram", 0.0) or 0.0)
+        _hold_shared_ram_slot(now)
+    except Exception:
+        pass
+
+
+def _end_boot_ram_hold() -> None:
+    """The boot quiet is over: put the pulse's own "ram" stamp back when the
+    slot still holds the quiet's last stamp, so the pulse's hourly cooldown
+    does not run from the quiet (it kept the pulse silent ~70 min, not 10).
+    Never raises."""
+    pulse = sys.modules.get("skill_system_pulse")
+    lock = getattr(pulse, "_alert_lock", None)
+    stamps = getattr(pulse, "_last_abnormal_alert", None)
+    try:
+        saved = _ram_boot_saved[0]
+        _ram_boot_saved[0] = None
+        if saved is None or lock is None or not isinstance(stamps, dict):
+            return
+        with lock:
+            if _ram_hold_stamp[0] and stamps.get("ram") == _ram_hold_stamp[0]:
+                stamps["ram"] = saved
+                _ram_hold_stamp[0] = 0.0
+    except Exception:
+        pass
+
+
+def _pulse_spoke_ram_last() -> float:
+    """The pulse's shared "ram" stamp when it is the pulse's own RAM line:
+    newer than this monitor's last alert and not this monitor's hold stamp
+    (v3.0.10 review); else 0.0. Never raises (0.0)."""
+    pulse = sys.modules.get("skill_system_pulse")
+    stamps = getattr(pulse, "_last_abnormal_alert", None)
+    try:
+        if not isinstance(stamps, dict):
+            return 0.0
+        prev = float(stamps.get("ram", 0.0) or 0.0)
+        if (prev > float(_last_ram_alert_at[0] or 0.0)
+                and prev != _ram_hold_stamp[0]):
+            return prev
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def _release_ram_hold() -> None:
+    """The latch re-armed (v3.0.10 review): a pulse "ram" stamp that is only
+    this monitor's hold goes back to the time of the last alert actually
+    spoken, and the hold stamp is forgotten, so the next alert (from either
+    alerter) waits out the shared hourly slot from that alert - never more
+    often than 3.0.9's one an hour. Never raises."""
+    pulse = sys.modules.get("skill_system_pulse")
+    lock = getattr(pulse, "_alert_lock", None)
+    stamps = getattr(pulse, "_last_abnormal_alert", None)
+    try:
+        if lock is not None and isinstance(stamps, dict):
+            with lock:
+                if (_ram_hold_stamp[0]
+                        and stamps.get("ram") == _ram_hold_stamp[0]):
+                    stamps["ram"] = max(float(_last_ram_alert_at[0] or 0.0),
+                                        float(_ram_pulse_said_at[0] or 0.0))
+        _ram_hold_stamp[0] = 0.0
+        _ram_pulse_said_at[0] = 0.0
+    except Exception:
+        pass
+
+
 def _ram_should_alert(ram_pct: float, now: float) -> bool:
     """One poll's RAM decision with RAM_ALERT_ESCALATE_ONLY on (v3.0.10).
     Armed (nothing spoken since the last re-arm): alert at RAM_ALERT_PCT,
     subject to the 10-min cooldown and the shared hourly slot. Latched: alert
     again only on a rise of RAM_REALERT_RISE_PTS over the last spoken
-    percent (the 10-min cooldown still applies); below RAM_REARM_BELOW_PCT
-    the alert re-arms. While latched the pulse's hourly RAM line is held.
-    Updates the latch when it says True. Never raises (False)."""
+    percent (the 10-min cooldown still applies), or once on reaching
+    RAM_REALERT_CRITICAL_PCT; after RAM_REARM_HOLD_S under
+    RAM_REARM_BELOW_PCT the alert re-arms. While latched the pulse's hourly
+    RAM line is held; a pulse RAM line spoken first latches it too. Updates
+    the latch when it says True. Never raises (False)."""
     try:
         rearm = float(_cfg_value("RAM_REARM_BELOW_PCT", 85.0))
         rise = float(_cfg_value("RAM_REALERT_RISE_PTS", 3.0))
         last = _ram_last_spoken_pct[0]
         if ram_pct < rearm:
-            _ram_last_spoken_pct[0] = None
+            # v3.0.10 review (RAM_REARM_HOLD_S): re-arm only after a sustained
+            # stay under the re-arm point, and forget the hold stamp so a
+            # re-armed alert waits out the shared hourly slot again.
+            hold_s = float(_cfg_value("RAM_REARM_HOLD_S", 0) or 0)
+            if _ram_below_since[0] <= 0.0:
+                _ram_below_since[0] = now
+            if last is not None and now - _ram_below_since[0] >= hold_s:
+                _ram_last_spoken_pct[0] = None
+                _release_ram_hold()
             return False
+        _ram_below_since[0] = 0.0
         if last is not None:
             _hold_shared_ram_slot(now)
         if ram_pct < RAM_ALERT_PCT:
             return False
+        crit = float(_cfg_value("RAM_REALERT_CRITICAL_PCT", 0) or 0)
+        if (last is not None and crit > 0 and ram_pct >= crit
+                and float(last) < crit):
+            # v3.0.10 review: heading for out-of-memory speaks once per
+            # latch, whatever the rise and the 10-min cooldown.
+            _ram_last_spoken_pct[0] = float(ram_pct)
+            return True
         if (now - _last_ram_alert_at[0]) <= ALERT_COOLDOWN_SECONDS:
             return False
         if last is None:
             if not _claim_shared_ram_alert(now):
+                said_at = _pulse_spoke_ram_last()
+                if said_at:
+                    # v3.0.10 review: the pulse spoke first (at its 88 %):
+                    # latch at this reading, so its hourly line is held from
+                    # here on too.
+                    _ram_pulse_said_at[0] = said_at
+                    _ram_last_spoken_pct[0] = float(ram_pct)
+                    _hold_shared_ram_slot(now)
                 return False
         elif ram_pct < float(last) + rise:
             return False
@@ -590,10 +707,15 @@ def _monitor_loop():
 
             # RAM single-sample check
             boot_quiet = float(_cfg_value("RAM_ALERT_BOOT_QUIET_S", 0) or 0)
-            if boot_quiet > 0 and (now - started_at) < boot_quiet:
+            in_boot_quiet = boot_quiet > 0 and (now - started_at) < boot_quiet
+            if not in_boot_quiet and _ram_boot_saved[0] is not None:
+                # v3.0.10 review: the quiet is over; the pulse's own stamp
+                # comes back so its hourly cooldown does not run from it.
+                _end_boot_ram_hold()
+            if in_boot_quiet:
                 # v3.0.10: still booting (the brain model is loading); the
                 # pulse's 88 % line is held with this monitor's.
-                _hold_shared_ram_slot(now)
+                _boot_hold_ram_slot(ram_pct, now)
             elif bool(_cfg_value("RAM_ALERT_ESCALATE_ONLY", False)):
                 # v3.0.10: once per rise, not once an hour while it stays high.
                 if _ram_should_alert(ram_pct, now):

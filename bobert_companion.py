@@ -14508,6 +14508,24 @@ def proactive_announce(message: str, source: str = "skill",
             return True
     except Exception:
         pass  # fail open — never let the focus gate break a real announcement
+    # ARRIVAL QUIET (v3.0.10 review, ARRIVAL_QUIET_ALL_MOMENTS): inside the
+    # quiet period after the arrival briefing, a moment-line (wellness,
+    # posture, banter, greet, night owl, a screen remark: owner_presence.
+    # EXPIRE_QUIETLY_SOURCES) is not queued behind the recap and briefing.
+    # Returns False (not queued) so the skill may try again later. An urgent
+    # line is never held. Fails open.
+    try:
+        if (not urgent
+                and globals().get("ARRIVAL_QUIET_ALL_MOMENTS", False)
+                and str(source or "").split(":", 1)[0]
+                in _owner_presence_mod.EXPIRE_QUIETLY_SOURCES):
+            from core.arrival_quiet import arrival_quiet_active
+            if arrival_quiet_active():
+                print(f"  [pending] arrival quiet - not queued ({source}): "
+                      f"{str(message)[:80]}")
+                return False
+    except Exception:
+        pass
     # Serialise the whole read-modify-write. proactive_announce is called from
     # many daemon threads (timers, promises, Teams/weather/device-flap nudges);
     # without this two concurrent enqueues both read state N, both append, and
@@ -16803,6 +16821,15 @@ def should_be_proactive() -> bool:
     # Game mode is quiet: no spontaneous remarks while he plays (2026-10-12).
     if _game_quiet_active():
         return False
+    # v3.0.10 review (ARRIVAL_QUIET_ALL_MOMENTS): no spontaneous remark inside
+    # the quiet period after the arrival briefing. Fails open.
+    try:
+        if globals().get("ARRIVAL_QUIET_ALL_MOMENTS", False):
+            from core.arrival_quiet import arrival_quiet_active
+            if arrival_quiet_active():
+                return False
+    except Exception:
+        pass
 
     # FOCUS / DO-NOT-DISTURB gate. Spontaneous proactive comments take the
     # should_be_proactive() → _do_proactive_turn() → _speak() path, which
@@ -17950,6 +17977,11 @@ _TURN_FLAG_KEYS = (
     # v3.0.10 lane D: an old turn no longer voices later lines; queued lines
     # wait while a video plays.
     "TTS_TURN_CONTEXT_TTL_S", "MEDIA_HOLD_ENABLED",
+    # v3.0.10 lane D review: the TV detector counts only once calibrated, a
+    # result he asked for speaks through the hold, and moment-lines wait out
+    # the arrival quiet.
+    "MEDIA_HOLD_TV_NEEDS_REGION", "MEDIA_HOLD_PASS_ASKED",
+    "ARRIVAL_QUIET_ALL_MOMENTS",
 )
 
 
@@ -25749,6 +25781,9 @@ _game_hold_seen = [False]
 # began (0.0 = no hold running), for MEDIA_HOLD_LINGER_S / MEDIA_HOLD_MAX_S.
 _media_hold_seen_at = [0.0]
 _media_hold_since = [0.0]
+# [_proactive_mono() of the last real signal read, its verdict] for
+# MEDIA_HOLD_SIGNAL_CACHE_S (v3.0.10 review): the drain asks every pass.
+_media_hold_signal_cache = [0.0, False]
 
 
 # The voice check behind a room-talk stamp while the PC plays audio runs off
@@ -25969,6 +26004,38 @@ def _presence_hold_reason() -> str:
 _MEDIA_HOLD_MUSIC_APPS = frozenset({"Apple Music", "Spotify", "iTunes"})
 
 
+def _media_hold_tv_counts(mod) -> bool:
+    """Does the camera TV detector's verdict count as a video for the media
+    hold? With MEDIA_HOLD_TV_NEEDS_REGION on (v3.0.10 review) only once a TV
+    rectangle is calibrated: uncalibrated it watches the whole webcam view,
+    where a person moving at the desk reads as a playing screen (live
+    2026-10-29 it turned ON 123 times while he worked at the desk). Off: it
+    always counts. Never raises (False: an unreadable calibration is no
+    region)."""
+    try:
+        if not globals().get("MEDIA_HOLD_TV_NEEDS_REGION", False):
+            return True
+        store = mod._store()
+        return store is not None and bool(store.is_calibrated())
+    except Exception:
+        return False
+
+
+def _media_hold_asked_for(entry) -> bool:
+    """A queued line he ASKED for (it carries history_text: a background
+    browser result), which speaks through a "media playing" hold with
+    MEDIA_HOLD_PASS_ASKED on (v3.0.10 review) - as it did in 3.0.9 - instead
+    of waiting out his video and coming out as a recap fragment. Never
+    raises (False)."""
+    try:
+        if not globals().get("MEDIA_HOLD_PASS_ASKED", False):
+            return False
+        hist = entry.get("history_text") if isinstance(entry, dict) else None
+        return isinstance(hist, str) and bool(hist.strip())
+    except Exception:
+        return False
+
+
 def _media_hold_signal() -> bool:
     """True when a VIDEO is playing right now (v3.0.10, MEDIA_HOLD_ENABLED):
     the Windows media session reports a session PLAYING that is not his
@@ -25982,7 +26049,14 @@ def _media_hold_signal() -> bool:
         snap = get_now_playing()
         if snap and snap.get("playing"):
             app = str(snap.get("app") or "")
-            if app not in _MEDIA_HOLD_MUSIC_APPS:
+            # v3.0.10 review (MEDIA_HOLD_ALBUM_IS_MUSIC): a session that
+            # publishes an artist AND an album is a song in any player (the
+            # Groove / Amazon Music apps read as "Media Player", VLC,
+            # TIDAL); a video publishes no album.
+            song = bool(globals().get("MEDIA_HOLD_ALBUM_IS_MUSIC", False)
+                        and str(snap.get("artist") or "").strip()
+                        and str(snap.get("album") or "").strip())
+            if app not in _MEDIA_HOLD_MUSIC_APPS and not song:
                 from core.media_now_playing import is_web_player_session
                 if not is_web_player_session(
                         snap, _apple_music_web_player_titles()):
@@ -25991,7 +26065,8 @@ def _media_hold_signal() -> bool:
         pass
     try:
         mod = sys.modules.get("skill_tv_detect")
-        if mod is not None and bool(mod.is_tv_on()):
+        if (mod is not None and _media_hold_tv_counts(mod)
+                and bool(mod.is_tv_on())):
             return True
     except Exception:
         pass
@@ -26006,10 +26081,16 @@ def _media_hold_active() -> bool:
     raises (False)."""
     try:
         now = _proactive_mono()
-        if _media_hold_signal():
+        linger = float(globals().get("MEDIA_HOLD_LINGER_S", 30) or 0)
+        if _media_hold_signal_cached(now):
+            # v3.0.10 review: the drain asks only while something is queued,
+            # so a gap with no asks never reset the hold's start; a signal
+            # after such a gap (a later video) is a new hold.
+            prev = float(_media_hold_seen_at[0] or 0.0)
+            if prev <= 0.0 or now - prev > linger:
+                _media_hold_since[0] = 0.0
             _media_hold_seen_at[0] = now
         seen = float(_media_hold_seen_at[0] or 0.0)
-        linger = float(globals().get("MEDIA_HOLD_LINGER_S", 30) or 0)
         if seen <= 0.0 or now - seen > linger:
             _media_hold_since[0] = 0.0
             return False
@@ -26019,6 +26100,22 @@ def _media_hold_active() -> bool:
         return now - float(_media_hold_since[0]) <= cap
     except Exception:
         return False
+
+
+def _media_hold_signal_cached(now: float) -> bool:
+    """_media_hold_signal(), re-read at most once per MEDIA_HOLD_SIGNAL_CACHE_S
+    (v3.0.10 review: each read can be a synchronous media-session refresh plus
+    a window scan, and a held line made the drain ask every pass). 0 = read
+    on every ask. Exceptions from the read propagate to the caller (which
+    fails open), as before."""
+    cache_s = float(globals().get("MEDIA_HOLD_SIGNAL_CACHE_S", 0) or 0)
+    at = float(_media_hold_signal_cache[0] or 0.0)
+    if cache_s > 0 and at > 0.0 and 0.0 <= now - at < cache_s:
+        return bool(_media_hold_signal_cache[1])
+    sig = bool(_media_hold_signal())
+    _media_hold_signal_cache[0] = now
+    _media_hold_signal_cache[1] = sig
+    return sig
 
 
 def _proactive_mono() -> float:
@@ -49772,10 +49869,12 @@ def _pending_source_in(item, sources) -> bool:
         return False
 
 
-def _pending_has_source(sources, urgent: bool = False) -> bool:
+def _pending_has_source(sources, urgent: bool = False,
+                        asked: bool = False) -> bool:
     """Peek (no claim): does the speech queue hold an entry from ``sources``
-    (or, with ``urgent``, any entry flagged urgent)? True on any read error,
-    so the real drain decides. Never raises."""
+    (or, with ``urgent``, any entry flagged urgent; with ``asked``, any line
+    he asked for - _media_hold_asked_for)? True on any read error, so the
+    real drain decides. Never raises."""
     try:
         with open(PENDING_SPEECH_PATH, "r", encoding="utf-8") as f:
             raw = f.read().strip()
@@ -49786,6 +49885,7 @@ def _pending_has_source(sources, urgent: bool = False) -> bool:
             return True
         return any(_pending_source_in(e, sources)
                    or (urgent and _owner_presence_mod.is_urgent(e))
+                   or (asked and _media_hold_asked_for(e))
                    for e in items)
     except FileNotFoundError:
         return False
@@ -49856,6 +49956,7 @@ def _speak_pending(only_sources=None):
     _return_drain = False
     _return_away = False
     _hold_urgent = False
+    _hold_asked = False
     if only_sources is None:
         # Standby (only_sources) leaves the governor's held line where it is,
         # exactly as before: it would only be held again below.
@@ -49882,6 +49983,9 @@ def _speak_pending(only_sources=None):
             # spoken through the hold (2026-10-02, core/owner_presence.
             # is_urgent): it used to wait behind his own video indefinitely.
             _hold_urgent = True
+            # v3.0.10 review (MEDIA_HOLD_PASS_ASKED): a result he asked for
+            # speaks through the media hold (_media_hold_asked_for).
+            _hold_asked = _kind == "media playing"
         else:
             _presence_hold_logged[0] = ""
             _return_drain = (bool(PRESENCE_HOLD_ENABLED
@@ -49893,7 +49997,7 @@ def _speak_pending(only_sources=None):
     # Standby runs this every pass (as often as every 0.3 s while muted):
     # claim and rewrite the queue only when something in it may be spoken.
     if only_sources is not None and not _pending_has_source(
-            only_sources, urgent=_hold_urgent):
+            only_sources, urgent=_hold_urgent, asked=_hold_asked):
         return False
     consume_path = PENDING_SPEECH_PATH + ".consuming"
     try:
@@ -49975,7 +50079,8 @@ def _speak_pending(only_sources=None):
         if (only_sources is not None
                 and not _pending_source_in(item, only_sources)
                 and not (_hold_urgent
-                         and _owner_presence_mod.is_urgent(item))):
+                         and _owner_presence_mod.is_urgent(item))
+                and not (_hold_asked and _media_hold_asked_for(item))):
             held.append(item)
             back.append(item)
             continue
