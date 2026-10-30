@@ -678,7 +678,13 @@ _SERVER_TOPIC_RE = re.compile(
     # v3.0.10 review: what server_status reports (SSH, web front end, Plex,
     # DNS) and the services on the box, so a clear ask is never refused.
     r"dns|ssh|web\s*front(?:\s*end)?|services?|docker|containers?|vms?|"
-    r"nextcloud|adguard|backups?|mover|cache|ups|swap|uptime|space)\b", re.I)
+    r"nextcloud|adguard|backups?|mover|cache|ups|swap|uptime|space|"
+    # Final notes 10-29: a clear general ask ("give me a status report",
+    # "how's everything?", "are all systems up?") is not a misheard line;
+    # refusing it said "Sorry, I didn't catch that" to a clear request.
+    r"status\s+(?:update|report|check)|systems?|"
+    r"how(?:'s|\s+is)\s+everything|everything\s+(?:ok(?:ay)?|alright|"
+    r"all\s+right|up|running|fine|good))\b", re.I)
 _PRINT_TOPIC_RE = re.compile(
     r"\b(?:print(?:s|er|ers|ing|ed)?|bambu|h2d|nozzle|bed|filament|layers?|"
     r"percent(?:age)?|done|finish(?:ed|es)?|left|long|eta|progress|"

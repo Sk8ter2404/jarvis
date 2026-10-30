@@ -44,7 +44,11 @@ class ActionTopicTests(unittest.TestCase):
                      "are my docker containers up?", "is Nextcloud up?",
                      "is the swap done yet?", "are the backups ok?",
                      "is the VM running?",
-                     "how much space do I have left?"):
+                     "how much space do I have left?",
+                     # Final notes 10-29: clear general status asks.
+                     "Jarvis, give me a status report.",
+                     "status update please", "how's everything?",
+                     "are all systems up?", "is everything running okay?"):
             with self.subTest(text=text):
                 self.assertEqual(
                     af.action_topic_missing("server_status", text), "")

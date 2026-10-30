@@ -161,10 +161,11 @@ class ActionTopicGateTests(_LaneEBase):
     def test_shared_reply_skips_it_and_reads_the_rest(self):
         # v3.0.10 review: a dropped check beside another action is a plain
         # skip, so the weather result is still spoken and no "didn't catch
-        # that" lands next to it.
+        # that" lands next to it. ("give me a status update" is a server
+        # topic since the final notes 10-29, so the line names no status.)
         printed = self._run_turn(
             "[ACTION: weather_briefing] [ACTION: server_status]",
-            "what's the weather and give me a status update")
+            "what's the weather and should I bring a jacket")
         self.assertEqual(self.server_calls, [])
         self.assertNotIn(self.bc.UNCLEAR_CUE, self.spoken)
         self.assertNotIn("terminal failure reported", printed)
@@ -174,7 +175,7 @@ class ActionTopicGateTests(_LaneEBase):
         self._p(self.bc, "ACTION_TOPIC_SHARED_SKIP", False, create=True)
         printed = self._run_turn(
             "[ACTION: weather_briefing] [ACTION: server_status]",
-            "what's the weather and give me a status update")
+            "what's the weather and should I bring a jacket")
         self.assertEqual(self.server_calls, [])
         self.assertIn("asking sir to repeat", printed)
 
