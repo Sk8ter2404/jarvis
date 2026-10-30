@@ -17936,12 +17936,15 @@ _TURN_FLAG_KEYS = (
     "LOOP_GUARD_MODE",
     "CHAIN_PROMISE_CHECK",
     "NOTE_CLAIM_CHECK",
-    # v3.0.9: rules 6 / 7 enforced in shadow; the ack-claim drop; the
+    # v3.0.9 lane A: rules 6 / 7 enforced in shadow; the ack-claim drop; the
     # self-change promise drop.
     "ACTION_FIT_ROBOT_SPEAK_ENFORCE",
     "ACTION_FIT_ACK_REPEAT_ENFORCE",
     "ACK_CLAIM_NO_FOLLOWUP",
     "SELF_CHANGE_PROMISE_CHECK",
+    # v3.0.9 lane B: site names, one action per offer yes, printer status.
+    "SITE_NAME_SPOKEN_FORMS", "OFFER_YES_ONE_ACTION",
+    "BAMBU_PUSHALL_ON_CONNECT", "PRINT_STATUS_HONEST",
 )
 
 
@@ -43311,15 +43314,97 @@ def _once_per_turn_arg(arg) -> str:
     return re.sub(r"\s+", " ", str(arg or "")).strip().lower()
 
 
+# ... and no browser agent on top of it (v3.0.9, OFFER_YES_ONE_ACTION): live
+# 2026-10-28 21:12:56 "Yes, go ahead." accepted "Shall I search for it on the
+# web instead?"; web_search opened Google and the follow-up round then ran
+# browse_for as well - a paid, minute-long browser agent nobody asked for. A
+# yes runs the ONE action the offer named. So once a web_search / open_url
+# ran this turn, the search-and-read agents (and their aliases) are refused
+# unless his words, or the offer he said yes to, asked for reading,
+# summarising, comparing, research or buying - what only the agent does.
+_SEARCH_THEN_AGENT_ACTIONS = ("browse_for", "browser_task", "browser_do",
+                              "browser_run")
+_AGENT_ASK_RE = re.compile(
+    r"\b(?:read(?:\s+up)?|reading|summari[sz](?:e|es|ing)|summary|compare|"
+    r"comparing|research|dig\s+into|look\s+into|find\s+out|cheapest|"
+    r"best\s+price|buy|purchase|order|book|fill\s+(?:in|out)|"
+    r"browser\s+agent|top\s+(?:three|3|five|5)\s+results|"
+    # The browser agent's own trigger phrases (core/prompts.py browser_task:
+    # "use the browser to <X>", "have your browser <X>", "autopilot the
+    # browser to <X>") and the asks only it does on an opened page ("find me
+    # a <X>", "go through the top posts"): an outright agent ask is never
+    # refused because an open_url / web_search ran first.
+    r"(?:use|have|get)\s+(?:the|your)\s+browser|autopilot\s+the\s+browser|"
+    r"your\s+browser\s+to|find\s+me|go\s+through)\b",
+    re.IGNORECASE)
+
+
+def _offer_yes_one_action_on() -> bool:
+    """OFFER_YES_ONE_ACTION as a bool (default True). Never raises."""
+    try:
+        return bool(globals().get("OFFER_YES_ONE_ACTION", True))
+    except Exception:
+        return True
+
+
+def _agent_asked_this_turn() -> bool:
+    """True when this turn's words - the owner's, the offer he said yes to,
+    or the offer still open as his turn began - ask for what only the
+    browser agent does (_AGENT_ASK_RE). Outside a turn: True (nothing
+    refused). Never raises (True)."""
+    try:
+        frame = getattr(_turn_grounding, "frame", None)
+        if frame is None:
+            return True
+        # The open offer counts too (v3.0.9 merge): "All right." to "Shall
+        # I read the top results?" is no clear yes (core.yes_no), yet it may
+        # accept the offer (_turn_offer_open) - the agent that offer named
+        # must not be refused because a search ran first.
+        said = " ".join(str(t or "") for t in (
+            frame.get("user_text"), frame.get("accepted_offer"),
+            frame.get("open_offer")))
+        return bool(_AGENT_ASK_RE.search(said))
+    except Exception:
+        return True
+
+
+def _agent_on_search_refusal(name, ran_before, ran_here) -> str:
+    """The refusal result for a browser agent (_SEARCH_THEN_AGENT_ACTIONS or
+    an alias) after a web_search / open_url already ran this turn (an
+    earlier round: ``ran_before``; this reply: ``ran_here``), or "" to let it
+    run. OFFER_YES_ONE_ACTION False: always "". Never raises."""
+    try:
+        if not _offer_yes_one_action_on():
+            return ""
+        if not _same_handler_as(name, _SEARCH_THEN_AGENT_ACTIONS):
+            return ""
+        kinds = {_once_per_turn_kind(n) for n in ran_before or ()}
+        kinds |= {str(pair[0]) for pair in (ran_here or ())}
+        kinds.discard("")
+        if not kinds or _agent_asked_this_turn():
+            return ""
+        # Name what actually ran: an open_url alone is "that page already
+        # opened", not "a web search already ran".
+        done = ("a web search already ran this turn and its page is open"
+                if "web_search" in kinds
+                else "that page already opened this turn")
+        return (f"refused: {done} - he asked for that one action, not the browser agent "
+                "as well. Say the page is open, or ask whether he wants it "
+                "read.")
+    except Exception:
+        return ""
+
+
 def _once_per_turn_refusal(name, arg, ran_before, ran_here) -> str:
     """The refusal result for a web_search / open_url that must not run
     again this turn, or "" to let it run. ``ran_before``: action names that
     ran successfully in EARLIER rounds of this turn; ``ran_here``: (kind,
-    arg) pairs run by the current reply so far. Never raises."""
+    arg) pairs run by the current reply so far. A browser agent after one
+    of them: _agent_on_search_refusal. Never raises."""
     try:
         kind = _once_per_turn_kind(name)
         if not kind:
-            return ""
+            return _agent_on_search_refusal(name, ran_before, ran_here)
         if any(_once_per_turn_kind(n) == kind for n in ran_before or ()):
             return (f"refused: {kind} already ran earlier this turn and its "
                     f"page is still open - running it again only opens "
@@ -43737,7 +43822,7 @@ def _take_open_offer(text) -> str:
         # The offer was open and this turn answers it (v3.0.9, see
         # _turn_offer_open): "All right." may accept it even though it is
         # not a clear yes.
-        _note_turn_offer_open()
+        _note_turn_offer_open(offer)
     if outcome == "yes":
         print(f"  [offer-yes] sir said yes to {offer[:90]!r} - asking the "
               f"brain to carry it out")
@@ -43976,14 +44061,17 @@ def _turn_accepted_offer() -> bool:
         return False
 
 
-def _note_turn_offer_open() -> None:
+def _note_turn_offer_open(offer="") -> None:
     """Record that JARVIS's offer was open when this owner turn began and
     the turn answers it (_take_open_offer: not none / stale / expired), for
-    _turn_offer_open. Never raises."""
+    _turn_offer_open, and the offer's words, for _agent_asked_this_turn.
+    Never raises."""
     try:
         frame = getattr(_turn_grounding, "frame", None)
         if frame is not None:
             frame["offer_open"] = True
+            if offer:
+                frame["open_offer"] = str(offer)
     except Exception:
         pass
 
