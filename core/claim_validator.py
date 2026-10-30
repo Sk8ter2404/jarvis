@@ -105,6 +105,8 @@ from __future__ import annotations
 import re
 from typing import Iterable, Optional
 
+from core import action_fit as _action_fit
+
 __all__ = [
     "NOTE_CLAIM_HONEST_LINES",
     "asks_owner",
@@ -2135,3 +2137,244 @@ def drop_note_claims(text: str, *, ran_actions: Iterable[str] = (),
         return ((lead.strip() + " " + out) if lead.strip() else out), flagged
     except Exception:
         return text, []
+
+
+# ── An acknowledgement claim over a bare ack / decline (v3.0.9) ──────────────
+# Live 2026-10-29 18:53:47 "No, not right now." declined JARVIS's offer; the
+# reply "Very good, sir. On it." was withheld as an unverified claim and the
+# forced follow-up round re-ran the previous turn's pause_music twice. When
+# the owner's whole line is a bare acknowledgement or decline (core/
+# action_fit.is_bare_ack, asked by the monolith) there is nothing to do, so
+# the claim itself is the slip: drop_unverified_claims removes the sentences
+# carrying it and the rest is spoken; ACK_CLAIM_LINE when nothing is left.
+# The switch (ACK_CLAIM_NO_FOLLOWUP) lives in the monolith.
+ACK_CLAIM_LINE = "Very good, sir."
+
+
+def drop_unverified_claims(text: str, *, ran_actions: Iterable[str] = (),
+                           user_text: str = "", first: str = "",
+                           max_drops: int = 4) -> str:
+    """``text`` without the sentences that carry an ungrounded execution
+    claim (find_unverified_claim, asked again after each drop, at most
+    ``max_drops`` times). ``first``: the claim already found, if any.
+    Leading [tags] are kept; "" when nothing but tags would be left (the
+    caller speaks ACK_CLAIM_LINE). Never raises ("" on a fault)."""
+    try:
+        src = str(text or "")
+        lead = _NC_LEAD_TAGS_RE.match(src).group(0)
+        pieces = [p.strip() for p in _NC_PIECE_SPLIT_RE.split(src[len(lead):])
+                  if p and p.strip()]
+        phrase = first or find_unverified_claim(
+            src, ran_actions=ran_actions, user_text=user_text)
+        drops = 0
+        while phrase and drops < max_drops:
+            drops += 1
+            want = _norm(phrase)
+            keep = [p for p in pieces if want not in _norm(p)]
+            if len(keep) == len(pieces):
+                # The claim spans sentences or was re-worded by the
+                # detector: nothing safe is left to speak.
+                return ""
+            pieces = keep
+            if not pieces:
+                return ""
+            phrase = find_unverified_claim(
+                " ".join(pieces), ran_actions=ran_actions,
+                user_text=user_text)
+        if phrase or not pieces:
+            return ""
+        if pieces[0][:1].isalpha():
+            pieces[0] = pieces[0][0].upper() + pieces[0][1:]
+        out = " ".join(pieces).strip()
+        return ((lead.strip() + " " + out) if lead.strip() else out)
+    except Exception:
+        return ""
+
+
+# ── Self-change promises (v3.0.9, SELF_CHANGE_PROMISE_CHECK) ─────────────────
+# Live 2026-10-29 18:56:26 "Jarvis, when you make the robot talk, you need to
+# put a little bit of delay in there ..." got "Very good, sir. I'll build in
+# a slight pause before the robot speaks.", and 18:56:56 "you need to make
+# him finish talking before you speak." got "I'll ensure the robot completes
+# its delivery before I chime in." (and "Try it again." got "I'll ensure he
+# finishes his business before I interrupt."). JARVIS cannot change his own
+# code or timing, so the owner believed it was fixed.
+# A sentence is a self-change promise when JARVIS promises, in the first-
+# person future ("I'll", "I will", "I'm going to"), a concrete change to HIS
+# OWN behaviour, timing, speech or code:
+#   * a change / assurance verb (build in, add, put in, adjust, tweak,
+#     change, fix, program ...; make sure, ensure, be sure to, wait, hold
+#     off, give him, let him ...) followed, in the same sentence, by what it
+#     changes: a pause / delay / gap / timing, "my code / timing / speech /
+#     delivery ...", "before I speak / talk / chime in / interrupt ...", or
+#     "until / after he finishes talking";
+#   * or a going-forward promise ("from now on / next time / going forward
+#     / in future I'll <verb>", either order) with a concrete verb.
+# Deliberately narrow. Never a self-change promise: a question or an offer
+# ("Shall I add a pause?", "if you'd like"), generic contrition ("I'll be
+# more careful", "I'll do better next time", "I'll try to ..."), a memory
+# claim ("I'll remember that", "I'll keep it in mind" - NOTE_CLAIM_CHECK's),
+# or a turn where a real action ran (it may be what keeps the promise:
+# "I'll remind you at 5" after add_reminder). The robot's own speak action
+# never keeps one - saying a line changes no timing.
+_SC_FUTURE = (r"\b(?:i'?ll|i\s+will|i\s+shall|i'?m\s+going\s+to|"
+              r"i\s+am\s+going\s+to|i'?m\s+gonna)\s+"
+              r"(?:(?:also|now|certainly|definitely|just|simply|then|"
+              r"absolutely|personally)\s+)*")
+_SC_VERB = (r"(?:build\s+in|build|add|put\s+in|insert|adjust|tweak|change|"
+            r"fix|program|reprogram|modify|alter|introduce|include|set\s+up|"
+            r"slow\s+down|tune|recalibrate|make\s+sure|ensure|be\s+sure|"
+            r"see\s+to\s+it|wait|hold\s+off|hold\s+back|hang\s+back|"
+            r"(?:give|let|allow|leave)\s+(?:him|her|it|them|the\s+[\w-]+"
+            r"(?:\s+[\w-]+)?))\b")
+_SC_SPEECH = (r"(?:speak|speaks|talk|talks|respond|reply|answer|chime\s+in|"
+              r"interrupt|say|continue|carry\s+on|jump\s+in|cut\s+in|go\s+on|"
+              r"pipe\s+up)")
+_SC_TARGET = (
+    r"\b(?:(?:slight|short|brief|little|small|longer|proper)\s+)?(?:pause|"
+    r"delay|gap|buffer|beat|lag|timing|breather)s?\b"
+    r"|\bmy\s+(?:own\s+)?(?:code|timing|behaviou?r|speech|voice|delivery|"
+    r"responses?|replies|programming|settings?|cadence|pacing|habits?|"
+    r"wording|routine|logic|reactions?|tone)\b"
+    r"|\bbefore\s+i\s+(?:(?:start\s+to|begin\s+to|then)\s+)?" + _SC_SPEECH
+    + r"\b"
+    r"|\b(?:until|after|once)\s+(?:he|she|it|they|the\s+[\w-]+(?:\s+[\w-]+)?)"
+    r"\s+(?:has\s+|is\s+|'s\s+)?(?:finish|finishes|finished|done|completes|"
+    r"completed|stops|stopped)\s+(?:talking|speaking|saying|his|her|its|"
+    r"their)\b")
+_SC_CHANGE_RE = re.compile(_SC_FUTURE + _SC_VERB + r".*?(?:" + _SC_TARGET
+                           + r")")
+_SC_FORWARD = (r"(?:from\s+now\s+on|going\s+forward|from\s+here\s+on(?:\s+"
+               r"out)?|in\s+(?:the\s+)?future|henceforth|next\s+time)")
+# Verbs a going-forward promise may carry that change nothing concrete
+# (contrition, memory, an action's own wording).
+_SC_SOFT = (r"(?:be|try|do\s+better|do\s+my\s+best|keep|bear|remember|note|"
+            r"make\s+a\s+note|not\s+forget|never\s+forget|endeavou?r|strive|"
+            r"aim|attempt|work\s+on|look\s+into|let\s+you\s+know|remind|"
+            r"call\s+you|address\s+you|refer\s+to\s+you|take\s+care|"
+            r"stick\s+to|happily|gladly|see|catch\s+you|talk\s+to\s+you|"
+            r"speak\s+(?:to|with)\s+you|chat|be\s+here|miss)\b")
+_SC_FORWARD_RES = (
+    re.compile(r"\b" + _SC_FORWARD + r"\b\s*,?\s*" + _SC_FUTURE
+               + r"(?!" + _SC_SOFT + r")[a-z]"),
+    re.compile(_SC_FUTURE + r"(?!" + _SC_SOFT + r")[a-z][a-z'\s-]{0,60}?\b"
+               + _SC_FORWARD + r"\b"),
+)
+# Never a self-change promise: a question / offer, contrition, memory.
+_SC_NOT_RE = re.compile(
+    r"\b(?:can'?t|cannot|won'?t|unable|i\s+could|i\s+can|if\s+you|"
+    r"would\s+you|shall\s+i|should\s+i|want\s+me\s+to|remember|in\s+mind|"
+    r"memory|more\s+careful|do\s+better|try\s+(?:to|harder)|"
+    r"(?:it|that)\s+won'?t\s+happen|remind\w*|timers?|alarms?|"
+    r"schedul\w*|calendar|appointment)\b")
+
+
+def _sc_sentence(sentence: str) -> Optional[str]:
+    """The promise phrase when ``sentence`` is a self-change promise."""
+    low = _norm(sentence)
+    if not low or "?" in low:
+        return None
+    if _OFFER_RE.search(low) or _SC_NOT_RE.search(low):
+        return None
+    m = _SC_CHANGE_RE.search(low)
+    if m:
+        return m.group(0).strip()
+    for rx in _SC_FORWARD_RES:
+        m = rx.search(low)
+        if m:
+            return m.group(0).strip()
+    return None
+
+
+def _sc_kept_by_action(ran_actions: Iterable[str]) -> bool:
+    """True when a real action ran this turn (it may keep the promise); the
+    robot's speak action never does."""
+    for n in ran_actions or ():
+        nm = str(n or "").strip().lower()
+        if (nm and not nm.startswith("_")
+                and not _action_fit.is_robot_speak_action(nm)):
+            return True
+    return False
+
+
+def find_self_change_promise(text: str, *, ran_actions: Iterable[str] = (),
+                             user_text: str = "") -> Optional[str]:
+    """The phrase when ``text`` promises a concrete change to JARVIS's own
+    behaviour, timing, speech or code and no action this turn ran (see the
+    section comment), else None. ``user_text`` is accepted for symmetry with
+    the other checks. Never raises."""
+    try:
+        if not text or not str(text).strip():
+            return None
+        if _sc_kept_by_action(ran_actions):
+            return None
+        for sentence in _SENTENCE_SPLIT_RE.split(str(text)):
+            got = _sc_sentence(sentence)
+            if got:
+                return got
+    except Exception:
+        return None
+    return None
+
+
+def drop_self_change_promises(text: str, *, ran_actions: Iterable[str] = (),
+                              user_text: str = "") -> tuple:
+    """(``text`` without its self-change promise sentences, [the phrases],
+    whether what is left says something of substance). Leading [tags] are
+    kept. ``text`` unchanged, [] and True when there is no such promise.
+    Never raises."""
+    try:
+        if find_self_change_promise(text, ran_actions=ran_actions,
+                                    user_text=user_text) is None:
+            return text, [], True
+        src = str(text)
+        lead = _NC_LEAD_TAGS_RE.match(src).group(0)
+        kept: list = []
+        flagged: list = []
+        for part in _NC_PIECE_SPLIT_RE.split(src[len(lead):]):
+            if not part or not part.strip():
+                continue
+            got = _sc_sentence(part)
+            if got:
+                flagged.append(got)
+            else:
+                kept.append(part.strip())
+        if not flagged:
+            return text, [], True
+        substance = any(
+            _substantive(_strip_leadins(c.strip()))
+            for k in kept for c in _CLAUSE_SPLIT_RE.split(_norm(k)))
+        if kept and kept[0][:1].isalpha():
+            kept[0] = kept[0][0].upper() + kept[0][1:]
+        out = " ".join(kept).strip()
+        out = (lead.strip() + " " + out).strip() if lead.strip() else out
+        return out, flagged, substance
+    except Exception:
+        return text, [], True
+
+
+# The owner told JARVIS (or the robot) how to behave: worth a note for the
+# developer, who can make the change.
+_SC_DIRECTIVE_RE = re.compile(
+    r"\b(?:you\s+(?:really\s+|just\s+|still\s+)?(?:need\s+to|needa|should|"
+    r"have\s+to|gotta|got\s+to|must|ought\s+to)|make\s+sure\s+(?:that\s+)?"
+    r"you|next\s+time|from\s+now\s+on|going\s+forward|in\s+(?:the\s+)?"
+    r"future|i\s+(?:want|need)\s+you\s+to|i'?d\s+like\s+you\s+to)\b"
+    r"|^(?:(?:hey|ok|okay)\s+)?(?:jarvis\b[\s,.:!-]*)?when\s+you\b[^,]{2,},")
+SELF_CHANGE_HONEST_LINE = "I can't change that myself, sir."
+SELF_CHANGE_NOTED_LINE = ("I can't change that myself, sir - I've noted it "
+                          "for Claude.")
+
+
+def is_behaviour_directive(user_text: str) -> bool:
+    """True when the owner's line tells JARVIS (or the robot) how to behave
+    from now on: "you need to / you should / you have to / you gotta / you
+    must / make sure you / next time / from now on / I want you to ..." or
+    an opening "when you ..., ...". A question is not. Never raises."""
+    try:
+        low = _norm(user_text)
+        if not low or "?" in low:
+            return False
+        return _SC_DIRECTIVE_RE.search(low) is not None
+    except Exception:
+        return False

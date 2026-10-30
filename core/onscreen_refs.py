@@ -917,13 +917,10 @@ _ROBOT_WORD_LOOSE = r"(?:[a-z]+(?:\s+|\s*-\s*))?[a-z]*bott?"
 # lines". Strict: "robot", "bot" on its own, a two-word "<word> bot" /
 # "<word>-bot" (not "chat bot"), or a one-word "<word>bot" that is not a
 # common English word; never a household "robot vacuum / mower ...". A
-# doubled final t from the recogniser still counts.
-_BOT_COMMON_WORDS = (r"(?:abbott?|sabot|turbot|jabot|talbott?|cabot|chatbot|"
-                     r"chabot)")
-_ROBOT_WORD_STRICT = (
-    r"(?:(?!chat\b)[a-z]+(?:\s+|\s*-\s*)bott?\b|robot\b|bott?\b"
-    r"|(?!" + _BOT_COMMON_WORDS + r"\b)[a-z]+bott?\b)"
-    r"(?!\s+(?:vacuums?|mops?|mowers?|lawn\s*mowers?|cleaners?|toys?)\b)")
+# doubled final t from the recogniser still counts. Since v3.0.9 the pattern
+# lives in core/robot_words.py (with its common-word list), shared with
+# core/action_fit rule 6.
+from core.robot_words import ROBOT_WORD_STRICT as _ROBOT_WORD_STRICT  # noqa: E402
 _ROBOT_WORD = _ROBOT_WORD_STRICT
 
 

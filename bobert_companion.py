@@ -17936,6 +17936,12 @@ _TURN_FLAG_KEYS = (
     "LOOP_GUARD_MODE",
     "CHAIN_PROMISE_CHECK",
     "NOTE_CLAIM_CHECK",
+    # v3.0.9: rules 6 / 7 enforced in shadow; the ack-claim drop; the
+    # self-change promise drop.
+    "ACTION_FIT_ROBOT_SPEAK_ENFORCE",
+    "ACTION_FIT_ACK_REPEAT_ENFORCE",
+    "ACK_CLAIM_NO_FOLLOWUP",
+    "SELF_CHANGE_PROMISE_CHECK",
 )
 
 
@@ -25119,6 +25125,15 @@ class _SentenceFlushBuffer:
             # / memory / list action ran (NOTE_CLAIM_CHECK).
             if (globals().get("NOTE_CLAIM_CHECK", True)
                     and _claim_validator.find_note_claim(
+                        piece, ran_actions=_turn_actions_ran(),
+                        user_text=_turn_user_text())):
+                self._stopped = True
+                return True
+            # "I'll build in a slight pause before the robot speaks"
+            # (v3.0.9): held so parse_and_run_actions can drop it unless an
+            # action this turn keeps it (SELF_CHANGE_PROMISE_CHECK).
+            if (globals().get("SELF_CHANGE_PROMISE_CHECK", True)
+                    and _claim_validator.find_self_change_promise(
                         piece, ran_actions=_turn_actions_ran(),
                         user_text=_turn_user_text())):
                 self._stopped = True
@@ -43937,11 +43952,126 @@ def _action_fit_prior_actions() -> list:
         return []
 
 
+def _action_fit_flag(key: str) -> bool:
+    """One of the v3.0.9 rule switches (ACTION_FIT_ROBOT_SPEAK_ENFORCE,
+    ACTION_FIT_ACK_REPEAT_ENFORCE) as a bool, default True. Never raises."""
+    try:
+        return bool(globals().get(key, True))
+    except Exception:
+        return True
+
+
+def _turn_accepted_offer() -> bool:
+    """True when this owner turn said yes to JARVIS's open offer (recorded by
+    _note_turn_accepted_offer from _take_open_offer). Never raises."""
+    try:
+        frame = getattr(_turn_grounding, "frame", None)
+        return bool(frame and frame.get("accepted_offer"))
+    except Exception:
+        return False
+
+
+def _turn_is_bare_ack() -> bool:
+    """True when this owner turn's WHOLE line is a bare acknowledgement or
+    decline (core.action_fit.is_bare_ack: "All right.", "No, not right
+    now.") and it accepted no open offer - action-fit rule 7 and the
+    ACK_CLAIM_NO_FOLLOWUP claim drop ask the same thing. False outside an
+    owner turn. Never raises."""
+    try:
+        user_text = _turn_user_text()
+        return bool(user_text and not _turn_accepted_offer()
+                    and _action_fit.is_bare_ack(user_text))
+    except Exception:
+        return False
+
+
+_SC_LEAD_TAGS_RE = re.compile(r"^\s*(?:\[[^\]]*\]\s*)*")
+
+
+def _self_change_note(user_text: str) -> bool:
+    """Note sir's directive for Claude through the note_for_claude action
+    (core.actions._act_note_for_claude -> core.dev_notes), once per turn.
+    True when the note landed (not guest mode, the file writable). Never
+    raises."""
+    try:
+        frame = getattr(_turn_grounding, "frame", None)
+        if frame is None:
+            return False
+        if frame.get("self_change_noted"):
+            return True
+        fn = ACTIONS.get("note_for_claude")
+        if not callable(fn):
+            return False
+        from core import dev_notes as _dn
+        from core import onscreen_refs as _or
+        note = _or.clean(user_text) or " ".join(str(user_text).split())
+        if not note:
+            return False
+        res = str(fn(note) or "")
+        ok = bool(res) and (res == _dn.SPOKEN_LINE or (
+            res != _dn.GUEST_LINE and "?" not in res
+            and "couldn't" not in res and not _action_result_failed(res)))
+        if ok:
+            frame["self_change_noted"] = True
+            _note_turn_action_ran("note_for_claude", res, note)
+        print(f"  [validation] noted sir's directive for Claude: "
+              f"{'ok' if ok else 'not saved'} ({len(note)} chars)")
+        return ok
+    except Exception as _e:
+        print(f"  [validation] self-change note failed: {type(_e).__name__}")
+        return False
+
+
+def _self_change_promise_apply(cleaned: str) -> str:
+    """``cleaned`` without a promise of a change JARVIS cannot make to his
+    own behaviour (SELF_CHANGE_PROMISE_CHECK, see parse_and_run_actions),
+    plus the honest line: SELF_CHANGE_NOTED_LINE when sir's line was a
+    directive and it was noted for Claude, SELF_CHANGE_HONEST_LINE when it
+    was a directive that could not be noted or nothing else is left, and
+    nothing more when the rest of the reply says something of its own.
+    ``cleaned`` unchanged when there is no such promise. Never raises."""
+    try:
+        user_text = _turn_user_text()
+        kept, flagged, substance = (
+            _claim_validator.drop_self_change_promises(
+                cleaned, ran_actions=_turn_actions_ran(),
+                user_text=user_text))
+        if not flagged:
+            return cleaned
+        directive = _claim_validator.is_behaviour_directive(user_text)
+        if directive and _self_change_note(user_text):
+            line = _claim_validator.SELF_CHANGE_NOTED_LINE
+        elif directive or not substance:
+            line = _claim_validator.SELF_CHANGE_HONEST_LINE
+        else:
+            line = ""
+        if not line:
+            out = kept
+        elif substance:
+            out = f"{kept} {line}".strip()
+        else:
+            lead = _SC_LEAD_TAGS_RE.match(kept or "").group(0).strip()
+            out = f"{lead} {line}".strip()
+        print(f"  [validation] dropped the self-change promise "
+              f"'{flagged[0]}': JARVIS cannot change that himself"
+              + (f" - said {line!r}" if line else ""))
+        return out
+    except Exception as _e:
+        print(f"  [validation] self-change check failed: {type(_e).__name__}")
+        return cleaned
+
+
 def _action_fit_refusal(name: str, arg: str, reply_names=()) -> "str | None":
     """The 'on'-mode failure result for an action that misfits the owner's
     words this turn, else None. 'shadow' logs "[action-fit] would block"
     and returns None; 'off' and a dispatch with no owner words (a proactive
-    remark) return None without checking. Never raises."""
+    remark) return None without checking. Never raises.
+
+    v3.0.9: rule 6 (the robot made to speak when sir asked JARVIS) and rule
+    7 (the same action again for a bare acknowledgement / decline) are
+    enforced even in 'shadow' while ACTION_FIT_ROBOT_SPEAK_ENFORCE /
+    ACTION_FIT_ACK_REPEAT_ENFORCE are on (core.action_fit.check_rule says
+    which rule fired); with both off this is the v3.0.8 check exactly."""
     try:
         mode = _action_fit_mode()
         if mode == "off":
@@ -43949,12 +44079,18 @@ def _action_fit_refusal(name: str, arg: str, reply_names=()) -> "str | None":
         user_text = _turn_user_text()
         if not user_text:
             return None
-        reason = _action_fit.check(user_text, name, arg,
-                                   _action_fit_prior_actions(), reply_names)
+        robot_on = _action_fit_flag("ACTION_FIT_ROBOT_SPEAK_ENFORCE")
+        ack_on = _action_fit_flag("ACTION_FIT_ACK_REPEAT_ENFORCE")
+        rule, reason = _action_fit.check_rule(
+            user_text, name, arg, _action_fit_prior_actions(), reply_names,
+            robot_speaker=robot_on, ack_repeat=ack_on,
+            accepted_offer=ack_on and _turn_accepted_offer())
         if not reason:
             return None
         shown = f"{name}({arg})" if arg else name
-        if mode != "on":
+        enforced = ((robot_on and rule == _action_fit.RULE_ROBOT_SPEECH)
+                    or (ack_on and rule == _action_fit.RULE_ACK_REPEAT))
+        if mode != "on" and not enforced:
             print(f"  [action-fit] would block {shown}: {reason}")
             return None
         print(f"  [action-fit] blocked {shown}: {reason}")
@@ -44650,6 +44786,30 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
         except Exception as _cv_err:
             print(f"  [validation] claim check failed: {_cv_err}")
             matched = None
+        # A bare acknowledgement or decline (v3.0.9, ACK_CLAIM_NO_FOLLOWUP;
+        # live 2026-10-29 18:53:47 "No, not right now." -> "Very good, sir.
+        # On it." -> a forced follow-up round that re-ran the previous
+        # turn's pause_music twice): there is nothing to do, so the claim
+        # itself is the slip. It is dropped and the rest spoken ("Very good,
+        # sir."; that line alone when nothing else is left), with no
+        # synthetic result and so no follow-up round. Only inside an owner
+        # turn that accepted no open offer (_turn_is_bare_ack). False = the
+        # old path exactly.
+        if (matched and globals().get("ACK_CLAIM_NO_FOLLOWUP", True)
+                and _turn_is_bare_ack()):
+            try:
+                _ack_rest = _claim_validator.drop_unverified_claims(
+                    cleaned, ran_actions=_turn_actions_ran(),
+                    user_text=_turn_user_text(), first=matched)
+                _ack_line = _ack_rest or _claim_validator.ACK_CLAIM_LINE
+                print(f"  [validation] sir only acknowledged or declined - "
+                      f"dropped the claim '{matched.strip()}' and no "
+                      f"follow-up round")
+                cleaned = _ack_line
+                matched = None
+            except Exception as _ack_err:
+                print(f"  [validation] ack-claim drop failed: "
+                      f"{type(_ack_err).__name__}")
         if matched:
             _withhold = getattr(_turn_grounding, "frame", None) is not None
             warn = (
@@ -44730,6 +44890,28 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
                   + (" - said the honest line instead"
                      if _nc_kept == _nc_line else ""))
             cleaned = _nc_kept
+
+    # Self-change promises (v3.0.9, SELF_CHANGE_PROMISE_CHECK; live
+    # 2026-10-29 18:56:26 "you need to put a little bit of delay in there"
+    # -> "I'll build in a slight pause before the robot speaks.", and
+    # 18:56:56 "you need to make him finish talking before you speak." ->
+    # "I'll ensure the robot completes its delivery before I chime in.").
+    # JARVIS cannot change his own code or timing; the sentence is dropped
+    # (core.claim_validator.find_self_change_promise has the rules) unless a
+    # real action this turn may keep it. When sir's line told JARVIS how to
+    # behave ("you need to ...", "from now on ..."), his sentence is noted for
+    # Claude through note_for_claude and the honest line says so; otherwise
+    # the plain honest line - or nothing, when the rest of the reply says
+    # something of its own and he gave no directive. No follow-up round.
+    # Runs after the note-claim check, so the "noted it for Claude" line is
+    # never judged as a note claim. False = the old path exactly.
+    if (cleaned and globals().get("SELF_CHANGE_PROMISE_CHECK", True)
+            and getattr(_turn_grounding, "frame", None) is not None):
+        try:
+            cleaned = _self_change_promise_apply(cleaned)
+        except Exception as _sc_err:
+            print(f"  [validation] self-change check failed: "
+                  f"{type(_sc_err).__name__}")
 
     # Invented readings (live 2026-10-09 17:53): "why can't I hear my
     # YouTube video?" -> "I'm afraid the volume is currently set to 20%,

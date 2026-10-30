@@ -1715,6 +1715,31 @@ THINK_CAPABILITY_PROBE = True
 # Flip to 'on' after 50+ live turns of shadow lines with no false flag.
 # Set via user_settings.json; applies on the next start.
 ACTION_FIT_MODE = "shadow"
+# ACTION_FIT_ROBOT_SPEAK_ENFORCE (bool, v3.0.9; core/action_fit rule 6) -
+# live 2026-10-29 18:54:35 and 18:55:16 "Jarvis, say <line>." and 18:55:35
+# "I just want to say it, sir. Or if it's say <line>." each ran the robot's
+# speak action, so the robot said it, not JARVIS ("Wait, what? They sent it
+# over to the robot?"). True (default): the robot's speak action fits only
+# when sir's words make the ROBOT the speaker (a robot word, or "make him /
+# have it / let him / get him to / tell him to / can he ... say"); "say X",
+# "can you say X", "I want you to say X" are JARVIS's to say, and the
+# follow-up round is told so. Rule 6 is ENFORCED even while ACTION_FIT_MODE
+# is 'shadow' (the action does not run; ACTION_FIT_MODE 'off' still turns
+# every rule off). False: the v3.0.8 rule 6 (any speech word fits), logged
+# or enforced per ACTION_FIT_MODE (the old behaviour). Applies on the next
+# start.
+ACTION_FIT_ROBOT_SPEAK_ENFORCE = True
+# ACTION_FIT_ACK_REPEAT_ENFORCE (bool, v3.0.9; core/action_fit rule 7) -
+# live 2026-10-29 18:55:26 "All right." ran the robot's speak action again
+# with the same line (rule 6 only logged it, in shadow). True (default):
+# when sir's WHOLE line is a bare acknowledgement or decline ("all right",
+# "okay", "thanks", "no, not right now", "never mind" ...) and he accepted
+# no open offer, an action whose name and argument ran in the 2 minutes
+# before the turn is not run again - enforced even while ACTION_FIT_MODE is
+# 'shadow' ('off' still turns it off). "Yes", "sure", "again" or any line
+# with a request in it never count. False: no rule 7 (the old behaviour).
+# Applies on the next start.
+ACTION_FIT_ACK_REPEAT_ENFORCE = True
 
 # --- Chain loop guard (v3 W21, 2026-10-27; core/loop_guard.py) ---------
 # LOOP_GUARD_MODE - the follow-up loop already stops a chain on a repeated
@@ -1753,6 +1778,36 @@ CHAIN_PROMISE_CHECK = True
 # of that, sir."). A bare "Noted, sir." is untouched, and so is a true claim.
 # False: such sentences are spoken as before. Applies on the next start.
 NOTE_CLAIM_CHECK = True
+# ACK_CLAIM_NO_FOLLOWUP (bool, v3.0.9; bobert_companion parse_and_run_actions,
+# the unverified-claim check) - live 2026-10-29 18:53:47 "No, not right now."
+# declined JARVIS's offer "Shall I note that for Claude to add, sir?"; the
+# reply "Very good, sir. On it." was withheld as an unverified claim and the
+# forced follow-up round ran the previous turn's pause_music twice ("Chrome
+# is already paused"). True (default): when sir's WHOLE line is a bare
+# acknowledgement or decline (core/action_fit.is_bare_ack) and he accepted no
+# open offer, the claim ("On it") is dropped and the rest is spoken ("Very
+# good, sir."; that line alone when nothing else is left) - no synthetic
+# result, so no follow-up round. False: the claim withholds the reply and
+# forces the follow-up round (the old behaviour). Applies on the next start.
+ACK_CLAIM_NO_FOLLOWUP = True
+# SELF_CHANGE_PROMISE_CHECK (bool, v3.0.9; core/claim_validator.
+# drop_self_change_promises) - live 2026-10-29 18:56:26 "Jarvis, when you make
+# the robot talk, you need to put a little bit of delay in there ..." got
+# "Very good, sir. I'll build in a slight pause before the robot speaks.",
+# and 18:56:56 "you need to make him finish talking before you speak." got
+# "I'll ensure the robot completes its delivery before I chime in." JARVIS
+# cannot change his own code or timing, so sir believed it was fixed. True
+# (default): in your turn a sentence promising a concrete change to JARVIS's
+# own behaviour, timing, speech or code ("I'll build in a pause ...", "I'll
+# make sure to wait ... before I speak", "from now on I'll ...") is not
+# spoken when no action ran this turn; when sir's line was a directive ("you
+# need to ...", "from now on ...", "make sure you ...") his sentence is noted
+# for Claude (note_for_claude) and JARVIS says "I can't change that myself,
+# sir - I've noted it for Claude."; otherwise "I can't change that myself,
+# sir." Never touches a promise an action this turn keeps, "I'll be more
+# careful", memory claims (NOTE_CLAIM_CHECK) or offers. False: such promises
+# are spoken as before. Applies on the next start.
+SELF_CHANGE_PROMISE_CHECK = True
 # VERBATIM_CONTENT_RESULTS (bool, v3.0.8, bobert_companion
 # _action_result_failed): live 2026-10-28 19:47 "what's new" - the changelog
 # summary said fixes as fixes ("no longer fails"), its words read as a failed

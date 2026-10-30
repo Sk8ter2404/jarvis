@@ -14,7 +14,7 @@ cases):
   * safety-03 "turn it off" -> game_mode_off.
 
 ``check(user_text, name, arg, prior_actions)`` is pure: it returns None when
-the action fits, else a short reason. Six rules only:
+the action fits, else a short reason. Seven rules only:
 
   1. A list / status action when the owner gave an on / off / set / dim /
      turn command (and asked for no list or status in the same breath, and
@@ -51,6 +51,26 @@ the action fits, else a short reason. Six rules only:
      "I am ready for more dialogue." and the robot said it. "Make him
      talk", "have the bot say hi" and "tell the robot I aced my exam" fit.
 
+     Since v3.0.9 (ACTION_FIT_ROBOT_SPEAK_ENFORCE) a speech word is not
+     enough: the owner's words must make the ROBOT the speaker - a robot
+     word (core/robot_words) or a third-person form ("make him ...", "have
+     it say", "let him ...", "get him to ...", "tell him to ...", "can he
+     say", "he should say"). Live 2026-10-29 18:54:35 and 18:55:16 "Jarvis,
+     say <line>." and 18:55:35 "I just want to say it, sir. Or if it's say
+     <line>." (the recogniser's "I just want you to say it") each ran the
+     robot's speak action, so the robot said it, not JARVIS. "Say X", "can
+     you say X" and "I want you to say X" ask JARVIS himself.
+  7. The same action and argument again (v3.0.9, ACTION_FIT_ACK_REPEAT_
+     ENFORCE) when the owner's WHOLE line is a bare acknowledgement or
+     decline ("All right.", "No, not right now.", "okay, thanks") and the
+     turn did not accept an open offer. Live 2026-10-29 18:55:26 "All
+     right." ran the robot's speak action again with the same line. "Yes",
+     "sure", "again" and any line with a request in it are never bare.
+
+``check_rule`` returns (rule number, reason) - (0, None) when the action
+fits - so the monolith can enforce rules 6 and 7 while the rest stay in
+shadow; ``check`` is the same test returning only the reason.
+
 No owner words (a proactive dispatch) never flags. Never raises: any fault
 reads as "fits".
 
@@ -61,13 +81,27 @@ the handler runs. Behind ``ACTION_FIT_MODE`` (core/config.py): 'off' = the
 old path; 'shadow' (default) logs "[action-fit] would block ..." and runs
 the action; 'on' does not run it and returns a failure result (``refused
 (action-fit): not run - ...``) so the follow-up round chooses again.
+Rules 6 and 7 are enforced as in 'on' even while the mode is 'shadow' when
+ACTION_FIT_ROBOT_SPEAK_ENFORCE / ACTION_FIT_ACK_REPEAT_ENFORCE are on (the
+v3.0.9 defaults); 'off' still turns every rule off.
 """
 from __future__ import annotations
 
 import re
 from typing import Iterable, Optional, Sequence
 
+from core.robot_words import ROBOT_WORD_STRICT
+
 MODES = ("off", "shadow", "on")
+
+# The rule numbers check_rule returns (0 = the action fits).
+RULE_STATUS_FOR_COMMAND = 1
+RULE_MODE_SWAP = 2
+RULE_RECHECK_AFTER_CORRECTION = 3
+RULE_FACE_LOOK = 4
+RULE_REMARK_RERUN = 5
+RULE_ROBOT_SPEECH = 6
+RULE_ACK_REPEAT = 7
 
 # ── Rule 1 / 3: what counts as a list / status (read-only) action ──────────
 # A name pattern, plus a few read-only names the pattern misses. Every name
@@ -266,6 +300,108 @@ def asks_robot_speech(user_text) -> bool:
         return False
 
 
+# v3.0.9 (ACTION_FIT_ROBOT_SPEAK_ENFORCE): a speech word is not enough -
+# "Jarvis, say <line>." asks JARVIS to say it (live 2026-10-29 18:54:35 and
+# 18:55:16, and 18:55:35 "I just want to say it, sir. Or if it's say
+# <line>.", the recogniser's "I just want you to say it"); each ran the
+# robot's speak action and the owner asked "They sent it over to the
+# robot?". The robot speaks only when his words make the ROBOT the speaker:
+#   * a robot word (core/robot_words.ROBOT_WORD_STRICT, the developer-to-do
+#     pattern: "robot", "bot", "<word> bot", a one-word "<word>bot" that is
+#     not a common word);
+#   * or a third-person speaker form: make / have / let / get him / her /
+#     it / them (or "the <name>") ... <speech verb> ("make him talk", "have
+#     it say hello", "let him introduce himself", "get him to tell a
+#     joke"), "tell him / it to ...", "can he / it say ...", "he / it
+#     should say ...".
+# "say X", "can you say X", "you say it" and "I want you to say X" name no
+# robot and no third person: JARVIS says those words himself.
+_ROBOT_NAMED_RE = re.compile(r"\b" + ROBOT_WORD_STRICT, re.I)
+_SPEECH_VERB = (r"(?:say|says|speak|talk|tell|announce|repeat|greet|"
+                r"introduce|sing|shout|yell|whisper|chat|ask|read|recite|"
+                r"pronounce|roast|compliment|insult|respond|reply|answer|"
+                r"quote|thank|congratulate|welcome)")
+_THIRD_PRON = r"(?:him|her|it|them)"
+_THIRD_SUBJ = r"(?:he|she|it|they)"
+_THIRD_SPEAKER_RES = (
+    # make him talk / have it say hello / let him introduce himself / get
+    # him to tell a joke / make the <name> talk
+    re.compile(r"\b(?:make|makes|making|have|has|having|let|lets|letting|"
+               r"get|gets|getting)\s+(?:" + _THIRD_PRON + r"|(?:the|my|our|"
+               r"your)\s+[\w'-]+(?:\s+[\w'-]+)?)\s+(?:to\s+)?"
+               r"(?:(?:just|also|please|now|quickly)\s+)?" + _SPEECH_VERB
+               + r"\b", re.I),
+    # tell him to ... / tell it to ...
+    re.compile(r"\btell\s+" + _THIRD_PRON + r"\s+to\b", re.I),
+    # can he say ... / could it say ... / will she greet ...
+    re.compile(r"\b(?:can|could|will|would|should|does|did)\s+"
+               + _THIRD_SUBJ + r"\s+(?:(?:just|also|please)\s+)?"
+               + _SPEECH_VERB + r"\b", re.I),
+    # he should say ... / it needs to say ... / she can greet ...
+    re.compile(r"\b" + _THIRD_SUBJ + r"\s+(?:should|can|could|will|would|"
+               r"must|might|needs\s+to|has\s+to|ought\s+to|is\s+going\s+to|"
+               r"gets\s+to)\s+(?:(?:just|also|please)\s+)?" + _SPEECH_VERB
+               + r"\b", re.I),
+)
+
+
+def asks_robot_speaker(user_text) -> bool:
+    """True when the owner's words make the ROBOT the speaker: a robot word
+    or a third-person speaker form (see the block comment). "Jarvis, say
+    hello." and "I want you to say it" are not. Never raises."""
+    try:
+        text = _norm(user_text)
+        if not text:
+            return False
+        if _ROBOT_NAMED_RE.search(text):
+            return True
+        return any(rx.search(text) for rx in _THIRD_SPEAKER_RES)
+    except Exception:
+        return False
+
+
+# ── Rule 7: the same action again for a bare acknowledgement / decline ─────
+# Live 2026-10-29 18:55:26 "All right." ran the robot's speak action again
+# with the line it had just said (rule 6 only logged it, in shadow), and
+# 18:53:47 "No, not right now." (a decline of JARVIS's offer) ended in the
+# previous turn's pause_music twice. An acknowledgement or decline asks for
+# nothing: an action whose name and argument ran on the previous turn is not
+# run again unless the turn accepted an open offer (the monolith passes
+# accepted_offer). The WHOLE line must be acknowledgement / decline words,
+# with "Jarvis" / "sir" / "thanks" around them allowed. "Yes", "yeah",
+# "sure", "please", "go ahead", "do it", "again" are never bare (they ask),
+# and neither is any line with a request in it ("okay, play it").
+# core/claim_validator's ack-claim drop (ACK_CLAIM_NO_FOLLOWUP) asks the
+# same predicate (the monolith passes it this one).
+_BARE_ACK_WORDS = (
+    r"all\s*right|alright|ok(?:ay)?|cool|nice|great|good|fine|got\s+it|"
+    r"thanks|thank\s+you|no|nope|nah|not\s+now|not\s+right\s+now|"
+    r"not\s+yet|maybe\s+later|never\s*mind|forget\s+it|no\s+thanks|"
+    r"no\s+thank\s+you|that'?s\s+fine|that\s+is\s+fine|i'?m\s+good|"
+    r"i\s+am\s+good|all\s+good|perfect|understood")
+_BARE_ACK_EXTRA = r"jarvis|sir|thanks|thank\s+you"
+_BARE_ACK_RE = re.compile(
+    r"^(?:(?:" + _BARE_ACK_WORDS + r"|" + _BARE_ACK_EXTRA + r")"
+    r"(?:[\s,.!;:—–-]+|$))+$", re.I)
+_BARE_ACK_WORD_RE = re.compile(r"\b(?:" + _BARE_ACK_WORDS + r")\b", re.I)
+
+
+def is_bare_ack(user_text) -> bool:
+    """True when the owner's WHOLE line is a bare acknowledgement or decline
+    ("All right.", "No, not right now.", "okay sir", "thanks, Jarvis"), with
+    no request and no question in it. "Yes", "sure", "again" and "okay play
+    it" are not. Never raises."""
+    try:
+        text = _norm(user_text).lower().replace("’", "'")
+        text = text.strip(" .!,;:")
+        if not text or "?" in text:
+            return False
+        return (_BARE_ACK_RE.match(text) is not None
+                and _BARE_ACK_WORD_RE.search(text) is not None)
+    except Exception:
+        return False
+
+
 def asks_face_look(user_text) -> bool:
     """True when the owner's words ask for a face look: who someone is, to
     recognise / see / look at a person or face, or whether anyone is there.
@@ -336,55 +472,95 @@ def check(user_text, name, arg="",
 
     ``prior_actions``: (name, arg) pairs that ran on the previous owner turn.
     ``reply_actions``: every action name in the same reply (rule 1 holds off
-    when another action in the reply does the job). Never raises."""
+    when another action in the reply does the job). The reason of
+    check_rule with its defaults. Never raises."""
+    return check_rule(user_text, name, arg, prior_actions, reply_actions)[1]
+
+
+def check_rule(user_text, name, arg="",
+               prior_actions: Iterable = (),
+               reply_actions: Sequence = (), *,
+               robot_speaker: bool = True,
+               ack_repeat: bool = True,
+               accepted_offer: bool = False) -> tuple:
+    """(rule number, reason) when ``name(arg)`` misfits the owner's words,
+    (0, None) when it fits - see the module docstring for the rules and
+    check for ``prior_actions`` / ``reply_actions``.
+
+    ``robot_speaker``: rule 6 also needs the robot as the speaker (v3.0.9);
+    False = the v3.0.8 rule 6 (any speech word fits). ``ack_repeat``: rule 7
+    is on; False = no rule 7. ``accepted_offer``: this turn accepted JARVIS's
+    open offer (rule 7 never applies then). Never raises."""
     try:
         text = _norm(user_text)
         nm = str(name or "").strip().lower()
         if not text or not nm:
-            return None
+            return 0, None
+        # Rule 7: the same action again for a bare acknowledgement or
+        # decline (and no accepted offer).
+        if ack_repeat and not accepted_offer and is_bare_ack(text):
+            a = _norm(arg).lower()
+            if (nm, a) in set(_pairs(prior_actions)):
+                shown = f"{nm}({_norm(arg)})" if a else nm
+                return RULE_ACK_REPEAT, (
+                    f"not run: {shown} already ran a moment ago and sir only "
+                    f"acknowledged or declined (\"{text}\"); running it "
+                    f"again repeats it - answer him briefly instead")
         # Rule 2: a heavy mode swap with no word that asks for one.
         if nm in HEAVY_MODE_ACTIONS and not _MODE_WORD_RE.search(text):
-            return (f"not run: {nm} swaps the brain and the cameras (game "
-                    f"mode), and sir said nothing about a game, a mode or "
-                    f"power")
+            return RULE_MODE_SWAP, (
+                f"not run: {nm} swaps the brain and the cameras (game "
+                f"mode), and sir said nothing about a game, a mode or "
+                f"power")
         # Rule 4: a face look when sir asked nobody's name or face.
         if nm in FACE_LOOK_ACTIONS and not asks_face_look(text):
-            return (f"not run: {nm} looks through the webcam to say who is "
-                    f"there, and sir asked nothing about who someone is or "
-                    f"a face")
+            return RULE_FACE_LOOK, (
+                f"not run: {nm} looks through the webcam to say who is "
+                f"there, and sir asked nothing about who someone is or "
+                f"a face")
         # Rule 6: the robot made to speak when nobody was asked to say
-        # anything.
-        if is_robot_speak_action(nm) and not asks_robot_speech(text):
-            return (f"not run: {nm} makes the desk robot say a line, and "
+        # anything - or (v3.0.9) when sir asked JARVIS himself to say it.
+        if is_robot_speak_action(nm):
+            if not asks_robot_speech(text):
+                return RULE_ROBOT_SPEECH, (
+                    f"not run: {nm} makes the desk robot say a line, and "
                     f"sir asked nobody to say anything")
+            if robot_speaker and not asks_robot_speaker(text):
+                return RULE_ROBOT_SPEECH, (
+                    f"not run: {nm} makes the desk robot say a line, but "
+                    f"sir asked you (JARVIS) to say it and named no robot, "
+                    f"so say the words yourself in your reply")
         # Rule 5: the same reading again, for a remark about it.
         if is_informative_action(nm) and is_remark(text):
             a = _norm(arg).lower()
             if (nm, a) in set(_pairs(prior_actions)):
                 shown = f"{nm}({_norm(arg)})" if a else nm
-                return (f"not run: {shown} ran last turn and sir only "
-                        f"remarked on it; running it again only repeats "
-                        f"that answer")
+                return RULE_REMARK_RERUN, (
+                    f"not run: {shown} ran last turn and sir only "
+                    f"remarked on it; running it again only repeats "
+                    f"that answer")
         if not is_status_action(nm):
-            return None
+            return 0, None
         # Rule 1: a list / status action for a command that changes things.
         cmd = owner_command(text)
         if cmd:
             others = [str(r or "").strip().lower() for r in reply_actions
                       if str(r or "").strip().lower() != nm]
             if not any(o and not is_status_action(o) for o in others):
-                return (f"not run: sir asked to {cmd}; {nm} only lists or "
-                        f"reports, it changes nothing")
+                return RULE_STATUS_FOR_COMMAND, (
+                    f"not run: sir asked to {cmd}; {nm} only lists or "
+                    f"reports, it changes nothing")
         # Rule 3: the same read-only check again, right after a correction.
         if is_correction(text):
             a = _norm(arg).lower()
             if (nm, a) in set(_pairs(prior_actions)):
                 shown = f"{nm}({_norm(arg)})" if a else nm
-                return (f"not run: {shown} ran last turn and sir corrected "
-                        f"it; running it again only repeats that answer")
-        return None
+                return RULE_RECHECK_AFTER_CORRECTION, (
+                    f"not run: {shown} ran last turn and sir corrected "
+                    f"it; running it again only repeats that answer")
+        return 0, None
     except Exception:
-        return None
+        return 0, None
 
 
 def failure_result(reason: str) -> str:

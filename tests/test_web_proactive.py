@@ -75,6 +75,9 @@ NOT_PROACTIVE = {
                          "starts nothing",
     "DEV_TODO_ROBOT_STRICT": "how strictly a developer to-do names the robot; "
                              "routing only, starts nothing",
+    "ACTION_FIT_ROBOT_SPEAK_ENFORCE": "a gate on the robot's speak action "
+                                      "(only when sir makes the robot the "
+                                      "speaker); starts nothing",
     "AUDIO_AUTOSWITCH_DEFER_DURING_MEDIA": "a condition on audio auto-switch "
                                            "(its row): waits while media "
                                            "plays, starts nothing",

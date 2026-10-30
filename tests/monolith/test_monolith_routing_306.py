@@ -178,7 +178,9 @@ class DeclineRecheckTurnTests(_Base):
 @requires_monolith
 class RobotSpeechFitTests(_Base):
     """B7: action-fit rule 6 in the REAL _runner (shadow by default): the
-    live line's deskbot_speak still runs and is logged as a misfit."""
+    live line's deskbot_speak still runs and is logged as a misfit - since
+    v3.0.9 only with ACTION_FIT_ROBOT_SPEAK_ENFORCE False; on (the default)
+    rule 6 is enforced even in shadow."""
 
     def setUp(self):
         super().setUp()
@@ -197,10 +199,19 @@ class RobotSpeechFitTests(_Base):
         return out.getvalue()
 
     def test_shadow_runs_and_logs_the_live_misfit(self):
+        # The v3.0.6 shadow behaviour, kept exactly behind
+        # ACTION_FIT_ROBOT_SPEAK_ENFORCE False (v3.0.9).
+        self._p(self.bc, "ACTION_FIT_ROBOT_SPEAK_ENFORCE", False, create=True)
         log = self._dispatch(LIVE_TODO, "shadow")
         self.assertEqual(self.calls["deskbot_speak"],
                          ["I am ready for more dialogue."])
         self.assertIn("[action-fit] would block deskbot_speak", log)
+
+    def test_shadow_enforces_rule_six_since_309(self):
+        # v3.0.9 (live 2026-10-29): rule 6 is enforced even in shadow.
+        log = self._dispatch(LIVE_TODO, "shadow")
+        self.assertEqual(self.calls["deskbot_speak"], [])
+        self.assertIn("[action-fit] blocked deskbot_speak", log)
 
     def test_on_does_not_run_it(self):
         log = self._dispatch(LIVE_TODO, "on")
