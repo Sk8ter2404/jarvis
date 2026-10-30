@@ -192,6 +192,46 @@ class MovieTests(_MediaBase):
         self.assertEqual(self.spoke, [OFFER])
 
 
+class FinishLineThroughTheHoldTests(_MediaBase):
+    """v3.0.10 cross-lane review (lane D's media hold x lane F's
+    FINISH_LINE_KEEP): a print that finishes during his film. The finish
+    line and the companion's offer wait, whole and in order, and are both
+    spoken once the film stops - the offer never alone, the head never lost.
+    The REAL bambu_monitor is the live skill."""
+
+    HEAD = ("Print complete, sir — 'cube' is finished. "
+            "Shall I notify you when the bed has cooled?")
+    TAIL = "Shall I dim the workshop lights for you, sir?"
+
+    def setUp(self):
+        super().setUp()
+        from tests.skills.test_bambu_monitor import _load_bambu
+        self.bm, _ = _load_bambu()
+        p = mock.patch.dict(sys.modules, {"skill_bambu_monitor": self.bm})
+        p.start()
+        self.addCleanup(p.stop)
+        self.bm._finish_line_passed_at[0] = 0.0
+        from core import config
+        self._p(config, "FINISH_LINE_KEEP", True, create=True)
+        with self.bm._state_lock:
+            self.bm._state.update(gcode_state="FINISH", filename="cube.3mf",
+                                  task_id="7")
+
+    def test_held_through_the_film_then_head_and_offer_in_order(self):
+        self._write([
+            dict(self._e(self.HEAD, "bambu", age_s=20 * 60),
+                 still_valid="bambu_finish:cube|job=7"),
+            dict(self._e(self.TAIL, "print_companion", age_s=20 * 60),
+                 still_valid="bambu_finish_offer:"),
+        ])
+        self._drain()
+        self.assertEqual(self.spoke, [], "spoken over the film")
+        self._stop_video()
+        _, log = self._drain()
+        self.assertEqual(self.spoke, [self.HEAD, self.TAIL])
+        self.assertNotIn("finish offer dropped", log)
+
+
 @requires_monolith
 class ArrivalQuietTests(MonolithGlobalsTestCase):
     """v3.0.10 review (ARRIVAL_QUIET_ALL_MOMENTS): inside the quiet period

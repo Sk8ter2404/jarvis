@@ -238,6 +238,46 @@ class MilestoneSupersedeTests(_MonitorBase):
                          ["Print is 25% complete, sir.",
                           "Print is 50% complete, sir."])
 
+    def finish(self, *pcts):
+        self.state(gcode_state="RUNNING", filename="cube.3mf",
+                   mc_percent=10, task_id="9")
+        self.mod._handle_state_change()
+        for pct in pcts:
+            self.state(mc_percent=pct)
+            self.mod._handle_state_change()
+        self.state(gcode_state="FINISH", mc_percent=100)
+        self.mod._handle_state_change()
+        with open(self.queue, encoding="utf-8") as f:
+            return [e["message"] for e in json.load(f)]
+
+    def test_the_finish_line_replaces_a_held_milestone(self):
+        # v3.0.10 cross-lane review: a 75 % line held through his video
+        # must not be read out, stale ETA and all, before "Print complete".
+        self.flag("PRINT_MILESTONE_SUPERSEDE", True)
+        self.flag("FINISH_LINE_KEEP", True)
+        msgs = self.finish(26, 51, 76)
+        self.assertEqual(len(msgs), 1, msgs)
+        self.assertTrue(msgs[0].startswith("Print complete"), msgs)
+
+    def test_flag_off_the_finish_line_keeps_the_held_milestone(self):
+        self.flag("PRINT_MILESTONE_SUPERSEDE", False)
+        self.flag("FINISH_LINE_KEEP", True)
+        msgs = self.finish(26, 51, 76)
+        self.assertEqual(len(msgs), 4, msgs)
+        self.assertIn("75%", msgs[2])
+        self.assertTrue(msgs[3].startswith("Print complete"), msgs)
+
+    def test_the_finish_announcer_gets_check_and_family(self):
+        self.flag("PRINT_MILESTONE_SUPERSEDE", True)
+        bc = types.ModuleType("bc")
+        bc.proactive_announce = mock.MagicMock()
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}):
+            self.mod._enqueue_speech("x", still_valid="bambu_finish:cube",
+                                     supersede="bambu_milestone")
+        self.assertEqual(bc.proactive_announce.call_args.kwargs,
+                         {"source": "bambu", "still_valid": "bambu_finish:cube",
+                          "supersede": "bambu_milestone"})
+
     def test_the_announcer_gets_the_family_tag(self):
         self.flag("PRINT_MILESTONE_SUPERSEDE", True)
         bc = types.ModuleType("bc")

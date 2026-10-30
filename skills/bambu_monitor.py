@@ -745,7 +745,15 @@ def _enqueue_speech(message: str, urgent: bool = False,
                     pass        # an older announcer: say it without the flag
             if still_valid:
                 try:
-                    announcer(message, source="bambu", still_valid=still_valid)
+                    if supersede:
+                        # The finish line (v3.0.10 cross-lane review): its
+                        # check and its milestone family together.
+                        announcer(message, source="bambu",
+                                  still_valid=still_valid,
+                                  supersede=supersede)
+                    else:
+                        announcer(message, source="bambu",
+                                  still_valid=still_valid)
                     return
                 except TypeError:
                     pass
@@ -1259,17 +1267,26 @@ def _handle_state_change() -> None:
         elif time_gate_ok and not already_announced:
             _finish_witnessed[0] = None
             _last_finish_announced_at[0] = now
+            # PRINT_MILESTONE_SUPERSEDE (v3.0.10 cross-lane review): the
+            # finish line joins the milestone family, so a 75 % line still
+            # held (his video, his absence) is replaced by it instead of
+            # being read out, stale ETA and all, just before "Print
+            # complete". Only a new print's milestone could replace it in
+            # turn, and a new job makes the finish line stale anyway. False:
+            # no family tag (the old call).
+            _fin_fam = ({"supersede": "bambu_milestone"}
+                        if _flag_on("PRINT_MILESTONE_SUPERSEDE") else {})
             if fname:
                 _enqueue_speech(
                     f"Print complete, sir — '{fname}' is finished. "
                     "Shall I notify you when the bed has cooled?",
-                    still_valid=_finish_tag(fname),
+                    still_valid=_finish_tag(fname), **_fin_fam,
                 )
             else:
                 _enqueue_speech(
                     "Print complete, sir. "
                     "Shall I notify you when the bed has cooled?",
-                    still_valid=_finish_tag(""),
+                    still_valid=_finish_tag(""), **_fin_fam,
                 )
             _post_finish_bed_watch[0] = True
             _bed_cool_announced[0] = False
