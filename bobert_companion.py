@@ -18013,6 +18013,11 @@ _TURN_FLAG_KEYS = (
     "VOICE_MOOD_CALMING_LIGHTS", "VOICE_MOOD_HONEST_ADDENDUM",
     "MEDIA_TOGGLE_NO_FOLLOWUP", "ACTION_TOPIC_GATE",
     "ACTION_TOPIC_SHARED_SKIP", "RECALL_ACTION_GROUNDING",
+    # v3.0.10 lane F: print finish / milestone lines, media AEC bounds, the
+    # adaptive TV floor, the requeue supersede pass.
+    "FINISH_LINE_KEEP", "PRINT_MILESTONE_SUPERSEDE",
+    "PRINT_MILESTONE_ONE_LINE", "PENDING_REQUEUE_SUPERSEDE",
+    "MEDIA_AEC_DELAY_BOUNDS", "TV_DETECT_ADAPTIVE_BASELINE",
 )
 
 
@@ -39268,6 +39273,11 @@ def _listen_tick() -> None:
                   f"{'converging' if st.get('converging') else 'NOT converging'}"
                   f", frames over VAD raw {100.0 * fr['raw'] / n:.1f} % / "
                   f"cancelled {100.0 * fr['sup'] / n:.1f} %"
+                  # MEDIA_AEC_DELAY_BOUNDS (v3.0.10): its counters, when on.
+                  + (f", realigns {st.get('realigns')} "
+                     f"({st.get('realign_rejected')} rejected, "
+                     f"{st.get('delay_clamped')} clamped)"
+                     if "realign_rejected" in st else "")
                   + ("" if not _aec_ref_missing[0]
                      else " - reference MISSING (protected playback?)"))
     except Exception:
@@ -49963,6 +49973,35 @@ _PENDING_DRAIN_BUDGET_S = 25.0
 _PENDING_SPEAK_MAX_TRIES = 3
 
 
+def _requeue_supersede(items: list, live: list) -> list:
+    """PENDING_REQUEUE_SUPERSEDE (v3.0.10 review): drop each requeued entry
+    whose `supersede` family tag is also on an entry in `live` - the live
+    queue was written during the drain, so it is newer by construction (a
+    held "Print is 25% complete" next to a fresh 50 %). proactive_announce's
+    own supersede pass only sees the file it writes, never the claimed
+    snapshot. False: `items` unchanged (the old merge). Never raises."""
+    try:
+        import core.config as _rq_cfg
+        if not bool(getattr(_rq_cfg, "PENDING_REQUEUE_SUPERSEDE", True)):
+            return items
+        fams = {e.get("supersede") for e in live
+                if isinstance(e, dict) and e.get("supersede")}
+        if not fams:
+            return items
+        kept = []
+        for e in items:
+            fam = e.get("supersede") if isinstance(e, dict) else None
+            if fam and fam in fams:
+                print(f"  [pending] replaced 1 unspoken '{fam}' "
+                      f"announcement(s) on requeue: "
+                      f"{str(e.get('message', ''))[:80]}")
+                continue
+            kept.append(e)
+        return kept
+    except Exception:
+        return items
+
+
 def _requeue_pending_speech(items: list) -> bool:
     """Put un-spoken announcements back on the pending-speech queue.
 
@@ -49998,6 +50037,7 @@ def _requeue_pending_speech(items: list) -> bool:
                         live = decoded
             except Exception:
                 live = []
+        items = _requeue_supersede(items, live)
         merged = list(items) + live
         # Same cap proactive_announce enforces (keep the most recent 50). Say
         # so out loud when it bites: these are announcements we deferred and
@@ -50295,8 +50335,24 @@ def _speak_pending(only_sources=None):
         _sv = item.get("still_valid")
         if _sv:
             try:
-                import skills.bambu_monitor as _bm_sv
-                _sv_ok = bool(_bm_sv.speech_still_valid(str(_sv)))
+                # FINISH_LINE_KEEP (v3.0.10): ask the LIVE skill. The import
+                # below is a second, never-started copy with an empty state,
+                # so it judged every queued finish line stale (10-28 22:26).
+                # No live skill loaded = keep the line.
+                _sv_live = None
+                try:
+                    import core.config as _sv_cfg
+                    if bool(getattr(_sv_cfg, "FINISH_LINE_KEEP", True)):
+                        _sv_live = sys.modules.get("skill_bambu_monitor") or False
+                except Exception:
+                    _sv_live = None
+                if _sv_live is False:
+                    _sv_ok = True
+                elif _sv_live is not None:
+                    _sv_ok = bool(_sv_live.speech_still_valid(str(_sv)))
+                else:
+                    import skills.bambu_monitor as _bm_sv
+                    _sv_ok = bool(_bm_sv.speech_still_valid(str(_sv)))
             except Exception:
                 _sv_ok = True
             if not _sv_ok:
@@ -50306,6 +50362,7 @@ def _speak_pending(only_sources=None):
         _dkey = str(item.get("dedupe_key") or "") or msg
         if _dkey in seen_in_batch or _speech_was_recently_spoken(_dkey):
             print(f"  [pending] suppressed duplicate: {msg[:80]}")
+            _pending_finish_unspoken(item)
             # Progress: after a restart the in-memory dedupe is gone, so a
             # duplicate still in the snapshot would be SPOKEN.
             _rewrite_queue_snapshot(consume_path, back + items[_pos + 1:])
@@ -50349,6 +50406,7 @@ def _speak_pending(only_sources=None):
             # delivered, so keep it owed (in queue order) for a later pass -
             # up to _PENDING_SPEAK_MAX_TRIES attempts, so a line that can
             # never be spoken cannot wedge the queue forever.
+            _pending_finish_unspoken(item)
             _tries = int(item.get("_tries") or 0) + 1
             if _tries < _PENDING_SPEAK_MAX_TRIES:
                 print(f"  [pending] speak failed for reminder "
@@ -50393,6 +50451,27 @@ def _speak_pending(only_sources=None):
     except Exception:
         pass
     return spoke_any
+
+
+def _pending_finish_unspoken(item) -> None:
+    """FINISH_LINE_KEEP (v3.0.10 review): a print-finish line passed its
+    drain check (which stamps it for the follow-on offer) but was NOT spoken
+    - a duplicate, or TTS failed - so tell the live bambu_monitor, and the
+    companion's "Shall I queue a cooldown timer ...?" is not spoken alone.
+    False: nothing (the old path). Never raises."""
+    try:
+        import core.config as _fu_cfg
+        if not bool(getattr(_fu_cfg, "FINISH_LINE_KEEP", True)):
+            return
+        if not str((item or {}).get("still_valid") or "").startswith(
+                "bambu_finish:"):
+            return
+        _bm_live = sys.modules.get("skill_bambu_monitor")
+        _fn = getattr(_bm_live, "note_finish_unspoken", None)
+        if callable(_fn):
+            _fn()
+    except Exception:
+        pass
 
 
 def _rewrite_queue_snapshot(path: str, items: list) -> bool:

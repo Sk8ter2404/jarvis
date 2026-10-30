@@ -177,9 +177,13 @@ class PrintCompanionCompletionOfferTests(PrintCompanionMixin, unittest.TestCase)
         # bambu_monitor always speaks its own "Print complete" line on
         # FINISH — the companion must trail with just the offer, never
         # repeat the head (regression: triple-stacked completion lines).
+        # FINISH_LINE_KEEP off: the old offer, both halves (the flag-on trim
+        # is pinned in tests/skills/test_print_lines_3010).
+        from core import config
         mod, _a = self._load(bambu_state={"last_update": 0.0})
         with mock.patch.object(mod, "_light_skill_available", return_value=True), \
-             mock.patch.object(mod, "_timer_skill_available", return_value=True):
+             mock.patch.object(mod, "_timer_skill_available", return_value=True), \
+             mock.patch.object(config, "FINISH_LINE_KEEP", False, create=True):
             out = mod._completion_offer_line("cube")
         self.assertNotIn("Print complete", out)
         self.assertIn("dim the workshop lights", out)

@@ -265,6 +265,8 @@ def _note_verdict(decider) -> None:
     try:
         dbg = decider.debug_state(time.time())
         evidence = f"{dbg['qualifying']}/{dbg['fresh_readings']} frames"
+        if "motion_floor" in dbg:   # TV_DETECT_ADAPTIVE_BASELINE (v3.0.10)
+            evidence += f", motion floor {dbg['motion_floor']:.1f}"
     except Exception:
         evidence = "?"
     nums = (f"luma {b:.0f}, motion {d:.1f}, " if b is not None and d is not None

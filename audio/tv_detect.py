@@ -132,6 +132,32 @@ WHOLE_FRAME_OFF_FRAMES = 4
 WHOLE_FRAME_MAX_AGE_S = 20.0
 VERDICT_MIN_DWELL_S = 20.0
 
+# Adaptive OFF baseline for the whole-frame view (TV_DETECT_ADAPTIVE_BASELINE,
+# core/config.py, v3.0.10). The 10-15 profile cut the flips from 513 in 162
+# minutes to about 236 in 25 hours (10-28/29), still mostly a person: 58 of
+# 118 ON spells ended within 30 s, the OFF readings sat at motion 3.1-3.9
+# (mode 3.4-3.5) just under the fixed 4.0 floor, and the ON readings were
+# 4.2-6. A fixed floor cannot fit every room, so the uncalibrated decider
+# learns the room's own idle motion: the median motion of the last
+# BASELINE_READINGS readings that did NOT qualify. A reading then qualifies
+# only at max(TEMPORAL_DELTA_ON_MIN, baseline + BASELINE_MARGIN), and while
+# the verdict is ON at baseline + BASELINE_MARGIN * BASELINE_HOLD_FRACTION
+# (hysteresis: a playing screen's quiet scene does not drop it). Until
+# BASELINE_MIN_READINGS idle readings exist the fixed floor applies. A
+# calibrated TV rectangle never uses it (the crop leaves the room out).
+# Only TRULY idle readings are learned (verdict OFF and motion under the
+# fixed floor), and the floor never rises above TEMPORAL_DELTA_ON_MIN +
+# BASELINE_MARGIN: learning every non-qualifying reading let a playing TV's
+# quieter scenes ratchet the floor upward until the TV never read ON.
+# Residual (replay of the 122 logged 10-28 ON motions as 25 s bursts over a
+# 3.1-3.9 idle room): flips fall about 54 % (205 -> 94), not to zero; about
+# 40 % of the live bursts move harder than the learned floor (~6.45). The
+# 20 s dwell still applies; calibrating the TV region is the real cure.
+BASELINE_READINGS = 120
+BASELINE_MIN_READINGS = 30
+BASELINE_MARGIN = 3.0
+BASELINE_HOLD_FRACTION = 0.5
+
 
 # ─── per-frame statistics (pure; numpy only — NO cv2) ──────────────────────
 def _as_luma(frame: Any) -> "Optional[_np.ndarray]":
@@ -261,7 +287,8 @@ class TVDecider:
                  max_age_s: float = READING_MAX_AGE_S,
                  bright_min: float = BRIGHTNESS_ON_MIN,
                  delta_min: float = TEMPORAL_DELTA_ON_MIN,
-                 min_dwell_s: float = 0.0) -> None:
+                 min_dwell_s: float = 0.0,
+                 adaptive_baseline: bool = False) -> None:
         self.window = max(1, int(window))
         self.on_frames = max(1, int(on_frames))
         self.off_frames = max(0, int(off_frames))
@@ -274,6 +301,31 @@ class TVDecider:
         self._readings: list[tuple[bool, float]] = []   # (qualifies, ts)
         self._on = False
         self._changed_at: Optional[float] = None   # ts of the last flip
+        # The room's idle motion (BASELINE_READINGS): False = the fixed
+        # delta_min only, exactly the old decider.
+        self.adaptive_baseline = bool(adaptive_baseline)
+        self._idle_motion: list[float] = []
+
+    def delta_threshold(self) -> float:
+        """The motion a reading needs to qualify right now: delta_min, or with
+        the adaptive baseline max(delta_min, idle median + margin) (a smaller
+        margin while ON). Pure; never raises."""
+        try:
+            if (not self.adaptive_baseline
+                    or len(self._idle_motion) < BASELINE_MIN_READINGS):
+                return self.delta_min
+            vals = sorted(self._idle_motion)
+            mid = len(vals) // 2
+            med = (vals[mid] if len(vals) % 2
+                   else (vals[mid - 1] + vals[mid]) / 2.0)
+            margin = BASELINE_MARGIN * (BASELINE_HOLD_FRACTION if self._on
+                                        else 1.0)
+            # Capped: the floor can never climb past the fixed floor plus
+            # one margin, whatever was learned.
+            return min(max(self.delta_min, med + margin),
+                       self.delta_min + BASELINE_MARGIN)
+        except Exception:
+            return self.delta_min
 
     def observe(self, brightness: Optional[float],
                 temporal_delta: Optional[float],
@@ -281,8 +333,22 @@ class TVDecider:
         """Record one reading and re-evaluate the latched verdict. Returns the
         verdict AFTER this reading. ``ts`` defaults to wall-clock now."""
         now = time.time() if ts is None else float(ts)
-        q = frame_qualifies(brightness, temporal_delta,
-                             self.bright_min, self.delta_min)
+        if self.adaptive_baseline:
+            q = frame_qualifies(brightness, temporal_delta,
+                                self.bright_min, self.delta_threshold())
+            # Learn only truly idle readings: verdict OFF and motion under
+            # the fixed floor (a playing TV's quiet scenes must not count).
+            if not q and not self._on and temporal_delta is not None:
+                try:
+                    v = float(temporal_delta)
+                    if v < self.delta_min:
+                        self._idle_motion.append(v)
+                except (TypeError, ValueError):
+                    pass
+                del self._idle_motion[:-BASELINE_READINGS]
+        else:
+            q = frame_qualifies(brightness, temporal_delta,
+                                self.bright_min, self.delta_min)
         self._readings.append((q, now))
         # Keep only the most-recent `window` readings.
         if len(self._readings) > self.window:
@@ -330,6 +396,7 @@ class TVDecider:
 
     def reset(self) -> None:
         self._readings.clear()
+        self._idle_motion.clear()
         self._on = False
         self._changed_at = None
 
@@ -345,6 +412,9 @@ class TVDecider:
             "on_frames": self.on_frames,
             "off_frames": self.off_frames,
             "min_dwell_s": self.min_dwell_s,
+            **({"motion_floor": round(self.delta_threshold(), 2),
+                "idle_readings": len(self._idle_motion)}
+               if self.adaptive_baseline else {}),
         }
 
 
@@ -359,7 +429,18 @@ def decider_for(calibrated: bool) -> TVDecider:
                      on_frames=WHOLE_FRAME_ON_FRAMES,
                      off_frames=WHOLE_FRAME_OFF_FRAMES,
                      max_age_s=WHOLE_FRAME_MAX_AGE_S,
-                     min_dwell_s=VERDICT_MIN_DWELL_S)
+                     min_dwell_s=VERDICT_MIN_DWELL_S,
+                     adaptive_baseline=_adaptive_baseline_on())
+
+
+def _adaptive_baseline_on() -> bool:
+    """core.config TV_DETECT_ADAPTIVE_BASELINE (default True), read when the
+    decider is built. Never raises."""
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, "TV_DETECT_ADAPTIVE_BASELINE", True))
+    except Exception:
+        return True
 
 
 # ─── calibration store (gitignored json, atomic write) ─────────────────────

@@ -861,6 +861,26 @@ MEDIA_AEC_DELAY_WINDOW_S = 4.0      # each measurement looks this far back
 MEDIA_AEC_DRIFT_WINDOW_S = 120.0
 MEDIA_AEC_MAX_LAG_S = 0.400         # GCC searches the echo up to this late
 MEDIA_AEC_MAX_LEAD_S = 0.200        # ... and this early
+# MEDIA_AEC_DELAY_BOUNDS (core/config.py, v3.0.10): live 2026-10-29 the
+# wall-clock delay walked from the 40 ms prior to -1485 ms in ~100 ms steps
+# (each GCC search is relative to the CURRENT alignment, so realigns add up
+# with no bound) and the canceller sat in pass-through for hours. A real
+# echo path is speaker + room + capture latency less the loopback's: the
+# 10-19 room recording had the loopback up to ~200 ms late (a negative
+# delay), and a Bluetooth speaker can add a few hundred ms. With the flag on
+# a realign that would leave [MIN, MAX] is rejected (counted in
+# stats["realign_rejected"]), a drift correction is clipped into it
+# (stats["delay_clamped"]), and an echo "out of the filter's reach" must be
+# confirmed by two measurements in a row like any other realign (a single
+# spurious negative PHAT peak moved it at once). The confirming measure is
+# scheduled one DELAY_WINDOW later (fresh audio, independent evidence)
+# instead of the slow 10 s cadence, so a real path change (a Bluetooth
+# speaker) waits ~4 s more, not ~10 s. MEDIA_AEC_REJECT_LOG_AFTER rejected
+# realigns in a row log one "[media-aec] echo path outside the bounds" line
+# per canceller, so a genuinely long speaker path can be diagnosed.
+MEDIA_AEC_DELAY_MIN_S = -0.300
+MEDIA_AEC_DELAY_MAX_S = 0.600
+MEDIA_AEC_REJECT_LOG_AFTER = 3
 MEDIA_AEC_REF_ACTIVE_RMS = 1e-4     # quieter reference = silence
 # How long a block may wait for a reference that has not been written yet
 # (2026-10-19 room recording, offline replay of this class): live, the
@@ -1146,7 +1166,8 @@ class MediaEchoCanceller:
     Thread-safe; never raises (a failure passes the chunk through)."""
 
     def __init__(self, ref=None, sample_rate: int = 16000,
-                 clock=time.monotonic, delay_prior_s: float = 0.040):
+                 clock=time.monotonic, delay_prior_s: float = 0.040,
+                 delay_bounds: "bool | None" = None):
         self.sr = int(sample_rate)
         self.ref = ref
         self._clock = clock
@@ -1165,6 +1186,23 @@ class MediaEchoCanceller:
         self.stats = {"resets": 0, "realigns": 0, "delay_measures": 0,
                       "drift_updates": 0, "chunks": 0, "passthrough": 0,
                       "ref_late": 0, "sessions": 0, "not_converging": 0}
+        # MEDIA_AEC_DELAY_BOUNDS: (min, max) delay_wall in samples, or None
+        # (the old unbounded path). ``delay_bounds`` None = read the flag.
+        if delay_bounds is None:
+            try:
+                from core import config as _cfg  # type: ignore
+                delay_bounds = bool(getattr(_cfg, "MEDIA_AEC_DELAY_BOUNDS",
+                                            True))
+            except Exception:
+                delay_bounds = True
+        self._bounds = None
+        if delay_bounds:
+            self._bounds = (MEDIA_AEC_DELAY_MIN_S * self.sr,
+                            MEDIA_AEC_DELAY_MAX_S * self.sr)
+            self.stats["realign_rejected"] = 0
+            self.stats["delay_clamped"] = 0
+        self._rejected_run = 0           # rejected realigns in a row
+        self._rejected_logged = False    # the one bounds line, per canceller
         self._hist_n = int(self.sr * MEDIA_AEC_DELAY_WINDOW_S)
         self._mic_hist = np.zeros(self._hist_n)
         self._x_hist = np.zeros(self._hist_n)
@@ -1310,6 +1348,27 @@ class MediaEchoCanceller:
         step = int(round(err))
         if step == 0:
             return
+        if self._bounds is not None and not (
+                self._bounds[0] <= self.delay_wall + step <= self._bounds[1]):
+            # MEDIA_AEC_DELAY_BOUNDS: no physical echo path is that far off.
+            self.stats["realign_rejected"] += 1
+            self._gcc_last = None
+            self._rejected_run += 1
+            if (not self._rejected_logged
+                    and self._rejected_run >= MEDIA_AEC_REJECT_LOG_AFTER):
+                self._rejected_logged = True
+                try:
+                    print(f"  [media-aec] echo path outside the "
+                          f"{MEDIA_AEC_DELAY_MIN_S * 1000:+.0f}.."
+                          f"{MEDIA_AEC_DELAY_MAX_S * 1000:+.0f} ms bounds "
+                          f"({self._rejected_run} realigns in a row would "
+                          f"move it to "
+                          f"{(self.delay_wall + step) * 1000.0 / self.sr:+.0f}"
+                          f" ms) - a long-latency speaker?")
+                except Exception:
+                    pass
+            return
+        self._rejected_run = 0
         self._A -= step
         self._sess_shift += step
         self.delay_wall += step
@@ -1389,8 +1448,16 @@ class MediaEchoCanceller:
         if lag < self.margin / 3.0 or lag > self.margin + 0.050 * self.sr:
             last, self._gcc_last = self._gcc_last, lag
             reachable = 0 <= lag <= self.f.P * self.f.B - self.f.B
-            if reachable and (last is None
-                              or abs(last - lag) > 0.002 * self.sr):
+            # MEDIA_AEC_DELAY_BOUNDS: an unreachable lag is confirmed too.
+            confirm = reachable or self._bounds is not None
+            if confirm and (last is None
+                            or abs(last - lag) > 0.002 * self.sr):
+                if self._bounds is not None and self._next_measure is not None:
+                    # MEDIA_AEC_DELAY_BOUNDS: confirm on fresh audio one
+                    # window later, not at the slow 10 s cadence.
+                    self._next_measure = min(
+                        self._next_measure,
+                        self._k + int(MEDIA_AEC_DELAY_WINDOW_S * self.sr))
                 return                     # confirm it on the next measure
             self._gcc_last = None
             self._realign(err)
@@ -1469,6 +1536,11 @@ class MediaEchoCanceller:
         # turn a converged filter into a 1-2 s burst of uncancelled video
         # at 20-40 ppm (2026-10-09 review, synthetic reopen probe).
         self.delay_wall -= self._k * slope
+        if self._bounds is not None:
+            lo, hi = self._bounds
+            if not lo <= self.delay_wall <= hi:
+                self.delay_wall = float(min(max(self.delay_wall, lo), hi))
+                self.stats["delay_clamped"] += 1
         self.eps = float(np.clip(self.eps - slope, -300e-6, 300e-6))
         self._last_drift_step = abs(slope)
         self.stats["drift_updates"] += 1

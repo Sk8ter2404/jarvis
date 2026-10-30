@@ -181,14 +181,39 @@ def _strip_filename(name: str) -> str:
 
 
 # ── speech ────────────────────────────────────────────────────────
-def _enqueue_speech(message: str) -> None:
+def _flag_on(name: str) -> bool:
+    """A core.config flag, read live (default True). Never raises."""
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, name, True))
+    except Exception:
+        return True
+
+
+def _enqueue_speech(message: str, still_valid: str | None = None,
+                    supersede: str | None = None) -> None:
     """Route a proactive line through bobert_companion's
     proactive_announce(), falling back to bambu_monitor's queue writer
-    and ultimately a direct write so we never silently lose a callout."""
+    and ultimately a direct write so we never silently lose a callout.
+
+    ``still_valid`` (FINISH_LINE_KEEP) / ``supersede``
+    (PRINT_MILESTONE_SUPERSEDE), v3.0.10: passed on only when set; an
+    announcer that does not take them gets the plain call."""
+    extra = {}
+    if still_valid:
+        extra["still_valid"] = still_valid
+    if supersede:
+        extra["supersede"] = supersede
     try:
         bc = importlib.import_module("bobert_companion")
         fn = getattr(bc, "proactive_announce", None)
         if callable(fn):
+            if extra:
+                try:
+                    fn(message, source="print_companion", **extra)
+                    return
+                except TypeError:
+                    pass
             fn(message, source="print_companion")
             return
     except Exception:
@@ -196,6 +221,12 @@ def _enqueue_speech(message: str) -> None:
     bm = _get_bambu_module()
     if bm is not None and hasattr(bm, "_enqueue_speech"):
         try:
+            if extra:
+                try:
+                    bm._enqueue_speech(message, **extra)
+                    return
+                except TypeError:
+                    pass
             bm._enqueue_speech(message)
             return
         except Exception:
@@ -282,6 +313,47 @@ def _milestone_commentary(threshold: int, remaining_min) -> str:
     return f"{opener} — {eta_phrase}, {hedge}."
 
 
+def _focus_active() -> bool:
+    """True while the live do-not-disturb skill is engaged (its banter is
+    muted). Absent skill = False. Never raises."""
+    try:
+        mod = sys.modules.get("skill_dnd_focus_mode")
+        fn = getattr(mod, "is_focus_mode_active", None) if mod else None
+        return bool(fn()) if callable(fn) else False
+    except Exception:
+        return False
+
+
+def _one_line_milestone(threshold: int, remaining_min) -> str:
+    """PRINT_MILESTONE_ONE_LINE (v3.0.10): the companion's milestone line, or
+    "" to stay quiet. Spoken only when it adds the finish time the plain
+    bambu_monitor line lacked, never in focus mode, and never with a hedge
+    tail naming a fault nobody saw. Never raises."""
+    try:
+        if _focus_active():
+            print(f"  [print_companion] {threshold}% line skipped: focus mode")
+            return ""
+        eta = _format_eta_clock(remaining_min)
+        if not eta:
+            print(f"  [print_companion] {threshold}% line skipped: no ETA yet")
+            return ""
+        bm = _get_bambu_module()
+        had = getattr(bm, "_milestone_had_eta", None) if bm else None
+        if isinstance(had, dict) and had.get(threshold):
+            print(f"  [print_companion] {threshold}% line skipped: the plain "
+                  "line already gave the time left")
+            return ""
+        if threshold == 25:
+            opener = "Quarter of the way along, sir"
+        elif threshold == 50:
+            opener = "Halfway through, sir"
+        else:
+            opener = "Three-quarters complete, sir"
+        return f"{opener} — current trajectory suggests completion at {eta}."
+    except Exception:
+        return ""
+
+
 def _light_skill_available() -> bool:
     """True if sh_hue or sh_govee is loaded AND reports at least one device.
 
@@ -329,7 +401,7 @@ def _timer_skill_available() -> bool:
     return True
 
 
-def _completion_offer_line(pretty_filename: str) -> str:
+def _completion_offer_line(pretty_filename: str, own_head: bool = False) -> str:
     """Compose the FINISH offer based on which downstream skills are live.
 
     Degrades silently per-feature: no light skill loaded → no dim mention;
@@ -341,16 +413,25 @@ def _completion_offer_line(pretty_filename: str) -> str:
     trail-behind), and return "" when there's nothing to offer so the user
     doesn't hear the same completion announced twice. Only when
     bambu_monitor is absent do we own the full announcement ourselves.
+
+    ``own_head`` (FINISH_LINE_KEEP, v3.0.10 review): bambu_monitor is loaded
+    but queued no finish line for this print - compose the full head too.
+    With FINISH_LINE_KEEP on and bambu_monitor owning the head, the
+    cooldown-timer offer is left out: the head already asks "Shall I notify
+    you when the bed has cooled?", and a "yes" to two different offers back
+    to back was ambiguous (10-28 22:26).
     """
+    bambu_announces = _get_bambu_module() is not None and not own_head
     has_lights = _light_skill_available()
     has_timer  = _timer_skill_available()
+    if has_timer and bambu_announces and _flag_on("FINISH_LINE_KEEP"):
+        has_timer = False
     offers: list[str] = []
     if has_lights:
         offers.append("dim the workshop lights")
     if has_timer:
         offers.append("queue a cooldown timer")
 
-    bambu_announces = _get_bambu_module() is not None
     if bambu_announces:
         if not offers:
             return ""
@@ -507,6 +588,7 @@ def _reset_per_print_state() -> None:
     _milestone_detected_at.clear()
     _milestone_announced.clear()
     _announced_completion_offer[0]  = False
+    _finish_seen_at[0]              = 0.0
     _warned_historical_failure[0]   = False
     _vision_samples.clear()
 
@@ -557,6 +639,29 @@ def _maybe_warn_historical_failure(state: dict) -> None:
     )
 
 
+# FINISH_LINE_KEEP (v3.0.10 review): how long the companion waits, after it
+# first sees FINISH, for bambu_monitor to queue its own finish line before it
+# speaks the full announcement itself (the monitor skips a FINISH it did not
+# "witness", e.g. a gcode_file name in place of subtask_name). The hook fires
+# right after the monitor's handling and the poll every 15 s, so this spans
+# at least one more call.
+FINISH_HEAD_WAIT_S = 20.0
+_finish_seen_at: list = [0.0]
+
+
+def _monitor_head_queued(bm) -> "bool | None":
+    """Did bambu_monitor queue a finish line for this print? True / False, or
+    None when it cannot tell (an older monitor: assume it did, the old
+    behaviour). Never raises."""
+    try:
+        stamp = getattr(bm, "_last_finish_announced_at", None)
+        if not isinstance(stamp, list) or not stamp:
+            return None
+        return float(stamp[0] or 0.0) > 0.0
+    except Exception:
+        return None
+
+
 def _maybe_announce_completion_offer(state: dict) -> None:
     if _announced_completion_offer[0]:
         return
@@ -566,11 +671,33 @@ def _maybe_announce_completion_offer(state: dict) -> None:
         return
     fname  = state.get("filename") or _current_filename[0] or ""
     pretty = _strip_filename(fname)
-    line = _completion_offer_line(pretty)
+    bm = _get_bambu_module()
+    keep = bm is not None and _flag_on("FINISH_LINE_KEEP")
+    own_head = False
+    if keep and _monitor_head_queued(bm) is False:
+        # FINISH_LINE_KEEP: the monitor queued no head (yet). Wait a little
+        # for it; past that, speak the full announcement ourselves - an
+        # offer-only line would be dropped and the finish go unsaid.
+        now = time.time()
+        if not _finish_seen_at[0]:
+            _finish_seen_at[0] = now
+        if now - _finish_seen_at[0] < FINISH_HEAD_WAIT_S:
+            return
+        print("  [print_companion] bambu_monitor queued no finish line - "
+              "speaking the full announcement")
+        own_head = True
+    line = (_completion_offer_line(pretty, own_head=True) if own_head
+            else _completion_offer_line(pretty))
     # Empty line means bambu_monitor already owns the completion
     # announcement and we have no offer to trail it with — stay quiet.
     if line:
-        _enqueue_speech(line)
+        # FINISH_LINE_KEEP (v3.0.10): when bambu_monitor owns the head this
+        # is only the offer ("Shall I ... for you, sir?"); the drain speaks
+        # it only right after its finish line, never on its own.
+        if keep and not own_head:
+            _enqueue_speech(line, still_valid="bambu_finish_offer:")
+        else:
+            _enqueue_speech(line)
     _announced_completion_offer[0] = True
     _record_print_outcome("success", state)
 
@@ -679,7 +806,14 @@ def _poll_once_locked() -> None:
             if now - first_seen < MILESTONE_OFFSET_SECONDS:
                 continue
             _milestone_announced.add(threshold)
-            _enqueue_speech(_milestone_commentary(threshold, remaining))
+            if _flag_on("PRINT_MILESTONE_ONE_LINE"):
+                text = _one_line_milestone(threshold, remaining)
+            else:
+                text = _milestone_commentary(threshold, remaining)
+            if text and _flag_on("PRINT_MILESTONE_SUPERSEDE"):
+                _enqueue_speech(text, supersede="bambu_milestone")
+            elif text:
+                _enqueue_speech(text)
             _sample_vision_async(threshold)
             break  # one milestone per poll, never stack
 

@@ -1409,6 +1409,19 @@ MEDIA_AEC_DRM_FALLBACK     = "shadow"
 # build does not carry).
 MEDIA_SEGMENT_S            = 12.0
 MEDIA_AEC_BACKEND          = "nlms"
+# MEDIA_AEC_DELAY_BOUNDS (bool, core/audio_processor.MediaEchoCanceller, read
+# when the canceller is built): live 2026-10-29 the canceller's delay walked
+# from the 40 ms prior to -1485 ms in ~100 ms steps (one realign per single
+# spurious PHAT peak, never bounded) and it sat in pass-through, removing
+# nothing. True (default): the delay stays within MEDIA_AEC_DELAY_MIN_S ..
+# MEDIA_AEC_DELAY_MAX_S (-300 .. +600 ms), a realign that would leave that
+# range is rejected and counted, a drift correction is clipped into it, and
+# an echo "out of the filter's reach" needs two agreeing measurements like
+# any other realign; the confirming measure runs one 4 s window later (not at
+# the slow 10 s cadence), and three rejections in a row log one
+# "[media-aec] echo path outside the bounds" line (a speaker path over
+# 600 ms). False: the old unbounded path exactly. Applies on the next start.
+MEDIA_AEC_DELAY_BOUNDS     = True
 # skills/wake_listener.py's own detector autostart (its own InputStream; off:
 # it collides with record_speech on the same WASAPI device). Its ONE default
 # (2026-10-05) - distinct from WAKE_WORD_AUTOSTART, the standby wake latch.
@@ -2062,6 +2075,58 @@ BAMBU_PUSHALL_ON_CONNECT = True
 # is missing say why ("the printer hasn't sent its time estimate yet, sir").
 # False: the old field names and replies exactly. Read live.
 PRINT_STATUS_HONEST = True
+# FINISH_LINE_KEEP (bool, skills/bambu_monitor.speech_still_valid /
+# _handle_state_change, skills/proactive_print_companion, and the speech-queue
+# drain in bobert_companion.py): live 2026-10-28 22:26:44 "[pending] dropped
+# stale announcement: Print complete, sir - '<name>' is finished" and two
+# seconds later the companion's "Shall I queue a cooldown timer for you, sir?"
+# was spoken on its own. The drain asked `import skills.bambu_monitor`, a
+# SECOND never-started copy of the skill (the loader registers the live one as
+# sys.modules["skill_bambu_monitor"]), whose state is empty, so EVERY queued
+# finish line was judged stale (10-14 18:02, 10-28 12:04 and 22:26 too).
+# True (default): the drain asks the live module (no live module = keep the
+# line); a finish line is stale only when a new job is running (RUNNING /
+# PREPARE / PAUSE) or the printer's job id changed, never for a file-name
+# change alone; every drop is logged with its reason; and the companion's
+# follow-on offer is spoken only right after its finish line was. Review
+# 10-29: a job id is compared only with one from the same report key (a push
+# carrying only subtask_id is not a new job); a finish line passed but not
+# spoken (duplicate, TTS failure) and a new print both clear the offer's
+# stamp; when bambu_monitor queued no finish line at all the companion waits
+# 20 s and then speaks the full announcement itself; and the companion leaves
+# out its "queue a cooldown timer" offer when the monitor's head already asks
+# about the bed cooling. False: the old check exactly (a second module copy;
+# FINISH and the same file name, or drop), unlogged, and the offer queued on
+# its own. Read live.
+FINISH_LINE_KEEP = True
+# PRINT_MILESTONE_SUPERSEDE (bool, skills/bambu_monitor milestones,
+# skills/proactive_print_companion milestone line): live 2026-10-28 21:58:39
+# the owner-away hold released "Print is 25% complete" next to "Print is 50%
+# complete" (both still queued). True (default): every milestone line joins
+# the queue's "bambu_milestone" supersede family, so a newer milestone
+# replaces an older one that was never spoken. False: each line queues on its
+# own (the old behaviour). Read live.
+PRINT_MILESTONE_SUPERSEDE = True
+# PENDING_REQUEUE_SUPERSEDE (bool, bobert_companion._requeue_pending_speech):
+# v3.0.10 review of the 10-28 21:58 case - while a drain holds the claimed
+# queue (the owner-away hold speaking an exempt timer line), a newer 50 %
+# milestone lands in a fresh queue file and cannot remove the held 25 %; the
+# requeue merged both back. True (default): a requeued entry whose supersede
+# family is also on a newer queued entry is dropped and logged ("[pending]
+# replaced ..."), for every supersede family. False: the old merge exactly.
+# Read live.
+PENDING_REQUEUE_SUPERSEDE = True
+# PRINT_MILESTONE_ONE_LINE (bool, skills/proactive_print_companion,
+# skills/bambu_h2d_voice_companion): live 2026-10-28 21:58 four lines in 11 s
+# for two milestones, the companion's ending in made-up faults ("a hiccup in
+# the cooling fans", "a wobble in the filament tension") with no ETA at all.
+# True (default): the companion's milestone line is spoken only when it adds
+# the finish time the plain line lacked (a clock ETA is known), never while
+# focus / do-not-disturb is on, and never with a hedge tail; the H2D voice
+# companion leaves 25/50/75/100% to bambu_monitor when that skill is loaded.
+# False: the old lines exactly (hedged commentary 45 s after every milestone,
+# the H2D "Print at N%" variant). Read live.
+PRINT_MILESTONE_ONE_LINE = True
 
 # ─── Routing fixes (v3.0.6, 2026-10-28 human test + misroutes report) ─────
 # TIMER_LABEL_GROUNDING (skills/timer.py grounded_label): live 2026-10-28
@@ -3173,6 +3238,22 @@ KINECT_GHOST_DEPTH_RECHECK_SEC = 1.0
 #   detection', 'tv detection status', 'calibrate the tv region'. See
 #   audio/tv_detect.py (pure stats + region store) + skills/tv_detect.py (wiring).
 TV_DETECT_ENABLED = True
+# TV_DETECT_ADAPTIVE_BASELINE (bool, audio/tv_detect.decider_for, read when
+# the decider is built): live 2026-10-28/29 the UNCALIBRATED detector still
+# flipped about 236 times in 25 h (58 of 118 ON spells under 30 s; idle
+# motion 3.1-3.9 just under the fixed 4.0 floor, the "ON" bursts 4.2-6: a
+# person moving at the desk). True (default): with no TV rectangle the
+# decider learns the room's idle motion (the median of its last 120 readings
+# that did not qualify) and a reading must beat it by 3.0 to count, half that
+# while ON (hysteresis); a calibrated region is untouched. Only truly idle
+# readings are learned (verdict OFF, motion under 4.0) and the floor is capped
+# at 7.0, so a playing TV's quiet scenes cannot ratchet it up until the TV
+# never reads ON. Residual, stated honestly: replaying the 122 logged ON
+# motions as 25 s bursts cuts the flips about 54 % (205 -> 94), not to zero;
+# about 40 % of those bursts move harder than the learned ~6.45 floor. The
+# real cure is still his "calibrate the tv region". False: the fixed 4.0
+# floor exactly.
+TV_DETECT_ADAPTIVE_BASELINE = True
 
 
 # ─── Face recognition (identity, opt-in; all default off) ──────────────
