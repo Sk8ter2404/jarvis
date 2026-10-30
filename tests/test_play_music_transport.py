@@ -354,6 +354,33 @@ class TakenOfferReaderTests(unittest.TestCase):
         self.assertFalse(A._said_play_title(
             "Shall I play Carry On for you, sir?", "Carry On"))
 
+    def test_a_quoted_title_and_courtesy_before_or(self):
+        # Adversarial review 2026-10-29: the brain quotes titles in its
+        # offers, and puts "for you, sir" before "or ...".
+        for offer, arg, want in (
+                ('Shall I play "Carry On" for you, sir?', "Carry On", True),
+                ("Shall I play “Carry On” by fun., sir?",
+                 "Carry On", True),
+                ("Shall I play 'Carry On'?", "Carry On", True),
+                ("Shall I play ‘Carry On’ again?", "Carry On",
+                 True),
+                ('Shall I play "Resume"?', '"Resume"', True),
+                ("Shall I play Carry On for you, sir, or something calmer?",
+                 "Carry On", True),
+                ("I could play Carry On if you like, sir.", "Carry On",
+                 True),
+                ("Shall I play Don't Stop Me Now?", "Don't Stop Me Now",
+                 True),
+                ('Shall I play "it"?', "it", False),
+                ("Shall I play something else, or resume?", "resume",
+                 False),
+                ("Shall I play Carry On Wayward Son?", "Carry On", False)):
+            with self.subTest(offer=offer):
+                self.assertIs(A._said_play_title(offer, arg, offer=True),
+                              want)
+        # The owner's own words are unchanged (quotes still count).
+        self.assertFalse(A._said_play_title('play "Carry On"', "Carry On"))
+
 
 class NothingToResumeTests(unittest.TestCase):
     """The REAL resume / pause handlers with the media session reporting

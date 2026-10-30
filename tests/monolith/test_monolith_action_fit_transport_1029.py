@@ -183,6 +183,16 @@ class AcceptedSongOfferTests(_TransportFitBase):
         self.resume.assert_not_called()
         self.assertIn("the offer sir took named this title", printed)
 
+    def test_all_right_to_a_quoted_song_offer_plays_the_song(self):
+        # Adversarial review 2026-10-29: the brain quotes the title, and
+        # "All right." takes the offer while it is open.
+        self.turn("Jarvis, any music suggestions?",
+                  ['Shall I play "Carry On" for you, sir?'])
+        self.turn("All right.",
+                  ["Right away. [ACTION: play_music, Carry On]"])
+        self.search.assert_called_once_with("Carry On")
+        self.resume.assert_not_called()
+
     def test_the_taken_offer_reaches_the_classifier(self):
         import core.actions as A
         bc = self.bc

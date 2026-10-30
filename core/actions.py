@@ -5118,12 +5118,19 @@ def _play_music_transport_on() -> bool:
 
 # What may follow the title in JARVIS's own offer ("Shall I play Carry On
 # for you, sir?", "Shall I play Resume now?"): courtesy words, then the end
-# of the line - or "by <artist>", "and ...", "or ..." (cross-lane review
+# of the line - or "by <artist>", "and ...", "or ...", "if you ..."
+# (cross-lane review 2026-10-29). The courtesy words may come first ("Shall
+# I play Carry On for you, sir, or something calmer?", adversarial review
 # 2026-10-29).
 _OFFER_TITLE_TAIL_RE = (
-    r"(?:\s+(?:by|from|and|or)\b"
-    r"|(?:\s+(?:for\s+you|for\s+sir|sir|now|again|instead|then|next"
-    r"|right\s+away|straight\s+away))*$)")
+    r"(?:\s+(?:for\s+you|for\s+sir|sir|now|again|instead|then|next"
+    r"|right\s+away|straight\s+away))*"
+    r"(?:\s+(?:by|from|and|or|if\s+you)\b|$)")
+# The quotes JARVIS puts round a title in his offer ('Shall I play "Carry
+# On" by fun.?', adversarial review 2026-10-29): off on both sides before
+# the match. An apostrophe inside a word ("Don't Stop") stays.
+_OFFER_QUOTE_RE = re.compile(
+    "[\"“”‘«»]|(?<!\\w)'|'(?!\\w)")
 
 
 def _said_play_title(said: str, arg: str, offer: bool = False) -> bool:
@@ -5133,11 +5140,15 @@ def _said_play_title(said: str, arg: str, offer: bool = False) -> bool:
     "it" / "that" never counts ("play it" is a transport request).
     ``offer``: ``said`` is the offer the turn took ("Shall I play Carry On
     for you, sir?"), so courtesy words may follow the title
-    (_OFFER_TITLE_TAIL_RE). Never raises (an error reads as False)."""
+    (_OFFER_TITLE_TAIL_RE) and quotes round the title do not count
+    (_OFFER_QUOTE_RE). Never raises (an error reads as False)."""
     try:
         from core.dispatcher import _transport_norm
         norm_arg = _transport_norm(arg)
         norm_said = _transport_norm(said)
+        if offer:
+            norm_arg = " ".join(_OFFER_QUOTE_RE.sub(" ", norm_arg).split())
+            norm_said = " ".join(_OFFER_QUOTE_RE.sub(" ", norm_said).split())
         if not norm_arg or not norm_said or norm_arg in ("it", "that"):
             return False
         tail = (_OFFER_TITLE_TAIL_RE if offer
