@@ -152,6 +152,24 @@ class RobotSpeakerTests(unittest.TestCase):
         self.assertEqual(rule, af.RULE_ROBOT_SPEECH)
         self.assertIn("asked nobody to say anything", reason)
 
+    def test_a_taken_offer_that_names_the_robot_fits(self):
+        # Final review 2026-10-29: "Yes." to "Shall I have the robot say
+        # it?" has no speech word of its own; the offer he took has.
+        for offer in ("Shall I have the deskbot say it, sir?",
+                      "Shall I have him say it again?"):
+            with self.subTest(offer=offer):
+                self.assertEqual(af.check_rule("Yes.", SPEAK, LINE,
+                                               offer_text=offer), (0, None))
+        # An offer of JARVIS's own words is still JARVIS's to say.
+        rule, _reason = af.check_rule("Yes.", SPEAK, LINE,
+                                      offer_text="Shall I say it, sir?")
+        self.assertEqual(rule, af.RULE_ROBOT_SPEECH)
+        # Flag off: the offer is not read (v3.0.8 rule 6).
+        rule, _reason = af.check_rule(
+            "Yes.", SPEAK, LINE, robot_speaker=False,
+            offer_text="Shall I have the deskbot say it, sir?")
+        self.assertEqual(rule, af.RULE_ROBOT_SPEECH)
+
     def test_off_is_the_v308_rule(self):
         # robot_speaker=False: any speech word fits, as in v3.0.8.
         for text in JARVIS_SAYS:

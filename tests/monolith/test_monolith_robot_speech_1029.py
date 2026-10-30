@@ -141,6 +141,35 @@ class RobotSpeechEnforceTests(_FitBase):
         self.speak.assert_not_called()
         self.assertIn(f"[action-fit] blocked {SPEAK}", self.log)
 
+    def test_a_yes_to_a_robot_offer_runs(self):
+        # Final review 2026-10-29: "Yes." / "All right." to "Shall I have
+        # the deskbot say it?" asks for the robot's line.
+        offer = "Shall I have the deskbot say hello there, sir?"
+        self._turn(f"Certainly, sir. [ACTION: {SPEAK}, {LINE}]", "Yes.",
+                   offer=offer)
+        self.speak.assert_called_once_with(LINE)
+        self.assertNotIn("[action-fit]", self.log)
+        self.speak.reset_mock()
+        bc = self.bc
+        prev = bc._begin_turn_grounding("All right.")
+        try:
+            bc._note_turn_offer_open(offer)
+            with contextlib.redirect_stdout(io.StringIO()):
+                bc.parse_and_run_actions(f"[ACTION: {SPEAK}, {LINE}]")
+        finally:
+            bc._end_turn_grounding(prev)
+        self.speak.assert_called_once_with(LINE)
+        # A decline to it is not a yes.
+        self.speak.reset_mock()
+        prev = bc._begin_turn_grounding("No, not right now.")
+        try:
+            bc._note_turn_offer_open(offer)
+            with contextlib.redirect_stdout(io.StringIO()):
+                bc.parse_and_run_actions(f"[ACTION: {SPEAK}, {LINE}]")
+        finally:
+            bc._end_turn_grounding(prev)
+        self.speak.assert_not_called()
+
     def test_mode_off_turns_it_off(self):
         self._turn(f"[ACTION: {SPEAK}, {LINE}]", SAY_LIVE, mode="off")
         self.speak.assert_called_once_with(LINE)

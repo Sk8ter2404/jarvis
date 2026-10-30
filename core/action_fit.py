@@ -559,7 +559,8 @@ def check_rule(user_text, name, arg="",
                robot_speaker: bool = True,
                ack_repeat: bool = True,
                accepted_offer: bool = False,
-               offer_open: bool = False) -> tuple:
+               offer_open: bool = False,
+               offer_text: str = "") -> tuple:
     """(rule number, reason) when ``name(arg)`` misfits the owner's words,
     (0, None) when it fits - see the module docstring for the rules and
     check for ``prior_actions`` / ``reply_actions``.
@@ -570,7 +571,10 @@ def check_rule(user_text, name, arg="",
     open offer (rule 7 never applies then). ``offer_open``: JARVIS's offer
     was open when the turn began and this turn did not accept it as a clear
     yes - rule 7 then needs a DECLINE (is_bare_decline), since "All right."
-    may accept it. Never raises."""
+    may accept it. ``offer_text``: the offer this turn TOOK (a clear yes, or
+    an affirmative acknowledgement while it was open), else "" - with
+    ``robot_speaker`` on, an offer that makes the robot the speaker ("Shall
+    I have the robot say it?") lets rule 6 fit. Never raises."""
     try:
         text = _norm(user_text)
         nm = str(name or "").strip().lower()
@@ -608,6 +612,14 @@ def check_rule(user_text, name, arg="",
             if (robot_speaker and asks_rerun(text)
                     and any(is_robot_speak_action(p)
                             for p, _g in _pairs(prior_actions))):
+                return 0, None
+            # (v3.0.9 final review) "Yes." / "All right." to JARVIS's own
+            # offer "Shall I have the robot say it?" asks for exactly that:
+            # the offer he took is his words this turn. The monolith passes
+            # ``offer_text`` only when the turn took the offer.
+            ot = _norm(offer_text)
+            if (robot_speaker and ot and asks_robot_speech(ot)
+                    and asks_robot_speaker(ot)):
                 return 0, None
             if not asks_robot_speech(text):
                 return RULE_ROBOT_SPEECH, (

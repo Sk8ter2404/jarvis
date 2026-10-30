@@ -44089,6 +44089,29 @@ def _turn_offer_open() -> bool:
         return False
 
 
+def _turn_taken_offer_text() -> str:
+    """The words of JARVIS's offer this owner turn TOOK: the one a clear yes
+    accepted (_note_turn_accepted_offer), else the one still open as the
+    turn began when sir's whole line was an affirmative acknowledgement
+    ("All right.", not a decline); "" otherwise. Action-fit rule 6 reads it
+    (final review 2026-10-29): "Yes." to "Shall I have the robot say it?"
+    asks for the robot's line. Never raises ("")."""
+    try:
+        frame = getattr(_turn_grounding, "frame", None)
+        if not frame:
+            return ""
+        if frame.get("accepted_offer"):
+            return str(frame.get("accepted_offer"))
+        user_text = str(frame.get("user_text") or "")
+        if (frame.get("offer_open") and frame.get("open_offer")
+                and _action_fit.is_bare_ack(user_text)
+                and not _action_fit.is_bare_decline(user_text)):
+            return str(frame.get("open_offer"))
+        return ""
+    except Exception:
+        return ""
+
+
 def _turn_is_bare_ack() -> bool:
     """True when this owner turn's WHOLE line is a bare acknowledgement or
     decline (core.action_fit.is_bare_ack: "All right.", "No, not right
@@ -44207,7 +44230,8 @@ def _action_fit_refusal(name: str, arg: str, reply_names=()) -> "str | None":
             user_text, name, arg, _action_fit_prior_actions(), reply_names,
             robot_speaker=robot_on, ack_repeat=ack_on,
             accepted_offer=ack_on and _turn_accepted_offer(),
-            offer_open=ack_on and _turn_offer_open())
+            offer_open=ack_on and _turn_offer_open(),
+            offer_text=_turn_taken_offer_text() if robot_on else "")
         if not reason:
             return None
         shown = f"{name}({arg})" if arg else name
