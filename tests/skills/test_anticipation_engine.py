@@ -1076,6 +1076,32 @@ class AnticipationSchedulerLoopTests(_EngineTestBase):
         self.assertEqual(saved["last_trigger"], "pattern")
         self.assertIn("last_proactive_at", saved)
 
+    # v3.0.10 (ARRIVAL_QUIET_MINUTES, core/arrival_quiet.py). Live
+    # 2026-10-29 07:22:48 a pattern offer landed 45 s after the arrival
+    # briefing (07:22:03), between the recap and a stretch nudge.
+    def _offer_run(self, *, quiet_minutes, arrived_ago_s):
+        import core.arrival_quiet as aq
+        import core.config as cfg
+        enqueue = mock.MagicMock()
+        now = time.monotonic()
+        with self._loop_env(),              mock.patch.object(cfg, "ARRIVAL_QUIET_MINUTES", quiet_minutes),              mock.patch.object(aq, "_arrived_at", [now - arrived_ago_s]),              mock.patch.object(self.mod, "_load_state", return_value={}),              mock.patch.object(self.mod, "_try_pattern_offer",
+                               return_value="Your Monday routine, sir?"),              mock.patch.object(self.mod, "_enqueue_speech", enqueue),              mock.patch.object(self.mod, "_save_state"):
+            with self.assertRaises(_StopLoop):
+                self.mod._scheduler_loop()
+        return enqueue
+
+    def test_loop_live_offer_waits_after_the_arrival_briefing(self):
+        self._offer_run(quiet_minutes=10,
+                        arrived_ago_s=45).assert_not_called()
+
+    def test_loop_offer_fires_once_the_arrival_quiet_is_over(self):
+        self._offer_run(quiet_minutes=10,
+                        arrived_ago_s=11 * 60).assert_called_once()
+
+    def test_loop_arrival_quiet_zero_is_the_3_0_9_loop(self):
+        self._offer_run(quiet_minutes=0,
+                        arrived_ago_s=45).assert_called_once()
+
     def test_loop_long_dwell_fires_when_probability_passes(self):
         # Non-pattern trigger: random < FIRE_PROBABILITY → fires; records the
         # per-app dwell-remark timestamp.

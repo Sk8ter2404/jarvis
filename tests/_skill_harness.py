@@ -134,6 +134,21 @@ def _reset_process_camera_gate() -> None:
         pass
 
 
+def _reset_arrival_quiet() -> None:
+    """Clear core/arrival_quiet's process-wide arrival stamp (v3.0.10), if it
+    is loaded. A test that fires the arrival briefing stamps it, and for
+    ARRIVAL_QUIET_MINUTES every LATER skill test's stretch nudge or
+    anticipation offer would then stay quiet for the wrong reason. Each
+    isolated skill load starts with no arrival, like a fresh process.
+    Never raises."""
+    try:
+        aq = sys.modules.get("core.arrival_quiet")
+        if aq is not None:
+            aq._arrived_at[0] = 0.0
+    except Exception:
+        pass
+
+
 def load_skill_isolated(name, *, utils=None, actions=None, register=True,
                         neuter_threads=True, capture_output=True,
                         skip_if_missing_dep=True):
@@ -150,6 +165,7 @@ def load_skill_isolated(name, *, utils=None, actions=None, register=True,
     utils = make_fake_skill_utils() if utils is None else utils
     actions = {} if actions is None else actions
     _reset_process_camera_gate()
+    _reset_arrival_quiet()
 
     spec = importlib.util.spec_from_file_location(
         f"skill_{name}", path, submodule_search_locations=search_locs)

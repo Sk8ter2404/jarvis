@@ -1051,6 +1051,21 @@ class GatherAndFireTests(unittest.TestCase):
         enq.assert_called_once_with("[intent:briefing] hi")
         mark.assert_called_once_with("presence")
 
+    def test_fire_arrival_starts_the_arrival_quiet(self):
+        # v3.0.10 (ARRIVAL_QUIET_MINUTES): live 2026-10-29 07:22:03 the
+        # briefing was followed by an offer and a nudge inside 81 s.
+        import core.arrival_quiet as aq
+        with mock.patch.object(aq, "_arrived_at", [0.0]),              mock.patch.object(self.mod, "_already_fired_today", return_value=False),              mock.patch.object(self.mod, "_chain_morning_briefing_fired_today", return_value=False),              mock.patch.object(self.mod, "_daily_briefing_heard_today", return_value=False),              mock.patch.object(self.mod, "_build_briefing", return_value="[intent:briefing] hi"),              mock.patch.object(self.mod, "_enqueue_speech"),              mock.patch.object(self.mod, "_mark_fired"):
+            self.assertFalse(aq.arrival_quiet_active())
+            self.mod._fire_arrival("presence")
+            self.assertGreater(aq._arrived_at[0], 0.0)
+
+    def test_a_suppressed_arrival_starts_no_quiet(self):
+        import core.arrival_quiet as aq
+        with mock.patch.object(aq, "_arrived_at", [0.0]),              mock.patch.object(self.mod, "_already_fired_today", return_value=True):
+            self.mod._fire_arrival("auto", force=False)
+            self.assertEqual(aq._arrived_at[0], 0.0)
+
     def test_fire_arrival_empty_text_not_enqueued(self):
         with mock.patch.object(self.mod, "_already_fired_today", return_value=False), \
              mock.patch.object(self.mod, "_chain_morning_briefing_fired_today", return_value=False), \

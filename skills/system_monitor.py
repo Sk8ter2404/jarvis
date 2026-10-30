@@ -57,6 +57,12 @@ _speech_lock = threading.Lock()
 _alert_lock = threading.Lock()
 _last_cpu_alert_at = [0.0]
 _last_ram_alert_at = [0.0]
+# The RAM alert's escalation state (v3.0.10, RAM_ALERT_ESCALATE_ONLY): the
+# percent last spoken (None = armed: the next crossing alerts), and the stamp
+# this monitor last put in the pulse's shared "ram" slot to hold the pulse's
+# own hourly line while it stays latched (0.0 = none).
+_ram_last_spoken_pct: list = [None]
+_ram_hold_stamp = [0.0]
 
 # ─── naming the CPU culprit (2026-10-02) ─────────────────────────────────
 # The key _top_processes / _window_culprit use for JARVIS's own process.
@@ -206,6 +212,90 @@ def _cpu_alert_line(culprit_key: str | None) -> str | None:
             f"culprit. You may want to investigate.")
 
 
+def _cfg_value(name: str, default):
+    """core.config.<name>, read live; ``default`` when unreadable (v3.0.10).
+    Never raises."""
+    try:
+        import core.config as _cfg
+        return getattr(_cfg, name, default)
+    except Exception:
+        return default
+
+
+def _ram_alert_line(ram_pct: float) -> str:
+    """The spoken high-RAM alert. With RAM_ALERT_NAME_USERS on (v3.0.10) it
+    names the biggest memory users through the LOADED system_pulse skill
+    (_memory_users / _memory_users_sentence - the helper an asked-for pulse
+    uses) instead of "Things may start swapping shortly". The 3.0.9 line when
+    the setting is off, the pulse is not loaded or nobody stands out.
+    Never raises."""
+    head = f"Sir, memory usage is at {ram_pct:.0f} percent."
+    old = head + " Things may start swapping shortly."
+    try:
+        if not bool(_cfg_value("RAM_ALERT_NAME_USERS", False)):
+            return old
+        pulse = sys.modules.get("skill_system_pulse")
+        if pulse is None:
+            return old
+        users = pulse._memory_users_sentence(pulse._memory_users()) or ""
+        return f"{head} {users}" if users else old
+    except Exception:
+        return old
+
+
+def _hold_shared_ram_slot(now: float) -> None:
+    """While the RAM alert is latched (RAM_ALERT_ESCALATE_ONLY) or the boot
+    quiet runs (RAM_ALERT_BOOT_QUIET_S), keep the pulse's shared "ram" slot
+    stamped so its own hourly RAM line stays quiet too; the stamp is
+    remembered so this monitor's own claim treats it as free. Pulse not
+    loaded -> nothing. Never raises."""
+    pulse = sys.modules.get("skill_system_pulse")
+    lock = getattr(pulse, "_alert_lock", None)
+    stamps = getattr(pulse, "_last_abnormal_alert", None)
+    if lock is None or not isinstance(stamps, dict):
+        return
+    try:
+        with lock:
+            stamps["ram"] = now
+            _ram_hold_stamp[0] = now
+    except Exception:
+        pass
+
+
+def _ram_should_alert(ram_pct: float, now: float) -> bool:
+    """One poll's RAM decision with RAM_ALERT_ESCALATE_ONLY on (v3.0.10).
+    Armed (nothing spoken since the last re-arm): alert at RAM_ALERT_PCT,
+    subject to the 10-min cooldown and the shared hourly slot. Latched: alert
+    again only on a rise of RAM_REALERT_RISE_PTS over the last spoken
+    percent (the 10-min cooldown still applies); below RAM_REARM_BELOW_PCT
+    the alert re-arms. While latched the pulse's hourly RAM line is held.
+    Updates the latch when it says True. Never raises (False)."""
+    try:
+        rearm = float(_cfg_value("RAM_REARM_BELOW_PCT", 85.0))
+        rise = float(_cfg_value("RAM_REALERT_RISE_PTS", 3.0))
+        last = _ram_last_spoken_pct[0]
+        if ram_pct < rearm:
+            _ram_last_spoken_pct[0] = None
+            return False
+        if last is not None:
+            _hold_shared_ram_slot(now)
+        if ram_pct < RAM_ALERT_PCT:
+            return False
+        if (now - _last_ram_alert_at[0]) <= ALERT_COOLDOWN_SECONDS:
+            return False
+        if last is None:
+            if not _claim_shared_ram_alert(now):
+                return False
+        elif ram_pct < float(last) + rise:
+            return False
+        else:
+            _hold_shared_ram_slot(now)
+        _ram_last_spoken_pct[0] = float(ram_pct)
+        return True
+    except Exception:
+        return False
+
+
 def _claim_shared_ram_alert(now: float) -> bool:
     """2026-10-01: one spoken high-RAM alert per hour across BOTH alerters.
     skills/system_pulse.py speaks at 88 % with an hourly per-key cooldown and
@@ -222,7 +312,11 @@ def _claim_shared_ram_alert(now: float) -> bool:
         return True
     try:
         with lock:
-            if (now - stamps.get("ram", 0.0)) <= cooldown:
+            prev = stamps.get("ram", 0.0)
+            # v3.0.10: a stamp this monitor made only to hold the pulse while
+            # its alert was latched (_hold_shared_ram_slot) is no claim.
+            ours = bool(prev) and prev == _ram_hold_stamp[0]
+            if not ours and (now - prev) <= cooldown:
                 return False
             stamps["ram"] = now
     except Exception:
@@ -432,6 +526,9 @@ def _monitor_loop():
     pegged process that briefly dips below 90% doesn't reset the counter."""
     if not _HAS_PSUTIL:
         return
+    # v3.0.10 (RAM_ALERT_BOOT_QUIET_S): the brain model loading fills memory
+    # in the first minutes; no RAM alert until this long after the start.
+    started_at = time.time()
     time.sleep(INITIAL_DELAY_SECONDS)
 
     # (timestamp, was_high) — pruned to last CPU_ALERT_SUSTAIN_SECONDS each tick.
@@ -492,13 +589,21 @@ def _monitor_loop():
                         proc_snaps.clear()
 
             # RAM single-sample check
-            if ram_pct >= RAM_ALERT_PCT:
+            boot_quiet = float(_cfg_value("RAM_ALERT_BOOT_QUIET_S", 0) or 0)
+            if boot_quiet > 0 and (now - started_at) < boot_quiet:
+                # v3.0.10: still booting (the brain model is loading); the
+                # pulse's 88 % line is held with this monitor's.
+                _hold_shared_ram_slot(now)
+            elif bool(_cfg_value("RAM_ALERT_ESCALATE_ONLY", False)):
+                # v3.0.10: once per rise, not once an hour while it stays high.
+                if _ram_should_alert(ram_pct, now):
+                    _enqueue_speech(_ram_alert_line(ram_pct))
+                    with _alert_lock:
+                        _last_ram_alert_at[0] = now
+            elif ram_pct >= RAM_ALERT_PCT:
                 if ((now - _last_ram_alert_at[0]) > ALERT_COOLDOWN_SECONDS
                         and _claim_shared_ram_alert(now)):
-                    _enqueue_speech(
-                        f"Sir, memory usage is at {ram_pct:.0f} percent. "
-                        f"Things may start swapping shortly."
-                    )
+                    _enqueue_speech(_ram_alert_line(ram_pct))
                     with _alert_lock:
                         _last_ram_alert_at[0] = now
 

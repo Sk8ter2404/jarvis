@@ -747,6 +747,18 @@ IMAGE_GEN_STEPS       = 4                # SDXL-Turbo's sweet spot
 TTS_VOICE     = "en-GB-RyanNeural"   # British male — closest to JARVIS (Paul Bettany)
 WHISPER_MODEL = "base"               # legacy fallback name (tiny|base|small|medium|large)
 
+# TTS_TURN_CONTEXT_TTL_S (v3.0.10, bobert_companion _turn_ctx_fresh): how long
+# the owner's last turn still colours the voice of what JARVIS says. Live
+# 2026-10-28 22:33:59 his last turn of the night carried a swear word; every
+# proactive line until his next turn at 09:52 the next morning (the print-bed
+# line, the memory recap, four memory alerts) was voiced brisk_alert (+15 %
+# rate, raised pitch, louder) off that stale sentence, and logged
+# tone=stressed. Older than this many seconds, his last words, tone, voice
+# mood and emotion no longer pick the preset: the line's own intent, the hour
+# and neutral do. 0 = the 3.0.9 behaviour (the last turn colours every line
+# until the next one). Set via user_settings.json; applies on the next start.
+TTS_TURN_CONTEXT_TTL_S = 300
+
 
 # ─── TTS backend selector ──────────────────────────────────────────────
 # synthesise() consults this on every utterance so 'use my voice' /
@@ -1098,6 +1110,47 @@ OWNER_PRESENT_INPUT_WINDOW_S = 300
 OWNER_PRESENT_POLLED_INPUT_BACKUP_S = 900
 ROOM_TALK_HOLD_S             = 45
 PRESENCE_STALE_STATUS_S      = 600
+
+# Media hold for queued proactive speech (v3.0.10, bobert_companion
+# _presence_hold_reason / _media_hold_signal). Live 2026-10-29 18:45-18:53 he
+# watched a movie in Chrome: the room-talk hold lapsed and a queued "you
+# typically check Claude around now" offer was spoken over the film at
+# 18:48:33; at 10:21:53 a credits alert and at 15:24:37 a memory alert were
+# spoken over playing media too. The presence hold knew only "gaming", "room
+# talk" and "owner away".
+# MEDIA_HOLD_ENABLED True (default): while a VIDEO plays - the Windows media
+#   session reports a browser or video player playing that is not his music
+#   (the Apple Music web player, the Apple Music / Spotify / iTunes apps), or
+#   the camera TV detector sees the TV on - the drain holds the queue as it
+#   does for room talk: his own reminders, the guard alert and urgent lines
+#   still speak; everything else waits, and a status line that waited longer
+#   than PRESENCE_STALE_STATUS_S comes out folded into the one-line "Earlier,
+#   sir" recap. His own music never holds the queue.
+# MEDIA_HOLD_LINGER_S: a signal seen this many seconds ago still holds (the
+#   camera detector flips ON / OFF every few seconds during a film).
+# MEDIA_HOLD_MAX_S: a hold longer than this releases, so a show that runs for
+#   hours cannot hold the queue for ever; it re-arms once the media stops.
+# False = the 3.0.9 hold exactly (no media reason). Set via
+# user_settings.json; applies on the next start.
+MEDIA_HOLD_ENABLED  = True
+MEDIA_HOLD_LINGER_S = 30
+MEDIA_HOLD_MAX_S    = 1800
+
+# Arrival spacing (v3.0.10, core/arrival_quiet.py). Live 2026-10-29 07:21-07:23
+# he walked in to a "while you were away" recap, the morning briefing, a
+# pattern offer and a stretch nudge inside 90 s; the nudge ("You've been on
+# this for a while, sir") counted the 65 minutes the screen sat unattended.
+# ARRIVAL_QUIET_MINUTES: after the arrival briefing is queued, the screen-watch
+#   stretch nudge and the anticipation engine's offers wait this many minutes.
+#   0 = the 3.0.9 behaviour (no quiet period).
+# SCREEN_WATCH_RESET_ON_AWAY True (default): the stretch nudge's stare timer
+#   restarts on every poll while JARVIS is asleep / in standby or the face
+#   tracker sees him away, and the nudge stays quiet when his last keyboard /
+#   mouse input is older than the stare itself (nothing shows he was there).
+#   False = the 3.0.9 stare timer exactly.
+# Set via user_settings.json; read live.
+ARRIVAL_QUIET_MINUTES     = 10
+SCREEN_WATCH_RESET_ON_AWAY = True
 
 # Device dialogues (core/dialogue.py): a skill that owns a talking device can
 # run a short scripted back-and-forth between JARVIS and it through the
@@ -1596,6 +1649,29 @@ SYSTEM_PULSE_GPU_EXPLAINED = True
 # with the memory reading, never "nominal". False: the 3.0.6 path exactly
 # (the model answers; the pulse opens as before).
 SYSTEM_PULSE_MEMORY_ANSWER = True
+
+# The proactive high-RAM alert (v3.0.10, skills/system_monitor.py). Live
+# 2026-10-28 21:17 -> 2026-10-29 21:13 "Sir, memory usage is at 91 percent.
+# Things may start swapping shortly." was spoken or folded into a recap every
+# hour (8 copies overnight), the same bare percentage each time, while the PC
+# sat at 87-92 %.
+# RAM_ALERT_NAME_USERS True (default): the alert names the biggest memory
+#   users (the system_pulse helper an asked-for pulse uses) instead of
+#   "Things may start swapping shortly". False: the 3.0.9 wording.
+# RAM_ALERT_ESCALATE_ONLY True (default): after one alert the monitor speaks
+#   again only when the reading has risen RAM_REALERT_RISE_PTS points above
+#   the last spoken one, or after it fell below RAM_REARM_BELOW_PCT and
+#   crossed the threshold again; meanwhile the pulse's own hourly RAM line is
+#   held too. False: one alert an hour while it stays high (3.0.9).
+# RAM_ALERT_BOOT_QUIET_S: no RAM alert for this many seconds after the
+#   monitor starts (the brain model loading fills memory). 0 = only the
+#   monitor's own start-up delay, as in 3.0.9.
+# Read live.
+RAM_ALERT_NAME_USERS    = True
+RAM_ALERT_ESCALATE_ONLY = True
+RAM_REALERT_RISE_PTS    = 3.0
+RAM_REARM_BELOW_PCT     = 85.0
+RAM_ALERT_BOOT_QUIET_S  = 600
 
 # ─── Two-sentence shutdown asks the overnight question (v3 W08) ─────────
 # "Jarvis, shut down. No overnight protocol." (live 2026-10-19 20:26:04) is

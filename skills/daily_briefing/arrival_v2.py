@@ -696,6 +696,14 @@ def _fire_arrival(reason: str, *, force: bool = False) -> str:
     print(f"  [arrival_v2] queuing ({reason}): {text[:120]}...")
     _enqueue_speech(text)
     _mark_fired(reason)
+    # v3.0.10 (ARRIVAL_QUIET_MINUTES): the stretch nudge and the anticipation
+    # offers wait a few minutes after this (live 2026-10-29 07:21-07:23: four
+    # proactive lines in 90 s as he walked in).
+    try:
+        from core.arrival_quiet import note_arrival
+        note_arrival()
+    except Exception:
+        pass
     return text
 
 

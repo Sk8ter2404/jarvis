@@ -227,6 +227,26 @@ def _user_is_away() -> bool:
     return snap.get("current_monitor") == "away"
 
 
+def _reset_on_away() -> bool:
+    """core.config.SCREEN_WATCH_RESET_ON_AWAY, read live (v3.0.10). Never
+    raises (False = the 3.0.9 stare timer)."""
+    try:
+        import core.config as _cfg
+        return bool(getattr(_cfg, "SCREEN_WATCH_RESET_ON_AWAY", False))
+    except Exception:
+        return False
+
+
+def _arrival_quiet() -> bool:
+    """True within ARRIVAL_QUIET_MINUTES of the arrival briefing (v3.0.10,
+    core/arrival_quiet.py). Never raises (False)."""
+    try:
+        from core.arrival_quiet import arrival_quiet_active
+        return bool(arrival_quiet_active())
+    except Exception:
+        return False
+
+
 def _title_is_ignored(title: str) -> bool:
     low = title.lower()
     return any(frag in low for frag in IGNORE_TITLE_FRAGMENTS)
@@ -266,6 +286,18 @@ def _poll_once() -> None:
 
         stare_duration = now - _stare_started_at[0]
 
+    # v3.0.10 (SCREEN_WATCH_RESET_ON_AWAY). Live 2026-10-29 07:23:24 the nudge
+    # said "You've been on this for a while" 81 s after he walked in: the
+    # stare timer had run through his absence (65 min on one window, no input
+    # for 80). While JARVIS sleeps or he is seen away the timer restarts on
+    # every poll, so a nudge needs STARE_THRESHOLD_SECONDS of him being back.
+    reset_on_away = _reset_on_away()
+    if reset_on_away and (_is_sleeping_or_standby() or _user_is_away()):
+        with _state_lock:
+            if _current_identity[0] == identity:
+                _stare_started_at[0] = now
+        return
+
     if stare_duration < STARE_THRESHOLD_SECONDS:
         return
 
@@ -274,8 +306,15 @@ def _poll_once() -> None:
         return
     if _user_is_away():
         return
-    if _get_system_idle_seconds() < STARE_THRESHOLD_SECONDS:
+    idle = _get_system_idle_seconds()
+    if idle < STARE_THRESHOLD_SECONDS:
         return   # user IS using the window, just not switching it
+    if reset_on_away and idle > stare_duration + SCREEN_WATCH_POLL_SECONDS:
+        # His last input is older than the stare itself: nothing shows he
+        # has been on this window at all (an unattended screen).
+        return
+    if _arrival_quiet():
+        return   # he just arrived: the briefing has the floor (v3.0.10)
 
     # Cooldown: don't repeat for the same identity within NUDGE_COOLDOWN_SECONDS
     with _state_lock:

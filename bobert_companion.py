@@ -17947,6 +17947,9 @@ _TURN_FLAG_KEYS = (
     "BAMBU_PUSHALL_ON_CONNECT", "PRINT_STATUS_HONEST",
     # v3.0.9 lane C: a transport word is not a song.
     "PLAY_MUSIC_TRANSPORT_WORDS",
+    # v3.0.10 lane D: an old turn no longer voices later lines; queued lines
+    # wait while a video plays.
+    "TTS_TURN_CONTEXT_TTL_S", "MEDIA_HOLD_ENABLED",
 )
 
 
@@ -21923,6 +21926,27 @@ def detect_tone(user_text: str) -> str | None:
 # classifier (and so register stays stable across action chains).
 _last_voice_route: list[dict | None] = [None]
 
+# time.monotonic() of the owner turn that last stamped _last_user_text (v3.0.10,
+# TTS_TURN_CONTEXT_TTL_S). 0.0 = never stamped: the cells are read as before.
+_last_turn_ctx_at: list[float] = [0.0]
+
+
+def _turn_ctx_fresh() -> bool:
+    """Whether the last owner turn's words / tone / voice mood / emotion may
+    still pick the TTS preset (v3.0.10). True with TTS_TURN_CONTEXT_TTL_S 0
+    (the 3.0.9 path), when no turn stamped the context (a bare import, a
+    test that sets the cells directly), or within the TTL. Live 2026-10-28:
+    a 22:33 swear word voiced every proactive line brisk_alert until 09:52.
+    Never raises (True)."""
+    try:
+        ttl = float(globals().get("TTS_TURN_CONTEXT_TTL_S", 0) or 0)
+        at = float(_last_turn_ctx_at[0] or 0.0)
+        if ttl <= 0 or at <= 0.0:
+            return True
+        return time.monotonic() - at <= ttl
+    except Exception:
+        return True
+
 
 def route_voice_emotion(user_text: str, now: float | None = None) -> dict:
     """Thin wrapper over core.voice_emotion.route_voice_emotion: supply the
@@ -25720,6 +25744,11 @@ _presence_away_seen = [False]
 # first drain after the game folds what waited into one "Earlier, sir" recap
 # (2026-10-12), even when the presence gate itself is not armed.
 _game_hold_seen = [False]
+# The media hold (v3.0.10, MEDIA_HOLD_ENABLED): _proactive_mono() of the last
+# time a video / TV signal was seen (0.0 = none), and of when the current hold
+# began (0.0 = no hold running), for MEDIA_HOLD_LINGER_S / MEDIA_HOLD_MAX_S.
+_media_hold_seen_at = [0.0]
+_media_hold_since = [0.0]
 
 
 # The voice check behind a room-talk stamp while the PC plays audio runs off
@@ -25928,9 +25957,68 @@ def _presence_hold_reason() -> str:
         present, why = _owner_presence()
         if not present:
             return f"owner away ({why})"
+        if globals().get("MEDIA_HOLD_ENABLED", False) and _media_hold_active():
+            return "media playing"
         return ""
     except Exception:
         return ""
+
+
+# His own music players: a session from one of these is music, never a video
+# (MEDIA_HOLD_ENABLED). Names as core/media_now_playing._clean_app gives them.
+_MEDIA_HOLD_MUSIC_APPS = frozenset({"Apple Music", "Spotify", "iTunes"})
+
+
+def _media_hold_signal() -> bool:
+    """True when a VIDEO is playing right now (v3.0.10, MEDIA_HOLD_ENABLED):
+    the Windows media session reports a session PLAYING that is not his
+    music (the Apple Music / Spotify / iTunes apps, or a browser session that
+    is the Apple Music web player - core/media_now_playing.
+    is_web_player_session), or the camera TV detector sees the TV on. The
+    spectral room-music detector is left out on purpose: his music at the
+    desk must not silence every status line. Never raises (False)."""
+    try:
+        from core.media_now_playing import get_now_playing
+        snap = get_now_playing()
+        if snap and snap.get("playing"):
+            app = str(snap.get("app") or "")
+            if app not in _MEDIA_HOLD_MUSIC_APPS:
+                from core.media_now_playing import is_web_player_session
+                if not is_web_player_session(
+                        snap, _apple_music_web_player_titles()):
+                    return True
+    except Exception:
+        pass
+    try:
+        mod = sys.modules.get("skill_tv_detect")
+        if mod is not None and bool(mod.is_tv_on()):
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _media_hold_active() -> bool:
+    """The media hold right now: a video signal (_media_hold_signal) seen
+    within MEDIA_HOLD_LINGER_S, for no longer than MEDIA_HOLD_MAX_S in one
+    run (after that the hold releases until the signal has been gone for the
+    linger, so an hours-long show cannot hold the queue for ever). Never
+    raises (False)."""
+    try:
+        now = _proactive_mono()
+        if _media_hold_signal():
+            _media_hold_seen_at[0] = now
+        seen = float(_media_hold_seen_at[0] or 0.0)
+        linger = float(globals().get("MEDIA_HOLD_LINGER_S", 30) or 0)
+        if seen <= 0.0 or now - seen > linger:
+            _media_hold_since[0] = 0.0
+            return False
+        if float(_media_hold_since[0] or 0.0) <= 0.0:
+            _media_hold_since[0] = now
+        cap = float(globals().get("MEDIA_HOLD_MAX_S", 1800) or 0)
+        return now - float(_media_hold_since[0]) <= cap
+    except Exception:
+        return False
 
 
 def _proactive_mono() -> float:
@@ -27035,6 +27123,7 @@ def _call_llm(user_text: str) -> str:
     # _last_user_tone / _last_voice_route / _last_emotion cells TTS reads).
     tone, route, emotion_addendum = _classify_turn_mood(user_text)
     _last_user_text[0] = user_text
+    _last_turn_ctx_at[0] = time.monotonic()   # TTS_TURN_CONTEXT_TTL_S
 
     # Voice-mood response: closes the loop on a 'stressed' label by
     # suppressing proactive nudges for 15 min, dimming Hue/Govee lights to
@@ -27603,6 +27692,11 @@ def _resolve_tts_preset_from(text: str, user_tone: str | None, *,
 
     er = _last_emotion[0]
     emotion_preset = getattr(er, "tts_preset", None) if er is not None else None
+    user_text = _last_user_text[0]
+    if not _turn_ctx_fresh():
+        # v3.0.10 TTS_TURN_CONTEXT_TTL_S: a stale turn's words (a swear word
+        # -> brisk_alert) and emotion no longer voice a later line.
+        user_text, emotion_preset = None, None
 
     return _tts_layer.resolve_tts_preset(
         text,
@@ -27610,7 +27704,7 @@ def _resolve_tts_preset_from(text: str, user_tone: str | None, *,
         wry=wry,
         intent_override=intent_override,
         mood=mood,
-        user_text=_last_user_text[0],
+        user_text=user_text,
         peak_rms=peak_rms,
         emotion_preset=emotion_preset,
     )
@@ -28223,6 +28317,10 @@ def _synth_user_tone() -> str | None:
     time-of-day, so its label is the one that should drive prosody. Falls back
     to the fine-grained text tone (rushed/tired/playful/frustrated) when the
     router said 'casual'."""
+    if not _turn_ctx_fresh():
+        # v3.0.10 TTS_TURN_CONTEXT_TTL_S: an hours-old turn's tone is not
+        # this line's (a proactive line long after he last spoke).
+        return None
     route = _last_voice_route[0]
     mood = route["mood"] if route else "casual"
     return mood if mood != "casual" else _last_user_tone[0]
@@ -35716,6 +35814,7 @@ def maybe_replay_last_action(utterance: str) -> str | None:
     # never runs here): a skill that checks the transcript before acting (a
     # device chat) must judge THIS sentence, not the previous turn's.
     _last_user_text[0] = utterance
+    _last_turn_ctx_at[0] = time.monotonic()   # TTS_TURN_CONTEXT_TTL_S
     return _act_replay_last_action(monitor)
 
 
@@ -52589,6 +52688,7 @@ def _run_llm_dispatch_body(text: str) -> str:
         # start off any sentence but the one that asked for it), so a routed
         # turn must record them too, or the skill judges the PREVIOUS turn.
         _last_user_text[0] = text
+        _last_turn_ctx_at[0] = time.monotonic()   # TTS_TURN_CONTEXT_TTL_S
         # ... and this utterance's mood, or every line the action speaks is
         # voiced with the PREVIOUS turn's prosody. Before _append_turn: the
         # classifiers take the owner's previous sentence from the history.

@@ -348,6 +348,113 @@ class GateEdgeTests(unittest.TestCase):
 
 
 # ── _enqueue_speech (announcer path + atomic-write fallback) ──────────────
+class UnattendedScreenTests(unittest.TestCase):
+    """v3.0.10 (SCREEN_WATCH_RESET_ON_AWAY, ARRIVAL_QUIET_MINUTES). Live
+    2026-10-29 07:23:24: "You've been on this for a while, sir" 81 s after he
+    walked in - one window focused 65 min with no input for 80 min, all of it
+    while he was away; the arrival briefing had been queued at 07:22:03."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("screen_watch")
+        self.mod._current_identity[0] = None
+        self.mod._stare_started_at[0] = 0.0
+        self.mod._last_nudge_at[0] = 0.0
+        self.mod._last_nudged_id[0] = None
+        self.threshold = self.mod.STARE_THRESHOLD_SECONDS
+        import core.arrival_quiet as aq
+        import core.config as cfg
+        self.aq, self.cfg = aq, cfg
+        for name, value in (("SCREEN_WATCH_RESET_ON_AWAY", True),
+                            ("ARRIVAL_QUIET_MINUTES", 10)):
+            p = mock.patch.object(cfg, name, value, create=True)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(aq, "_arrived_at", [0.0])
+        p.start()
+        self.addCleanup(p.stop)
+        self.clock = [1_000_000.0]
+        self.away = [False]
+        self.sleeping = [False]
+        self.idle = [0.0]
+        for name, fn in (
+                ("_get_focused_window",
+                 lambda: ("report.docx - Word", (0, 0, 800, 600))),
+                ("_hash_window_thumbnail", lambda bbox: "h"),
+                ("_user_is_away", lambda: self.away[0]),
+                ("_is_sleeping_or_standby", lambda: self.sleeping[0]),
+                ("_get_system_idle_seconds", lambda: self.idle[0])):
+            p = mock.patch.object(self.mod, name, side_effect=fn)
+            p.start()
+            self.addCleanup(p.stop)
+        fake_time = types.SimpleNamespace(time=lambda: self.clock[0],
+                                          sleep=time.sleep,
+                                          monotonic=time.monotonic)
+        p = mock.patch.object(self.mod, "time", fake_time)
+        p.start()
+        self.addCleanup(p.stop)
+        self.enq = mock.patch.object(self.mod, "_enqueue_speech").start()
+        self.addCleanup(mock.patch.stopall)
+
+    def _poll(self, minutes=5):
+        self.clock[0] += minutes * 60
+        self.idle[0] += minutes * 60
+        self.mod._poll_once()
+
+    def _live_night(self):
+        """He leaves at 06:03; the screen sits on one window, untouched."""
+        self.mod._poll_once()              # the window is seen
+        self.away[0] = True
+        for _ in range(12):                # an hour away
+            self._poll()
+        self.away[0] = False               # 07:21: he walks back in
+
+    def test_live_no_nudge_on_the_first_poll_after_he_returns(self):
+        self._live_night()
+        self._poll()
+        self.enq.assert_not_called()
+
+    def test_the_stare_restarts_while_he_is_away_or_asleep(self):
+        self.mod._poll_once()
+        self.sleeping[0] = True
+        self._poll(30)
+        self.assertEqual(self.mod._stare_started_at[0], self.clock[0])
+        self.sleeping[0] = False
+        self.away[0] = True
+        self._poll(30)
+        self.assertEqual(self.mod._stare_started_at[0], self.clock[0])
+
+    def test_no_nudge_when_his_last_input_predates_the_stare(self):
+        # Nobody was ever seen away (no camera), but the screen has had no
+        # input since before this window's stare began.
+        self.mod._poll_once()
+        self.idle[0] = 15 * 60             # input stopped 15 min before
+        for _ in range(6):
+            self._poll()
+        self.enq.assert_not_called()
+
+    def test_a_real_stare_still_nudges(self):
+        self.mod._poll_once()              # he focused it (input just now)
+        for _ in range(6):                 # 30 min reading, no input
+            self._poll()
+        self.enq.assert_called_once()
+
+    def test_the_arrival_quiet_holds_the_nudge(self):
+        self.mod._poll_once()
+        for _ in range(4):
+            self._poll()
+        self.aq.note_arrival()
+        self._poll()
+        self.enq.assert_not_called()
+
+    def test_flags_off_are_the_3_0_9_watch(self):
+        self.cfg.SCREEN_WATCH_RESET_ON_AWAY = False
+        self.cfg.ARRIVAL_QUIET_MINUTES = 0
+        self.aq.note_arrival()
+        self._live_night()
+        self._poll()
+        self.enq.assert_called_once()
+
+
 class EnqueueSpeechTests(unittest.TestCase):
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("screen_watch")

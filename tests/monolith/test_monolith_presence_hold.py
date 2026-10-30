@@ -83,6 +83,9 @@ class _Base(MonolithGlobalsTestCase):
                 return True
         self._p(bc, "_yield_watch_mod", return_value=_Watch, create=True)
         self._p(bc, "PRESENCE_HOLD_ENABLED", True, create=True)
+        # The media hold (v3.0.10) reads the machine's real media session and
+        # camera TV detector: no video plays here unless a test says so.
+        self._p(bc, "_media_hold_signal", return_value=False, create=True)
         self._cell("_presence_gate_armed", True)
         self._cell("_last_room_talk_at", 0.0)
         bc._last_owner_voice_at[0] = 0.0

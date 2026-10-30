@@ -597,6 +597,17 @@ def _should_skip_late_night() -> bool:
     return age > LATE_HOUR_ACTIVE_WINDOW
 
 
+def _arrival_quiet() -> bool:
+    """True within ARRIVAL_QUIET_MINUTES of the arrival briefing (v3.0.10,
+    core/arrival_quiet.py; live 2026-10-29 07:22:48 a pattern offer landed
+    45 s after the briefing). Never raises (False = the 3.0.9 path)."""
+    try:
+        from core.arrival_quiet import arrival_quiet_active
+        return bool(arrival_quiet_active())
+    except Exception:
+        return False
+
+
 def _scheduler_loop() -> None:
     time.sleep(INITIAL_DELAY_SECONDS)
     while True:
@@ -622,6 +633,11 @@ def _scheduler_loop() -> None:
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
             if _should_skip_late_night():
+                time.sleep(POLL_INTERVAL_SECONDS)
+                continue
+            if _arrival_quiet():
+                # v3.0.10: the arrival briefing was just queued; an offer
+                # right behind it piles onto his first minutes back.
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
 

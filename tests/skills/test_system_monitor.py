@@ -449,6 +449,12 @@ class SystemMonitorLoopTests(unittest.TestCase):
         self.mod, self.actions = load_skill_isolated("system_monitor")
         self.mod._last_cpu_alert_at[0] = 0.0
         self.mod._last_ram_alert_at[0] = 0.0
+        # These tests sample from the first poll on; the v3.0.10 boot quiet
+        # (RAM_ALERT_BOOT_QUIET_S) has its own tests below.
+        import core.config as cfg
+        p = mock.patch.object(cfg, "RAM_ALERT_BOOT_QUIET_S", 0, create=True)
+        p.start()
+        self.addCleanup(p.stop)
 
     def _make_psutil(self, cpu_seq, ram_seq):
         fake = mock.MagicMock()
@@ -671,6 +677,142 @@ class SystemMonitorLoopTests(unittest.TestCase):
                 self.mod._monitor_loop()
         self.assertTrue(seen["poll_sleep"])
         logexc.assert_called()
+
+
+class SystemMonitorRamEscalationTests(unittest.TestCase):
+    """v3.0.10 (RAM_ALERT_ESCALATE_ONLY / RAM_ALERT_NAME_USERS /
+    RAM_ALERT_BOOT_QUIET_S). Live 2026-10-28 21:17 -> 2026-10-29 21:13 "Sir,
+    memory usage is at 91 percent. Things may start swapping shortly." every
+    hour (8 copies folded into the 07:21 recap), always the bare percent, while
+    the PC sat at 87-92 %."""
+
+    HOUR = 3600.0
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("system_monitor")
+        self.mod._last_ram_alert_at[0] = 0.0
+        import core.config as cfg
+        self.cfg = cfg
+        for name, value in (("RAM_ALERT_ESCALATE_ONLY", True),
+                            ("RAM_ALERT_NAME_USERS", True),
+                            ("RAM_REALERT_RISE_PTS", 3.0),
+                            ("RAM_REARM_BELOW_PCT", 85.0),
+                            ("RAM_ALERT_BOOT_QUIET_S", 600)):
+            p = mock.patch.object(cfg, name, value, create=True)
+            p.start()
+            self.addCleanup(p.stop)
+        self.pulse = types.SimpleNamespace(
+            _alert_lock=threading.Lock(), _last_abnormal_alert={},
+            PROACTIVE_COOLDOWN_SECONDS=3600,
+            _memory_users=lambda: [("my local brain model", 8.0),
+                                   ("Claude", 6.7), ("Chrome", 4.5)],
+            _memory_users_sentence=lambda users: (
+                "The biggest memory users are my local brain model at 8 "
+                "gigabytes, Claude at 6.5 and Chrome at 4.5."))
+        p = mock.patch.dict(sys.modules, {"skill_system_pulse": self.pulse})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _run(self, readings, *, gap=HOUR):
+        """Feed one RAM reading per poll, ``gap`` seconds apart; returns how
+        many alerts were spoken (the loop's own bookkeeping)."""
+        spoken = []
+        t = 1_700_000_000.0
+        for pct in readings:
+            t += gap
+            if self.mod._ram_should_alert(pct, t):
+                spoken.append(pct)
+                self.mod._last_ram_alert_at[0] = t
+        return spoken
+
+    def test_live_hourly_91_is_one_alert(self):
+        self.assertEqual(self._run([91, 91, 90, 92, 91]), [91])
+
+    def test_a_real_rise_alerts_again(self):
+        self.assertEqual(self._run([91, 95]), [91, 95])
+
+    def test_a_small_rise_does_not(self):
+        self.assertEqual(self._run([91, 92, 93]), [91])
+
+    def test_falling_below_the_rearm_line_rearms(self):
+        self.assertEqual(self._run([91, 84, 91]), [91, 91])
+
+    def test_the_rise_still_waits_out_the_ten_minute_cooldown(self):
+        self.assertEqual(self._run([91, 96], gap=60), [91])
+
+    def test_the_pulse_hourly_line_is_held_while_latched(self):
+        self._run([91])
+        t = 1_700_000_000.0 + 5 * self.HOUR
+        self.mod._ram_should_alert(89.0, t)
+        self.assertEqual(self.pulse._last_abnormal_alert["ram"], t)
+
+    def test_its_own_hold_stamp_does_not_block_its_next_claim(self):
+        self._run([91, 84])              # alerted, then re-armed
+        self.mod._hold_shared_ram_slot(1_700_000_000.0 + 2.5 * self.HOUR)
+        t = 1_700_000_000.0 + 2.6 * self.HOUR
+        self.assertTrue(self.mod._ram_should_alert(91.0, t))
+
+    def test_a_real_pulse_alert_still_holds_the_slot(self):
+        t = 1_700_000_000.0
+        self.pulse._last_abnormal_alert["ram"] = t - 120
+        self.assertFalse(self.mod._ram_should_alert(93.0, t))
+
+    def test_the_alert_names_the_biggest_users(self):
+        line = self.mod._ram_alert_line(91.0)
+        self.assertTrue(line.startswith("Sir, memory usage is at 91 percent."))
+        self.assertIn("my local brain model at 8 gigabytes", line)
+        self.assertNotIn("swapping", line)
+
+    def test_name_users_off_is_the_3_0_9_line(self):
+        self.cfg.RAM_ALERT_NAME_USERS = False
+        self.assertEqual(self.mod._ram_alert_line(91.0),
+                         "Sir, memory usage is at 91 percent. Things may "
+                         "start swapping shortly.")
+
+    def test_no_pulse_or_no_users_is_the_3_0_9_line(self):
+        self.pulse._memory_users_sentence = lambda users: ""
+        self.assertIn("swapping shortly", self.mod._ram_alert_line(91.0))
+        sys.modules.pop("skill_system_pulse", None)
+        self.assertIn("swapping shortly", self.mod._ram_alert_line(91.0))
+
+    def _loop(self, ram_seq, clock):
+        fake = mock.MagicMock()
+        fake.cpu_percent.side_effect = [10.0] * len(ram_seq)
+        fake.virtual_memory.side_effect = [_VM(p, 40.0) for p in ram_seq]
+        ticks = iter(clock)
+        calls = {"n": 0}
+
+        def _sleep(_):
+            calls["n"] += 1
+            if calls["n"] > len(ram_seq):
+                raise _LoopBreak
+        with mock.patch.object(self.mod, "_HAS_PSUTIL", True),              mock.patch.object(self.mod, "psutil", fake),              mock.patch.object(self.mod.time, "time",
+                               side_effect=lambda: next(ticks)),              mock.patch.object(self.mod.time, "sleep", side_effect=_sleep),              mock.patch.object(self.mod, "_enqueue_speech") as enq:
+            with self.assertRaises(_LoopBreak):
+                self.mod._monitor_loop()
+        return enq
+
+    def test_boot_quiet_keeps_the_brain_load_unannounced(self):
+        base = 1_700_000_000.0
+        # started_at, then polls at +130 s and +300 s: inside the quiet.
+        enq = self._loop([95.0, 95.0], [base, base + 130, base + 300])
+        enq.assert_not_called()
+        self.assertEqual(self.pulse._last_abnormal_alert["ram"], base + 300)
+
+    def test_after_the_boot_quiet_it_alerts(self):
+        base = 1_700_000_000.0
+        enq = self._loop([95.0], [base, base + 700])
+        enq.assert_called_once()
+        self.assertIn("my local brain model", enq.call_args[0][0])
+
+    def test_escalate_off_is_hourly_as_in_3_0_9(self):
+        self.cfg.RAM_ALERT_ESCALATE_ONLY = False
+        self.cfg.RAM_ALERT_BOOT_QUIET_S = 0
+        base = 1_700_000_000.0
+        enq = self._loop([91.0, 91.0, 91.0],
+                         [base, base + 10, base + 10 + self.HOUR + 1,
+                          base + 10 + 2 * self.HOUR + 2])
+        self.assertEqual(enq.call_count, 3)
 
 
 class SystemMonitorImportGuardTests(unittest.TestCase):
