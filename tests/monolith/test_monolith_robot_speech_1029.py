@@ -68,7 +68,7 @@ class _FitBase(fit_t._Base):
         self.acts["play_music"] = self.play
 
     def _turn(self, reply, user_text, *, mode="shadow", prior=(),
-              offer=""):
+              offer="", offer_open=False):
         bc = self.bc
         self._p(bc, "ACTION_FIT_MODE", mode)
         for name, arg in prior:
@@ -79,6 +79,8 @@ class _FitBase(fit_t._Base):
         try:
             if offer:
                 bc._note_turn_accepted_offer(offer)
+            if offer_open:
+                bc._note_turn_offer_open()
             with contextlib.redirect_stdout(out):
                 res = bc.parse_and_run_actions(reply)
         finally:
@@ -126,6 +128,19 @@ class RobotSpeechEnforceTests(_FitBase):
         self.speak.assert_called_once_with(LINE)
         self.assertIn(f"[action-fit] would block {SPEAK}", self.log)
 
+    def test_try_it_again_after_the_robot_spoke_runs(self):
+        # Live 2026-10-29 18:57:07 "Try it again." (review 2026-10-29).
+        self._turn(f"Certainly, sir. [ACTION: {SPEAK}, {LINE}]",
+                   "Try it again.", prior=[(SPEAK, LINE)])
+        self.speak.assert_called_once_with(LINE)
+        self.assertNotIn("[action-fit]", self.log)
+
+    def test_say_hi_to_the_robot_is_jarvis_to_say(self):
+        self._turn(f"Certainly, sir. [ACTION: {SPEAK}, hi]",
+                   "Jarvis, say hi to the robot")
+        self.speak.assert_not_called()
+        self.assertIn(f"[action-fit] blocked {SPEAK}", self.log)
+
     def test_mode_off_turns_it_off(self):
         self._turn(f"[ACTION: {SPEAK}, {LINE}]", SAY_LIVE, mode="off")
         self.speak.assert_called_once_with(LINE)
@@ -160,6 +175,45 @@ class AckRepeatEnforceTests(_FitBase):
                    offer="Shall I play some jazz again, sir?")
         self.play.assert_called_once_with("jazz")
         self.assertNotIn("[action-fit]", self.log)
+
+    def test_all_right_to_an_open_offer_runs(self):
+        # Review 2026-10-29: "Shall I try again?" -> "All right." is "other"
+        # to core.yes_no, yet it accepts the offer.
+        self._turn("On it. [ACTION: play_music, jazz]", "All right.",
+                   prior=[("play_music", "jazz")], offer_open=True)
+        self.play.assert_called_once_with("jazz")
+        self.assertNotIn("[action-fit]", self.log)
+
+    def test_a_decline_to_an_open_offer_is_refused(self):
+        _c, results = self._turn("On it. [ACTION: play_music, jazz]",
+                                 DECLINE_LIVE, prior=[("play_music", "jazz")],
+                                 offer_open=True)
+        self.play.assert_not_called()
+        self.assertTrue(results[0][1].startswith("refused (action-fit)"))
+
+    def test_take_open_offer_records_an_open_offer(self):
+        bc = self.bc
+        from core import offer_reply
+        slot = offer_reply.OpenOffer(60.0)
+        slot.note("The lamp didn't answer, sir. Shall I try again?")
+        self._p(bc, "_open_offer", slot)
+        self._p(bc, "_prev_owner_turn_at", [0.0])
+        prev = bc._begin_turn_grounding("All right.")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(bc._take_open_offer("All right."), "")
+            self.assertTrue(bc._turn_offer_open())
+            self.assertFalse(bc._turn_is_bare_ack())
+        finally:
+            bc._end_turn_grounding(prev)
+        prev = bc._begin_turn_grounding("All right.")
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                bc._take_open_offer("All right.")    # no offer open now
+            self.assertFalse(bc._turn_offer_open())
+            self.assertTrue(bc._turn_is_bare_ack())
+        finally:
+            bc._end_turn_grounding(prev)
 
     def test_a_request_runs(self):
         self._turn("On it. [ACTION: play_music, jazz]", "okay, play it again",
@@ -216,6 +270,17 @@ class AckClaimTests(_ClaimBase):
     def test_an_accepted_offer_is_the_old_path(self):
         cleaned, results, _printed = self._parse_in_turn(
             DECLINE_REPLY, "okay", offer=OFFER)
+        self.assertEqual(cleaned, "")
+        self.assertEqual([n for n, _r, _i in results], ["_unverified_claim"])
+
+    def test_all_right_to_an_open_offer_is_the_old_path(self):
+        # Review 2026-10-29: "Shall I pause the music, sir?" -> "All right."
+        bc = self.bc
+        prev = bc._begin_turn_grounding("All right.")
+        self.addCleanup(bc._end_turn_grounding, prev)
+        bc._note_turn_offer_open()
+        with contextlib.redirect_stdout(io.StringIO()):
+            cleaned, results = bc.parse_and_run_actions(DECLINE_REPLY)
         self.assertEqual(cleaned, "")
         self.assertEqual([n for n, _r, _i in results], ["_unverified_claim"])
 

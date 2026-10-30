@@ -1723,9 +1723,11 @@ ACTION_FIT_MODE = "shadow"
 # when sir's words make the ROBOT the speaker (a robot word, or "make him /
 # have it / let him / get him to / tell him to / can he ... say"); "say X",
 # "can you say X", "I want you to say X" are JARVIS's to say, and the
-# follow-up round is told so. Rule 6 is ENFORCED even while ACTION_FIT_MODE
-# is 'shadow' (the action does not run; ACTION_FIT_MODE 'off' still turns
-# every rule off). False: the v3.0.8 rule 6 (any speech word fits), logged
+# follow-up round is told so; so are "say hi to the robot" (the robot only
+# addressed) and a robot word inside the quoted line, while "Try it again."
+# right after the robot spoke fits (live 18:57:07). Rule 6 is ENFORCED even
+# while ACTION_FIT_MODE is 'shadow' (the action does not run; ACTION_FIT_MODE
+# 'off' still turns every rule off). False: the v3.0.8 rule 6 (any speech word fits), logged
 # or enforced per ACTION_FIT_MODE (the old behaviour). Applies on the next
 # start.
 ACTION_FIT_ROBOT_SPEAK_ENFORCE = True
@@ -1737,8 +1739,9 @@ ACTION_FIT_ROBOT_SPEAK_ENFORCE = True
 # no open offer, an action whose name and argument ran in the 2 minutes
 # before the turn is not run again - enforced even while ACTION_FIT_MODE is
 # 'shadow' ('off' still turns it off). "Yes", "sure", "again" or any line
-# with a request in it never count. False: no rule 7 (the old behaviour).
-# Applies on the next start.
+# with a request in it never count; while JARVIS's offer was open ("Shall I
+# try again?") only a decline counts - "All right." may accept it. False:
+# no rule 7 (the old behaviour). Applies on the next start.
 ACTION_FIT_ACK_REPEAT_ENFORCE = True
 
 # --- Chain loop guard (v3 W21, 2026-10-27; core/loop_guard.py) ---------
@@ -1785,7 +1788,8 @@ NOTE_CLAIM_CHECK = True
 # forced follow-up round ran the previous turn's pause_music twice ("Chrome
 # is already paused"). True (default): when sir's WHOLE line is a bare
 # acknowledgement or decline (core/action_fit.is_bare_ack) and he accepted no
-# open offer, the claim ("On it") is dropped and the rest is spoken ("Very
+# open offer (while an offer was open: only a decline - "All right." may
+# accept it), the claim ("On it") is dropped and the rest is spoken ("Very
 # good, sir."; that line alone when nothing else is left) - no synthetic
 # result, so no follow-up round. False: the claim withholds the reply and
 # forces the follow-up round (the old behaviour). Applies on the next start.
@@ -1805,7 +1809,9 @@ ACK_CLAIM_NO_FOLLOWUP = True
 # for Claude (note_for_claude) and JARVIS says "I can't change that myself,
 # sir - I've noted it for Claude."; otherwise "I can't change that myself,
 # sir." Never touches a promise an action this turn keeps, "I'll be more
-# careful", memory claims (NOTE_CLAIM_CHECK) or offers. False: such promises
+# careful", "I'll listen more carefully next time", "I'll save that for next
+# time" (a going-forward promise needs a timing verb: wait, hold off, let
+# him ...), memory claims (NOTE_CLAIM_CHECK) or offers. False: such promises
 # are spoken as before. Applies on the next start.
 SELF_CHANGE_PROMISE_CHECK = True
 # VERBATIM_CONTENT_RESULTS (bool, v3.0.8, bobert_companion

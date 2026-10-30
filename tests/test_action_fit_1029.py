@@ -62,6 +62,22 @@ ROBOT_SAYS = (
     "get him to tell a joke", "tell him to say hi", "can he say hi",
     "he should say good morning", "deskbot, greet my roommate",
     "make the desk bot roast me", "have it read this out",
+    # Review 2026-10-29: more third-person speaker forms.
+    "ask him to say hi", "I want him to say hello", "get him talking",
+    "let's hear him say something", "have tin man say hi",
+    "keep it talking", "need it to greet her", "watch him sing",
+)
+# The robot word only names who is addressed, or sits in the quoted line:
+# JARVIS is the speaker (review 2026-10-29).
+ROBOT_ADDRESSED = (
+    "Jarvis, say hi to the robot", "say goodnight to the bot",
+    "Jarvis, say 'I am not a robot'", 'say "I am not a robot"',
+    "say hello to my robot",
+)
+# "have / make / let <word>" that names nobody else.
+NOT_A_SPEAKER = (
+    "make sure you say hi", "I have to say hello", "let me say hi",
+    "you have a say in it", "let Jarvis say it",
 )
 BARE_ACKS = (
     "All right.", "No, not right now.", "alright", "Okay.", "OK, sir.",
@@ -105,6 +121,36 @@ class RobotSpeakerTests(unittest.TestCase):
                 self.assertTrue(af.asks_robot_speaker(text), text)
                 self.assertEqual(af.check_rule(text, SPEAK, LINE), (0, None))
                 self.assertIsNone(af.check(text, SPEAK, LINE))
+
+    def test_an_addressed_or_quoted_robot_is_not_the_speaker(self):
+        for text in ROBOT_ADDRESSED + NOT_A_SPEAKER:
+            with self.subTest(text=text):
+                self.assertFalse(af.asks_robot_speaker(text), text)
+                rule, _reason = af.check_rule(text, SPEAK, LINE)
+                self.assertEqual(rule, af.RULE_ROBOT_SPEECH, text)
+
+    def test_a_rerun_right_after_the_robot_spoke_fits(self):
+        # Live 2026-10-29 18:57:07 "Try it again." (no speech word).
+        prior = [(SPEAK, LINE)]
+        for text in ("Try it again.", "Do it again.", "again",
+                     "one more time", "say it again"):
+            with self.subTest(text=text):
+                self.assertTrue(af.asks_rerun(text), text)
+                self.assertEqual(af.check_rule(text, SPEAK, LINE, prior),
+                                 (0, None))
+
+    def test_a_rerun_needs_the_robot_to_have_spoken(self):
+        rule, _reason = af.check_rule("Try it again.", SPEAK, LINE,
+                                      [("pause_music", "")])
+        self.assertEqual(rule, af.RULE_ROBOT_SPEECH)
+        rule, _reason = af.check_rule("Try it again.", SPEAK, LINE)
+        self.assertEqual(rule, af.RULE_ROBOT_SPEECH)
+
+    def test_a_rerun_with_the_flag_off_is_the_v308_rule(self):
+        rule, reason = af.check_rule("Try it again.", SPEAK, LINE,
+                                     [(SPEAK, LINE)], robot_speaker=False)
+        self.assertEqual(rule, af.RULE_ROBOT_SPEECH)
+        self.assertIn("asked nobody to say anything", reason)
 
     def test_off_is_the_v308_rule(self):
         # robot_speaker=False: any speech word fits, as in v3.0.8.
@@ -153,6 +199,23 @@ class BareAckTests(unittest.TestCase):
         for text in NOT_BARE:
             with self.subTest(text=text):
                 self.assertFalse(af.is_bare_ack(text), text)
+                self.assertFalse(af.is_bare_decline(text), text)
+
+    def test_declines(self):
+        for text in ("No, not right now.", "no", "nope", "nah", "not now",
+                     "not yet", "maybe later", "never mind", "forget it",
+                     "no thanks", "I'm good", "Jarvis, no.",
+                     "okay, no thanks"):
+            with self.subTest(text=text):
+                self.assertTrue(af.is_bare_decline(text), text)
+
+    def test_affirmative_acks_are_no_decline(self):
+        for text in ("All right.", "alright", "Okay.", "fine", "great",
+                     "perfect", "cool", "Good.", "got it", "That's fine.",
+                     "Thanks, Jarvis.", "Understood, sir."):
+            with self.subTest(text=text):
+                self.assertTrue(af.is_bare_ack(text), text)
+                self.assertFalse(af.is_bare_decline(text), text)
 
 
 class AckRepeatTests(unittest.TestCase):
@@ -183,6 +246,18 @@ class AckRepeatTests(unittest.TestCase):
     def test_an_accepted_offer_runs(self):
         self.assertEqual(af.check_rule("okay", "pause_music", "", self.PRIOR,
                                        accepted_offer=True), (0, None))
+
+    def test_an_open_offer_needs_a_decline(self):
+        # Review 2026-10-29: "Shall I try again?" -> "All right." accepts.
+        prior = [("smart_home_on", "lamp"), ("pause_music", "")]
+        for text in ("All right.", "great", "got it", "That's fine."):
+            with self.subTest(text=text):
+                self.assertEqual(af.check_rule(text, "smart_home_on", "lamp",
+                                               prior, offer_open=True),
+                                 (0, None))
+        rule, _reason = af.check_rule("No, not right now.", "pause_music",
+                                      "", prior, offer_open=True)
+        self.assertEqual(rule, af.RULE_ACK_REPEAT)
 
     def test_another_argument_or_no_prior_runs(self):
         self.assertEqual(af.check_rule("All right.", "pause_music", "chrome",

@@ -323,6 +323,10 @@ _SPEECH_VERB = (r"(?:say|says|speak|talk|tell|announce|repeat|greet|"
                 r"quote|thank|congratulate|welcome)")
 _THIRD_PRON = r"(?:him|her|it|them)"
 _THIRD_SUBJ = r"(?:he|she|it|they)"
+_NOT_A_NAME = (r"(?:you|me|us|yourself|myself|ourselves|jarvis|sir|a|an|the|"
+               r"my|our|your|his|its|their|sure|it|him|her|them|this|that|"
+               r"these|those|some|any|everyone|everybody|someone|somebody|"
+               r"people|and|or|then|so|to|i|we|fun|time)")
 _THIRD_SPEAKER_RES = (
     # make him talk / have it say hello / let him introduce himself / get
     # him to tell a joke / make the <name> talk
@@ -342,20 +346,65 @@ _THIRD_SPEAKER_RES = (
                r"must|might|needs\s+to|has\s+to|ought\s+to|is\s+going\s+to|"
                r"gets\s+to)\s+(?:(?:just|also|please)\s+)?" + _SPEECH_VERB
                + r"\b", re.I),
+    # ask him to say hi / I want him to say hello / need it to greet her
+    re.compile(r"\b(?:ask|asked|want|wanted|need|tell|told|get|got)\s+"
+               + _THIRD_PRON + r"\s+to\b", re.I),
+    # let's hear him say something / see it greet her / watch him sing
+    re.compile(r"\b(?:hear|see|watch)\s+" + _THIRD_PRON + r"\s+(?:to\s+)?"
+               + _SPEECH_VERB + r"\b", re.I),
+    # get him talking / keep it chatting / have her singing
+    re.compile(r"\b(?:get|got|have|has|keep)\s+" + _THIRD_PRON
+               + r"\s+(?:talking|speaking|saying|singing|chatting)\b", re.I),
+    # have <name> say hi / make <two-word name> talk: a bare name the
+    # recogniser spelled so it matches no robot word. Never "have you /
+    # let me / make sure / have a say / have to say / let Jarvis ...":
+    # those words name nobody else (_NOT_A_NAME).
+    re.compile(r"\b(?:have|make|let)\s+(?!" + _NOT_A_NAME + r"\b)[a-z][\w'-]*"
+               r"(?:\s+(?!" + _NOT_A_NAME + r"\b)[a-z][\w'-]*)?\s+"
+               r"(?:to\s+)?" + _SPEECH_VERB + r"\b", re.I),
 )
+# A robot word that only names who is ADDRESSED ("say hi to the robot",
+# "say goodnight to the bot") makes JARVIS the speaker, not the robot.
+_ADDRESSED_ROBOT_RE = re.compile(
+    r"\b(?:to|at|about)\s+(?:(?:the|my|our|your|that|this)\s+)?"
+    + ROBOT_WORD_STRICT + r"$", re.I)
+# Words the owner quotes are the line to say, not who says it ("say 'I am
+# not a robot'"): double or curly quotes anywhere, a single quote only when
+# it opens after a space (never the apostrophe in "don't").
+_QUOTED_RE = re.compile(r"\"[^\"]*\"|“[^”]*”"
+                        r"|(?:^|(?<=\s))'[^']+'(?=[\s.,!?;:]|$)")
+# Re-run words: right after the robot spoke, "Try it again." / "do it
+# again" / "one more time" ask for the same line again with no speech word
+# in them (live 2026-10-29 18:57:07, the owner testing the delay).
+_RERUN_RE = re.compile(
+    r"\bagain\b|\bone more time\b|\bonce more\b|\bre-?run\b"
+    r"|\b(?:try|do)\s+(?:it|that|this)\b|\brepeat\b|\bsame\s+thing\b",
+    re.I)
 
 
 def asks_robot_speaker(user_text) -> bool:
     """True when the owner's words make the ROBOT the speaker: a robot word
     or a third-person speaker form (see the block comment). "Jarvis, say
-    hello." and "I want you to say it" are not. Never raises."""
+    hello.", "I want you to say it", "say hi to the robot" and a robot word
+    inside the quoted line are not. Never raises."""
     try:
         text = _norm(user_text)
         if not text:
             return False
-        if _ROBOT_NAMED_RE.search(text):
-            return True
+        named = _QUOTED_RE.sub(" ", text)
+        for m in _ROBOT_NAMED_RE.finditer(named):
+            if not _ADDRESSED_ROBOT_RE.search(named[:m.end()]):
+                return True
         return any(rx.search(text) for rx in _THIRD_SPEAKER_RES)
+    except Exception:
+        return False
+
+
+def asks_rerun(user_text) -> bool:
+    """True when the owner's words ask for the same thing again ("Try it
+    again.", "do it again", "one more time"). Never raises."""
+    try:
+        return _RERUN_RE.search(_norm(user_text)) is not None
     except Exception:
         return False
 
@@ -398,6 +447,33 @@ def is_bare_ack(user_text) -> bool:
             return False
         return (_BARE_ACK_RE.match(text) is not None
                 and _BARE_ACK_WORD_RE.search(text) is not None)
+    except Exception:
+        return False
+
+
+# While JARVIS's offer was OPEN when the turn began ("Shall I try again?"),
+# an affirmative acknowledgement ("All right.", "great", "got it", "that's
+# fine") may be the owner accepting it - core.yes_no.classify_reply reads
+# only "alright" as a yes, so the recogniser's "All right." was "other" and
+# rule 7 blocked the retry he had just agreed to. Then only a DECLINE is
+# bare: these words, with the acknowledgement / "Jarvis" / "sir" words
+# around them allowed ("okay, no thanks").
+_BARE_DECLINE_WORD_RE = re.compile(
+    r"\b(?:no|nope|nah|not\s+now|not\s+right\s+now|not\s+yet|maybe\s+later|"
+    r"never\s*mind|forget\s+it|no\s+thanks|no\s+thank\s+you|i'?m\s+good|"
+    r"i\s+am\s+good)\b", re.I)
+
+
+def is_bare_decline(user_text) -> bool:
+    """True when the owner's WHOLE line is a bare acknowledgement or decline
+    (is_bare_ack) with a decline word in it ("No, not right now.", "never
+    mind", "okay, no thanks"). "All right.", "great", "got it" are not.
+    Never raises."""
+    try:
+        if not is_bare_ack(user_text):
+            return False
+        text = _norm(user_text).lower().replace("’", "'")
+        return _BARE_DECLINE_WORD_RE.search(text) is not None
     except Exception:
         return False
 
@@ -482,7 +558,8 @@ def check_rule(user_text, name, arg="",
                reply_actions: Sequence = (), *,
                robot_speaker: bool = True,
                ack_repeat: bool = True,
-               accepted_offer: bool = False) -> tuple:
+               accepted_offer: bool = False,
+               offer_open: bool = False) -> tuple:
     """(rule number, reason) when ``name(arg)`` misfits the owner's words,
     (0, None) when it fits - see the module docstring for the rules and
     check for ``prior_actions`` / ``reply_actions``.
@@ -490,15 +567,20 @@ def check_rule(user_text, name, arg="",
     ``robot_speaker``: rule 6 also needs the robot as the speaker (v3.0.9);
     False = the v3.0.8 rule 6 (any speech word fits). ``ack_repeat``: rule 7
     is on; False = no rule 7. ``accepted_offer``: this turn accepted JARVIS's
-    open offer (rule 7 never applies then). Never raises."""
+    open offer (rule 7 never applies then). ``offer_open``: JARVIS's offer
+    was open when the turn began and this turn did not accept it as a clear
+    yes - rule 7 then needs a DECLINE (is_bare_decline), since "All right."
+    may accept it. Never raises."""
     try:
         text = _norm(user_text)
         nm = str(name or "").strip().lower()
         if not text or not nm:
             return 0, None
         # Rule 7: the same action again for a bare acknowledgement or
-        # decline (and no accepted offer).
-        if ack_repeat and not accepted_offer and is_bare_ack(text):
+        # decline (and no accepted offer; only a decline while an offer
+        # was open).
+        bare = is_bare_decline(text) if offer_open else is_bare_ack(text)
+        if ack_repeat and not accepted_offer and bare:
             a = _norm(arg).lower()
             if (nm, a) in set(_pairs(prior_actions)):
                 shown = f"{nm}({_norm(arg)})" if a else nm
@@ -521,6 +603,12 @@ def check_rule(user_text, name, arg="",
         # Rule 6: the robot made to speak when nobody was asked to say
         # anything - or (v3.0.9) when sir asked JARVIS himself to say it.
         if is_robot_speak_action(nm):
+            # (v3.0.9) "Try it again." right after the robot spoke asks for
+            # its line again: it fits, with or without a speech word.
+            if (robot_speaker and asks_rerun(text)
+                    and any(is_robot_speak_action(p)
+                            for p, _g in _pairs(prior_actions))):
+                return 0, None
             if not asks_robot_speech(text):
                 return RULE_ROBOT_SPEECH, (
                     f"not run: {nm} makes the desk robot say a line, and "

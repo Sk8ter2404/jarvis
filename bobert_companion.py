@@ -43733,6 +43733,11 @@ def _take_open_offer(text) -> str:
         print("  [offer-yes] JARVIS said something else after the offer - "
               "this turn does not answer it")
         return ""
+    if outcome in ("yes", "no", "other"):
+        # The offer was open and this turn answers it (v3.0.9, see
+        # _turn_offer_open): "All right." may accept it even though it is
+        # not a clear yes.
+        _note_turn_offer_open()
     if outcome == "yes":
         print(f"  [offer-yes] sir said yes to {offer[:90]!r} - asking the "
               f"brain to carry it out")
@@ -43971,16 +43976,45 @@ def _turn_accepted_offer() -> bool:
         return False
 
 
+def _note_turn_offer_open() -> None:
+    """Record that JARVIS's offer was open when this owner turn began and
+    the turn answers it (_take_open_offer: not none / stale / expired), for
+    _turn_offer_open. Never raises."""
+    try:
+        frame = getattr(_turn_grounding, "frame", None)
+        if frame is not None:
+            frame["offer_open"] = True
+    except Exception:
+        pass
+
+
+def _turn_offer_open() -> bool:
+    """True when JARVIS's offer was open as this owner turn began (review
+    2026-10-29: "The lamp didn't answer, sir. Shall I try again?" -> "All
+    right." - core.yes_no reads "all right" as no clear yes, yet it accepts
+    the offer). Rule 7 and the ACK_CLAIM_NO_FOLLOWUP drop then apply to a
+    DECLINE only (core.action_fit.is_bare_decline). Never raises."""
+    try:
+        frame = getattr(_turn_grounding, "frame", None)
+        return bool(frame and frame.get("offer_open"))
+    except Exception:
+        return False
+
+
 def _turn_is_bare_ack() -> bool:
     """True when this owner turn's WHOLE line is a bare acknowledgement or
     decline (core.action_fit.is_bare_ack: "All right.", "No, not right
     now.") and it accepted no open offer - action-fit rule 7 and the
-    ACK_CLAIM_NO_FOLLOWUP claim drop ask the same thing. False outside an
-    owner turn. Never raises."""
+    ACK_CLAIM_NO_FOLLOWUP claim drop ask the same thing. While an offer was
+    open (_turn_offer_open) only a decline counts ("All right." may accept
+    it). False outside an owner turn. Never raises."""
     try:
         user_text = _turn_user_text()
-        return bool(user_text and not _turn_accepted_offer()
-                    and _action_fit.is_bare_ack(user_text))
+        if not user_text or _turn_accepted_offer():
+            return False
+        if _turn_offer_open():
+            return _action_fit.is_bare_decline(user_text)
+        return _action_fit.is_bare_ack(user_text)
     except Exception:
         return False
 
@@ -44084,7 +44118,8 @@ def _action_fit_refusal(name: str, arg: str, reply_names=()) -> "str | None":
         rule, reason = _action_fit.check_rule(
             user_text, name, arg, _action_fit_prior_actions(), reply_names,
             robot_speaker=robot_on, ack_repeat=ack_on,
-            accepted_offer=ack_on and _turn_accepted_offer())
+            accepted_offer=ack_on and _turn_accepted_offer(),
+            offer_open=ack_on and _turn_offer_open())
         if not reason:
             return None
         shown = f"{name}({arg})" if arg else name

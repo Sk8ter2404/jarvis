@@ -78,6 +78,17 @@ NOT_PROMISES = (
     "I can't change my timing myself, sir.",
     "I'm afraid I won't be able to wait before I speak.",
     "The deskbot paused before it spoke.",
+    # Review 2026-10-29: contrition and ordinary plans with "next time".
+    "Apologies, sir. I'll listen more carefully next time.",
+    "I'll get it right next time, sir.",
+    "I'll double-check next time.",
+    "I'll ask him next time he's online.",
+    "I'll save that for next time.",
+    "I'll introduce you next time.",
+    "I'll have it ready for you next time.",
+    "I'll pay more attention next time.",
+    "I'll wait for you next time, sir.",
+    "I'll be listening more carefully, sir.",
     "",
 )
 
@@ -117,6 +128,17 @@ class FindTests(unittest.TestCase):
     def test_never_raises(self):
         self.assertIsNone(cv.find_self_change_promise(None))
         self.assertEqual(cv.drop_self_change_promises(None), (None, [], True))
+
+
+class ApologyTests(unittest.TestCase):
+    def test_an_apology_is_kept_and_nothing_is_noted(self):
+        reply = ("[intent:apology] Apologies, sir. I'll listen more "
+                 "carefully next time.")
+        self.assertEqual(cv.drop_self_change_promises(reply),
+                         (reply, [], True))
+        reply = "Very good, sir. I'll save that for next time."
+        self.assertEqual(cv.drop_self_change_promises(reply),
+                         (reply, [], True))
 
 
 class DropTests(unittest.TestCase):

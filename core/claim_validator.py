@@ -2209,7 +2209,8 @@ def drop_unverified_claims(text: str, *, ran_actions: Iterable[str] = (),
 #     delivery ...", "before I speak / talk / chime in / interrupt ...", or
 #     "until / after he finishes talking";
 #   * or a going-forward promise ("from now on / next time / going forward
-#     / in future I'll <verb>", either order) with a concrete verb.
+#     / in future I'll <verb>", either order) with a timing verb (wait,
+#     hold off, slow down, let / give him ...: _SC_FORWARD_VERB).
 # Deliberately narrow. Never a self-change promise: a question or an offer
 # ("Shall I add a pause?", "if you'd like"), generic contrition ("I'll be
 # more careful", "I'll do better next time", "I'll try to ..."), a memory
@@ -2246,25 +2247,30 @@ _SC_CHANGE_RE = re.compile(_SC_FUTURE + _SC_VERB + r".*?(?:" + _SC_TARGET
                            + r")")
 _SC_FORWARD = (r"(?:from\s+now\s+on|going\s+forward|from\s+here\s+on(?:\s+"
                r"out)?|in\s+(?:the\s+)?future|henceforth|next\s+time)")
-# Verbs a going-forward promise may carry that change nothing concrete
-# (contrition, memory, an action's own wording).
-_SC_SOFT = (r"(?:be|try|do\s+better|do\s+my\s+best|keep|bear|remember|note|"
-            r"make\s+a\s+note|not\s+forget|never\s+forget|endeavou?r|strive|"
-            r"aim|attempt|work\s+on|look\s+into|let\s+you\s+know|remind|"
-            r"call\s+you|address\s+you|refer\s+to\s+you|take\s+care|"
-            r"stick\s+to|happily|gladly|see|catch\s+you|talk\s+to\s+you|"
-            r"speak\s+(?:to|with)\s+you|chat|be\s+here|miss)\b")
+# The verbs a going-forward promise must carry: a change to JARVIS's own
+# timing (wait, hold off, slow down, let / give HIM ...). Review 2026-10-29:
+# any verb but a soft list also caught contrition and ordinary plans ("I'll
+# listen more carefully next time", "I'll get it right next time", "I'll
+# ask him next time he's online", "I'll save that for next time", "I'll
+# introduce you next time"), so the apology became "I can't change that
+# myself, sir." A going-forward sentence with a concrete change and its
+# target ("next time I'll add a pause") is _SC_CHANGE_RE's anyway.
+_SC_FORWARD_VERB = (
+    r"(?:wait(?!\s+for\s+(?:you|your)\b)|hold\s+off|hold\s+back|"
+    r"hang\s+back|slow\s+down|pause|"
+    r"(?:give|let|allow|leave)\s+(?:him|her|them|the\s+[\w-]+"
+    r"(?:\s+[\w-]+)?))\b")
 _SC_FORWARD_RES = (
     re.compile(r"\b" + _SC_FORWARD + r"\b\s*,?\s*" + _SC_FUTURE
-               + r"(?!" + _SC_SOFT + r")[a-z]"),
-    re.compile(_SC_FUTURE + r"(?!" + _SC_SOFT + r")[a-z][a-z'\s-]{0,60}?\b"
+               + _SC_FORWARD_VERB),
+    re.compile(_SC_FUTURE + _SC_FORWARD_VERB + r"[a-z'\s-]{0,60}?\b"
                + _SC_FORWARD + r"\b"),
 )
 # Never a self-change promise: a question / offer, contrition, memory.
 _SC_NOT_RE = re.compile(
     r"\b(?:can'?t|cannot|won'?t|unable|i\s+could|i\s+can|if\s+you|"
     r"would\s+you|shall\s+i|should\s+i|want\s+me\s+to|remember|in\s+mind|"
-    r"memory|more\s+careful|do\s+better|try\s+(?:to|harder)|"
+    r"memory|more\s+careful(?:ly)?|do\s+better|try\s+(?:to|harder)|"
     r"(?:it|that)\s+won'?t\s+happen|remind\w*|timers?|alarms?|"
     r"schedul\w*|calendar|appointment)\b")
 
