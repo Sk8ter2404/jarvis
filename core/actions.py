@@ -5098,6 +5098,64 @@ def _act_latency_benchmark(_: str = "") -> str:
 
 # ─── Music: iTunes search-and-play with browser-Apple-Music routing (Phase 4H) ──
 
+def _play_music_transport_on() -> bool:
+    """PLAY_MUSIC_TRANSPORT_WORDS as the turn sees it: core.config's value
+    and, when the monolith is loaded, its own global (the one the
+    [turn-flags] line prints) - off when either is off, so the log and the
+    behaviour cannot disagree. Never raises (an error reads as off)."""
+    try:
+        from core import config as _cfg
+        if not bool(getattr(_cfg, "PLAY_MUSIC_TRANSPORT_WORDS", True)):
+            return False
+        bc = _loaded_bc()
+        if bc is not None and not bool(
+                getattr(bc, "PLAY_MUSIC_TRANSPORT_WORDS", True)):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _said_play_title(said: str, arg: str) -> bool:
+    """True when the owner's own words this turn were an explicit "play /
+    put on / queue <the whole argument>" ("play Carry On", "play Stop by the
+    Spice Girls"): a real song whose title is a transport word. A bare
+    "it" / "that" never counts ("play it" is a transport request). Never
+    raises (an error reads as False)."""
+    try:
+        from core.dispatcher import _transport_norm
+        norm_arg = _transport_norm(arg)
+        norm_said = _transport_norm(said)
+        if not norm_arg or not norm_said or norm_arg in ("it", "that"):
+            return False
+        return bool(re.search(
+            r"\b(?:play|put\s+on|queue(?:\s+up)?)\s+" + re.escape(norm_arg)
+            + r"(?:\s+(?:by|from)\b|$|\s+and\b)", norm_said))
+    except Exception:
+        return False
+
+
+def _play_music_transport_op(arg: str) -> "str | None":
+    """'resume' / 'pause' / 'next' when PLAY_MUSIC_TRANSPORT_WORDS is on and
+    the whole play_music argument is only a transport request
+    (core.dispatcher.transport_arg_op), unless the owner's words this turn
+    were "play <that argument>" (a song titled "Carry On" / "Stop" is still
+    a song, review 2026-10-29); else None (the song search, exactly as
+    before). Never raises."""
+    try:
+        if not _play_music_transport_on():
+            return None
+        from core.dispatcher import transport_arg_op
+        op = transport_arg_op(arg)
+        if op is not None and _said_play_title(_turn_said(), arg):
+            print("  [play_music] the owner asked for this title by name "
+                  "-> the song search")
+            return None
+        return op
+    except Exception:
+        return None
+
+
 def _act_play_music(args: str) -> str:
     """Play a song / artist / album by name.
 
@@ -5120,6 +5178,22 @@ def _act_play_music(args: str) -> str:
     stripped = args.strip()
     if not stripped:
         return "format: play_music, <song/artist/album name>"
+
+    # A transport word is not a song (v3.0.9, PLAY_MUSIC_TRANSPORT_WORDS):
+    # live 2026-10-29 19:12 "Resume movie." became play_music, resume, which
+    # opened a song called "Resume" and left the paused movie paused. Only
+    # the WHOLE argument counts; the handler's own line is the answer (never
+    # a fallback search for the word).
+    op = _play_music_transport_op(stripped)
+    if op == "resume":
+        print("  [play_music] a transport word, not a song -> resume_music")
+        return _act_resume_music()
+    if op == "pause":
+        print("  [play_music] a transport word, not a song -> pause_music")
+        return _act_pause_music()
+    if op == "next":
+        print("  [play_music] a transport word, not a song -> next_song")
+        return _act_next_song()
 
     # `library:` used to FORCE the local iTunes library. That library is gone,
     # so say so honestly, strip the prefix, and stream it via Apple Music.

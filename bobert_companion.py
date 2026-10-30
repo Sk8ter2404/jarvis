@@ -17945,6 +17945,8 @@ _TURN_FLAG_KEYS = (
     # v3.0.9 lane B: site names, one action per offer yes, printer status.
     "SITE_NAME_SPOKEN_FORMS", "OFFER_YES_ONE_ACTION",
     "BAMBU_PUSHALL_ON_CONNECT", "PRINT_STATUS_HONEST",
+    # v3.0.9 lane C: a transport word is not a song.
+    "PLAY_MUSIC_TRANSPORT_WORDS",
 )
 
 
@@ -17973,6 +17975,9 @@ def _log_turn_flags() -> None:
         for k in _TURN_FLAG_KEYS:
             if k in g:
                 v = g[k]
+                if k == "PLAY_MUSIC_TRANSPORT_WORDS":
+                    # Both switches it reads (v3.0.9): never a stale value.
+                    v = _play_music_transport_on()
                 if k == "STT_ENGINE" and g.get("_stt_parakeet") is not None:
                     v = g["_stt_parakeet"].engine_setting(v)
                 tok = _turn_flag_token(v)
@@ -23007,6 +23012,33 @@ _LOCAL_NEVER_GUESS_GUARD = (
 )
 
 
+def _play_music_transport_on() -> bool:
+    """PLAY_MUSIC_TRANSPORT_WORDS as this turn sees it (v3.0.9): this
+    module's global (the value the [turn-flags] line prints, the way
+    NOTE_CLAIM_CHECK is read) AND core.config's (what core.actions reads) -
+    off when either is off, so the log and the behaviour cannot disagree.
+    Never raises (an error reads as off)."""
+    try:
+        if not bool(globals().get("PLAY_MUSIC_TRANSPORT_WORDS", True)):
+            return False
+        import core.config as _cfg_pm
+        return bool(getattr(_cfg_pm, "PLAY_MUSIC_TRANSPORT_WORDS", True))
+    except Exception:
+        return False
+
+
+def _play_music_transport_hint() -> str:
+    """The one line under play_music in the local cheat sheet (v3.0.9,
+    PLAY_MUSIC_TRANSPORT_WORDS): live 2026-10-29 19:12 "Resume movie." was
+    written as play_music, resume. "" with the flag off (the old sheet
+    exactly). The sheet cache is keyed on this flag too, so a live flip
+    rebuilds it. Never raises."""
+    if not _play_music_transport_on():
+        return ""
+    return ("      resume / pause / next are resume_music / pause_music / "
+            "next_song, never play_music\n")
+
+
 def _local_cheatsheet() -> str:
     """A COMPACT action reference that REPLACES the ~18k-token PC_CONTROL_PROMPT
     for local-model calls.
@@ -23027,8 +23059,11 @@ def _local_cheatsheet() -> str:
         _n_actions = len(ACTIONS)
     except Exception:               # a broken registry must not break the prompt
         _n_actions = -1
+    # Keyed on the transport flag too (v3.0.9): its hint line must leave the
+    # sheet as soon as PLAY_MUSIC_TRANSPORT_WORDS goes off, not at a restart.
+    _cache_key = (_n_actions, _play_music_transport_on())
     cached = _LOCAL_CHEATSHEET_CACHE[0]
-    if isinstance(cached, tuple) and cached[0] == _n_actions:
+    if isinstance(cached, tuple) and cached[0] == _cache_key:
         return cached[1]
     common = (
         "\n\n=== CONTROLLING THE PC ===\n"
@@ -23039,6 +23074,7 @@ def _local_cheatsheet() -> str:
         + _LOCAL_NEVER_GUESS_GUARD +
         "\nMost-used actions (classic iTunes is GONE — the Apple Music app + music.apple.com are the player):\n"
         "  [ACTION: play_music, <artist/song/album>]   play a song/artist/album on Apple Music (music.apple.com)\n"
+        + _play_music_transport_hint() +
         "  [ACTION: play_playlist, <name>]   play ANY named playlist — streams it via Apple Music ('shuffle ' prefix shuffles). Use this for every 'play my/the <name> playlist', NOT apple_music.\n"
         "  [ACTION: list_playlists]   (points sir to the Apple Music app)   [ACTION: shuffle_library]   shuffle music via Apple Music\n"
         "  [ACTION: open_apple_music]   open Apple Music (the web player)   [ACTION: music_status]   is Apple Music open / what's playing\n"
@@ -23123,7 +23159,7 @@ def _local_cheatsheet() -> str:
         "=== END PC CONTROL ===\n"
     )
     out = common + allnames + tail
-    _LOCAL_CHEATSHEET_CACHE[0] = (_n_actions, out)
+    _LOCAL_CHEATSHEET_CACHE[0] = (_cache_key, out)
     return out
 
 
@@ -36985,6 +37021,25 @@ def _screen_route_reply(text: str) -> "str | None":
     return tok
 
 
+def _video_transport_route_reply(text: str) -> "str | None":
+    """The resume_music / pause_music token core.dispatcher.
+    video_transport_route claims ``text`` with, when PLAY_MUSIC_TRANSPORT_
+    WORDS is on (_play_music_transport_on, read live) and the action is
+    registered; else None. Never raises."""
+    try:
+        if not _play_music_transport_on():
+            return None
+        from core.dispatcher import video_transport_route as _vt_route
+        tok = _vt_route(text)
+    except Exception:
+        return None
+    m = _ROUTE_TOKEN_RE.match(tok) if tok else None
+    if not m or m.group(1) not in ACTIONS:
+        return None
+    print(f"  [route] video transport -> {m.group(1)}")
+    return tok
+
+
 def _utterance_route_reply(text: str) -> "str | None":
     """The action token a registered route claims ``text`` with, or None.
     Never raises; a failing or malformed route is logged and skipped.
@@ -37030,6 +37085,14 @@ def _utterance_route_reply(text: str) -> "str | None":
     if _yt_tok:
         print("  [route] play on YouTube -> youtube_play")
         return _yt_tok
+    # BUILT-IN route (v3.0.9, PLAY_MUSIC_TRANSPORT_WORDS): a whole "resume /
+    # continue the movie / video / show" or "pause the movie" -> resume_music
+    # / pause_music (core.dispatcher.video_transport_route). Live 2026-10-29
+    # 19:12 "Jarvis Resume movie." became play_music, resume: a song called
+    # "Resume" opened and the paused movie stayed paused.
+    _vt_tok = _video_transport_route_reply(text)
+    if _vt_tok:
+        return _vt_tok
     # "Play my song from earlier" (live 2026-10-26 20:08: the brain played a
     # track literally titled "Earlier"): the last media request, replayed.
     try:
@@ -43335,7 +43398,13 @@ _AGENT_ASK_RE = re.compile(
     # a <X>", "go through the top posts"): an outright agent ask is never
     # refused because an open_url / web_search ran first.
     r"(?:use|have|get)\s+(?:the|your)\s+browser|autopilot\s+the\s+browser|"
-    r"your\s+browser\s+to|find\s+me|go\s+through)\b",
+    r"your\s+browser\s+to|find\s+me|go\s+through|"
+    # "search X and tell me what it says" / "... what do the results say?"
+    # ask for the page to be read as well (final review 2026-10-29).
+    r"tell\s+me\s+(?:what|about|if|whether|how)|"
+    r"what\s+(?:it|they|the\s+(?:page|site|article|results?))\s+says?|"
+    r"what\s+(?:does|do)\s+(?:it|they|the\s+(?:page|site|article|results?))"
+    r"\s+say)\b",
     re.IGNORECASE)
 
 

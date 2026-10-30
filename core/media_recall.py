@@ -57,12 +57,35 @@ def _clean_title(text: str) -> str:
     return " ".join(t.split())
 
 
+def _is_transport_arg(arg: str) -> bool:
+    """True when play_music ran ``arg`` as resume / pause / next, not as a
+    song (v3.0.9, PLAY_MUSIC_TRANSPORT_WORDS on): "play_music, resume" is
+    not a song to replay "from earlier" (review 2026-10-29). Mirrors
+    core.actions._play_music_transport_op: a title the owner asked for by
+    name this turn ("play Carry On") is still a song. Never raises (an
+    error reads as False: remembered, the old path)."""
+    try:
+        import sys
+        from core import config as _cfg
+        if not bool(getattr(_cfg, "PLAY_MUSIC_TRANSPORT_WORDS", True)):
+            return False
+        acts = sys.modules.get("core.actions")
+        if acts is not None:
+            return acts._play_music_transport_op(arg) is not None
+        from core.dispatcher import transport_arg_op
+        return transport_arg_op(arg) is not None
+    except Exception:
+        return False
+
+
 def request_from(action: str, arg: str):
     """{"action", "title", "monitor"} for a media request, else None."""
     try:
         name = (action or "").strip().lower()
         a = str(arg or "")
         if name in PLAY_ACTIONS:
+            if name == "play_music" and _is_transport_arg(a):
+                return None
             title = _clean_title(a)
             return {"action": name, "title": title, "monitor": ""} if title else None
         if name in YOUTUBE_SEARCH_ACTIONS:

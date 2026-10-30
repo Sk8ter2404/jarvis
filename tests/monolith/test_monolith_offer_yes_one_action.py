@@ -172,6 +172,28 @@ class AgentAskedTests(_Base):
             self.assertEqual(bc._agent_on_search_refusal(
                 "browser_task", frozenset({"web_search"}), set()), "", said)
 
+    def test_tell_me_what_it_says_lets_the_agent_read_the_page(self):
+        # Final review 10-29: "search X and tell me what it says" asks for the
+        # page to be read, so the agent after the search is not refused; a
+        # bare search or a plain yes still gets only the search.
+        bc = self.bc
+        self._flag(True)
+        for said in ("Jarvis, search Example Site and tell me what it says.",
+                     "Jarvis, look it up and tell me about the reviews.",
+                     "Search Example Forum, what do the results say?",
+                     "Jarvis, search it and tell me if it's open today."):
+            self._p(bc._turn_grounding, "frame",
+                    {"user_text": said, "ran": set()}, create=True)
+            self.assertEqual(bc._agent_on_search_refusal(
+                "browse_for", frozenset({"web_search"}), set()), "", said)
+        for said in ("Jarvis, search for Example Site.", "Yes, go ahead.",
+                     "Tell me a joke after you search Example Site."):
+            self._p(bc._turn_grounding, "frame",
+                    {"user_text": said, "ran": set()}, create=True)
+            self.assertTrue(bc._agent_on_search_refusal(
+                "browse_for", frozenset({"web_search"}), set()).startswith(
+                    "refused:"), said)
+
     def test_open_url_and_use_the_browser_in_one_reply_both_run(self):
         self._flag(True)
         self._stub("open_url", "opened https://example.com")
