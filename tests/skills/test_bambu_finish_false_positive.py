@@ -84,6 +84,12 @@ class FinishFalsePositiveTests(unittest.TestCase):
                                        task_id="222")), 1)
 
     def test_queued_finish_dropped_when_printer_moved_on(self):
+        # The 10-12 check itself (FINISH_LINE_KEEP off). The v3.0.10 check is
+        # pinned in tests/skills/test_print_lines_3010.
+        from core import config
+        p = mock.patch.object(config, "FINISH_LINE_KEEP", False, create=True)
+        p.start()
+        self.addCleanup(p.stop)
         sv = self.mod.speech_still_valid
         with self.mod._state_lock:
             self.mod._state.update(gcode_state="FINISH", filename="cube.3mf")

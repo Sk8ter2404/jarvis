@@ -181,6 +181,21 @@ def _read_state():
 
 
 # ── speech routing ───────────────────────────────────────────────────
+def _defer_milestone_to_monitor() -> bool:
+    """PRINT_MILESTONE_ONE_LINE (core.config, v3.0.10): live 2026-10-28 one
+    milestone came as two or three lines. True = bambu_monitor is loaded and
+    owns the 25/50/75 % lines and the finish line, so the "Print at N%"
+    variant stays quiet. Flag off (or monitor absent): False, the old
+    behaviour. Never raises."""
+    try:
+        if _get_bambu_module() is None:
+            return False
+        from core import config as _cfg
+        return bool(getattr(_cfg, "PRINT_MILESTONE_ONE_LINE", True))
+    except Exception:
+        return False
+
+
 def _gated_announce(message: str) -> None:
     """Route milestone speech through bambu_print_announcer's gated
     _proactive_announce when available — that path coordinates focus
@@ -389,6 +404,8 @@ def _process_snapshot(snapshot: dict, gcode_state: str) -> None:
         for threshold in _MILESTONES:
             if pct_f >= threshold and threshold not in _announced_milestones:
                 _announced_milestones.add(threshold)
+                if _defer_milestone_to_monitor():
+                    break  # bambu_monitor speaks this one (one line each)
                 remaining_str = _format_minutes(remaining) if remaining else ""
                 if remaining_str:
                     msg = (f"Print at {threshold}%, sir — roughly "

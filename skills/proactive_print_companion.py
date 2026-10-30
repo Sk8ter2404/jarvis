@@ -181,14 +181,39 @@ def _strip_filename(name: str) -> str:
 
 
 # ── speech ────────────────────────────────────────────────────────
-def _enqueue_speech(message: str) -> None:
+def _flag_on(name: str) -> bool:
+    """A core.config flag, read live (default True). Never raises."""
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, name, True))
+    except Exception:
+        return True
+
+
+def _enqueue_speech(message: str, still_valid: str | None = None,
+                    supersede: str | None = None) -> None:
     """Route a proactive line through bobert_companion's
     proactive_announce(), falling back to bambu_monitor's queue writer
-    and ultimately a direct write so we never silently lose a callout."""
+    and ultimately a direct write so we never silently lose a callout.
+
+    ``still_valid`` (FINISH_LINE_KEEP) / ``supersede``
+    (PRINT_MILESTONE_SUPERSEDE), v3.0.10: passed on only when set; an
+    announcer that does not take them gets the plain call."""
+    extra = {}
+    if still_valid:
+        extra["still_valid"] = still_valid
+    if supersede:
+        extra["supersede"] = supersede
     try:
         bc = importlib.import_module("bobert_companion")
         fn = getattr(bc, "proactive_announce", None)
         if callable(fn):
+            if extra:
+                try:
+                    fn(message, source="print_companion", **extra)
+                    return
+                except TypeError:
+                    pass
             fn(message, source="print_companion")
             return
     except Exception:
@@ -196,6 +221,12 @@ def _enqueue_speech(message: str) -> None:
     bm = _get_bambu_module()
     if bm is not None and hasattr(bm, "_enqueue_speech"):
         try:
+            if extra:
+                try:
+                    bm._enqueue_speech(message, **extra)
+                    return
+                except TypeError:
+                    pass
             bm._enqueue_speech(message)
             return
         except Exception:
@@ -280,6 +311,47 @@ def _milestone_commentary(threshold: int, remaining_min) -> str:
     else:
         opener = "Three-quarters complete, sir"
     return f"{opener} — {eta_phrase}, {hedge}."
+
+
+def _focus_active() -> bool:
+    """True while the live do-not-disturb skill is engaged (its banter is
+    muted). Absent skill = False. Never raises."""
+    try:
+        mod = sys.modules.get("skill_dnd_focus_mode")
+        fn = getattr(mod, "is_focus_mode_active", None) if mod else None
+        return bool(fn()) if callable(fn) else False
+    except Exception:
+        return False
+
+
+def _one_line_milestone(threshold: int, remaining_min) -> str:
+    """PRINT_MILESTONE_ONE_LINE (v3.0.10): the companion's milestone line, or
+    "" to stay quiet. Spoken only when it adds the finish time the plain
+    bambu_monitor line lacked, never in focus mode, and never with a hedge
+    tail naming a fault nobody saw. Never raises."""
+    try:
+        if _focus_active():
+            print(f"  [print_companion] {threshold}% line skipped: focus mode")
+            return ""
+        eta = _format_eta_clock(remaining_min)
+        if not eta:
+            print(f"  [print_companion] {threshold}% line skipped: no ETA yet")
+            return ""
+        bm = _get_bambu_module()
+        had = getattr(bm, "_milestone_had_eta", None) if bm else None
+        if isinstance(had, dict) and had.get(threshold):
+            print(f"  [print_companion] {threshold}% line skipped: the plain "
+                  "line already gave the time left")
+            return ""
+        if threshold == 25:
+            opener = "Quarter of the way along, sir"
+        elif threshold == 50:
+            opener = "Halfway through, sir"
+        else:
+            opener = "Three-quarters complete, sir"
+        return f"{opener} — current trajectory suggests completion at {eta}."
+    except Exception:
+        return ""
 
 
 def _light_skill_available() -> bool:
@@ -570,7 +642,13 @@ def _maybe_announce_completion_offer(state: dict) -> None:
     # Empty line means bambu_monitor already owns the completion
     # announcement and we have no offer to trail it with — stay quiet.
     if line:
-        _enqueue_speech(line)
+        # FINISH_LINE_KEEP (v3.0.10): when bambu_monitor owns the head this
+        # is only the offer ("Shall I ... for you, sir?"); the drain speaks
+        # it only right after its finish line, never on its own.
+        if _get_bambu_module() is not None and _flag_on("FINISH_LINE_KEEP"):
+            _enqueue_speech(line, still_valid="bambu_finish_offer:")
+        else:
+            _enqueue_speech(line)
     _announced_completion_offer[0] = True
     _record_print_outcome("success", state)
 
@@ -679,7 +757,14 @@ def _poll_once_locked() -> None:
             if now - first_seen < MILESTONE_OFFSET_SECONDS:
                 continue
             _milestone_announced.add(threshold)
-            _enqueue_speech(_milestone_commentary(threshold, remaining))
+            if _flag_on("PRINT_MILESTONE_ONE_LINE"):
+                text = _one_line_milestone(threshold, remaining)
+            else:
+                text = _milestone_commentary(threshold, remaining)
+            if text and _flag_on("PRINT_MILESTONE_SUPERSEDE"):
+                _enqueue_speech(text, supersede="bambu_milestone")
+            elif text:
+                _enqueue_speech(text)
             _sample_vision_async(threshold)
             break  # one milestone per poll, never stack
 

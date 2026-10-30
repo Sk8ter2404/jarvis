@@ -570,6 +570,9 @@ def _honest_status_reply(with_temps: bool) -> str:
 # Milestone bookkeeping — reset whenever a new print starts so the same
 # print only announces each threshold once.
 _announced_milestones: set      = set()
+# threshold -> whether its plain line carried "Estimated X remaining"
+# (read by proactive_print_companion, PRINT_MILESTONE_ONE_LINE).
+_milestone_had_eta: dict        = {}
 _current_print_filename: list   = [None]
 _last_gcode_state: list         = [None]
 _announced_start: list          = [False]   # 0 % "Print started" guard
@@ -583,11 +586,79 @@ _print_start_ts: list           = [0.0]
 _print_initial_estimate_min: list = [None]
 
 
+# FINISH_LINE_KEEP (core.config, v3.0.10): a queued finish line is stale
+# only when a NEW job is under way. These states mean one is; FINISH, IDLE,
+# FAILED and an empty state keep the line. The tag carries the job id as
+# "bambu_finish:<file>|job=<id>" when the printer sent one.
+_NEW_JOB_STATES = ("RUNNING", "PREPARE", "PAUSE")
+_FINISH_JOB_SEP = "|job="
+# The companion's follow-on offer ("Shall I queue a cooldown timer ...?",
+# tag "bambu_finish_offer:") is spoken only this soon after a finish line
+# passed the drain check - never on its own.
+_FINISH_OFFER_TAG = "bambu_finish_offer:"
+FINISH_OFFER_WINDOW_S = 600.0
+_finish_line_passed_at: list = [0.0]
+
+
+def _finish_tag(fname: str) -> str:
+    """The still_valid tag for a finish line. FINISH_LINE_KEEP on: the job
+    id rides along when the printer sent one. Never raises."""
+    tag = f"bambu_finish:{fname}"
+    try:
+        if not _flag_on("FINISH_LINE_KEEP"):
+            return tag
+        with _state_lock:
+            tid = _state.get("task_id")
+        if tid:
+            tag += f"{_FINISH_JOB_SEP}{tid}"
+    except Exception:
+        pass
+    return tag
+
+
+def _finish_line_still_valid(tag: str) -> bool:
+    """FINISH_LINE_KEEP: the drain-time check, with the reason for every drop
+    logged. Never raises (any error keeps the line)."""
+    try:
+        tag = str(tag)
+        if tag.startswith(_FINISH_OFFER_TAG):
+            age = time.time() - _finish_line_passed_at[0]
+            if 0.0 <= age <= FINISH_OFFER_WINDOW_S:
+                return True
+            print("  [bambu] finish offer dropped: its finish line was not "
+                  "spoken just before it")
+            return False
+        rest = tag.split(":", 1)[1]
+        want, _sep, want_tid = rest.partition(_FINISH_JOB_SEP)
+        with _state_lock:
+            gs = (_state.get("gcode_state") or "").upper()
+            cur = _strip_filename(_state.get("filename") or "")
+            cur_tid = str(_state.get("task_id") or "")
+        why = ""
+        if gs in _NEW_JOB_STATES:
+            why = "a new job is under way"
+        elif want_tid and cur_tid and cur_tid != want_tid:
+            why = "the printer's job id changed"
+        if why:
+            print(f"  [bambu] finish line stale ({why}): state={gs or '-'} "
+                  f"file={cur or '-'} want={want or '-'}")
+            return False
+        _finish_line_passed_at[0] = time.time()
+        return True
+    except Exception:
+        return True
+
+
 def speech_still_valid(tag: str) -> bool:
     """Drain-time check for a queued line: False = drop it unspoken.
     ``bambu_finish:<file>`` holds only while the printer still reports FINISH
-    for that file (a new job started since means the line is stale)."""
+    for that file (a new job started since means the line is stale).
+    FINISH_LINE_KEEP on: see _finish_line_still_valid."""
     try:
+        if _flag_on("FINISH_LINE_KEEP") and (
+                str(tag).startswith("bambu_finish:")
+                or str(tag).startswith(_FINISH_OFFER_TAG)):
+            return _finish_line_still_valid(tag)
         if not str(tag).startswith("bambu_finish:"):
             return True
         want = str(tag).split(":", 1)[1]
@@ -602,7 +673,8 @@ def speech_still_valid(tag: str) -> bool:
 
 
 def _enqueue_speech(message: str, urgent: bool = False,
-                    still_valid: str | None = None) -> None:
+                    still_valid: str | None = None,
+                    supersede: str | None = None) -> None:
     """Route a proactive announcement through bobert_companion's public
     proactive_announce() API when available, falling back to a direct atomic
     write against pending_speech.json if the parent module hasn't loaded yet
@@ -611,7 +683,10 @@ def _enqueue_speech(message: str, urgent: bool = False,
 
     ``urgent`` (2026-10-02): an error code or a failed print. The drain
     speaks it through the owner-away / room-talk hold instead of letting it
-    wait behind his own video (core/owner_presence.is_urgent)."""
+    wait behind his own video (core/owner_presence.is_urgent).
+
+    ``supersede`` (PRINT_MILESTONE_SUPERSEDE, v3.0.10): the queue's family
+    tag - a newer milestone replaces an older one never spoken."""
     try:
         import importlib
         bc = importlib.import_module("bobert_companion")
@@ -626,6 +701,12 @@ def _enqueue_speech(message: str, urgent: bool = False,
             if still_valid:
                 try:
                     announcer(message, source="bambu", still_valid=still_valid)
+                    return
+                except TypeError:
+                    pass
+            if supersede:
+                try:
+                    announcer(message, source="bambu", supersede=supersede)
                     return
                 except TypeError:
                     pass
@@ -649,6 +730,10 @@ def _enqueue_speech(message: str, urgent: bool = False,
             entry["urgent"] = True
         if still_valid:
             entry["still_valid"] = still_valid
+        if supersede:
+            data = [e for e in data if not (isinstance(e, dict)
+                                            and e.get("supersede") == supersede)]
+            entry["supersede"] = supersede
         data.append(entry)
         try:
             _atomic_write_json(_SPEECH_QUEUE, data)
@@ -942,6 +1027,7 @@ def _handle_state_change() -> None:
 
     if new_print:
         _announced_milestones.clear()
+        _milestone_had_eta.clear()
         _announced_error_codes.clear()
         _last_finish_announced_at[0] = 0.0
         _announced_start[0] = False
@@ -1069,7 +1155,14 @@ def _handle_state_change() -> None:
                 _announced_milestones.add(threshold)
                 remaining_str = _format_minutes(remaining) if remaining else ""
                 eta_tail = f" Estimated {remaining_str} remaining." if remaining_str else ""
-                _enqueue_speech(template.format(eta=eta_tail))
+                # Did the plain line say the time left? The companion's
+                # PRINT_MILESTONE_ONE_LINE follow-up speaks only if not.
+                _milestone_had_eta[threshold] = bool(remaining_str)
+                if _flag_on("PRINT_MILESTONE_SUPERSEDE"):
+                    _enqueue_speech(template.format(eta=eta_tail),
+                                    supersede="bambu_milestone")
+                else:
+                    _enqueue_speech(template.format(eta=eta_tail))
                 break  # one milestone per push — never stack announcements
 
     # Layer 1 adhesion check. Once we observe layer_num past the first layer
@@ -1122,13 +1215,13 @@ def _handle_state_change() -> None:
                 _enqueue_speech(
                     f"Print complete, sir — '{fname}' is finished. "
                     "Shall I notify you when the bed has cooled?",
-                    still_valid=f"bambu_finish:{fname}",
+                    still_valid=_finish_tag(fname),
                 )
             else:
                 _enqueue_speech(
                     "Print complete, sir. "
                     "Shall I notify you when the bed has cooled?",
-                    still_valid="bambu_finish:",
+                    still_valid=_finish_tag(""),
                 )
             _post_finish_bed_watch[0] = True
             _bed_cool_announced[0] = False

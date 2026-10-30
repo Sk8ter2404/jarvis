@@ -39035,6 +39035,11 @@ def _listen_tick() -> None:
                   f"{'converging' if st.get('converging') else 'NOT converging'}"
                   f", frames over VAD raw {100.0 * fr['raw'] / n:.1f} % / "
                   f"cancelled {100.0 * fr['sup'] / n:.1f} %"
+                  # MEDIA_AEC_DELAY_BOUNDS (v3.0.10): its counters, when on.
+                  + (f", realigns {st.get('realigns')} "
+                     f"({st.get('realign_rejected')} rejected, "
+                     f"{st.get('delay_clamped')} clamped)"
+                     if "realign_rejected" in st else "")
                   + ("" if not _aec_ref_missing[0]
                      else " - reference MISSING (protected playback?)"))
     except Exception:
@@ -49900,8 +49905,24 @@ def _speak_pending(only_sources=None):
         _sv = item.get("still_valid")
         if _sv:
             try:
-                import skills.bambu_monitor as _bm_sv
-                _sv_ok = bool(_bm_sv.speech_still_valid(str(_sv)))
+                # FINISH_LINE_KEEP (v3.0.10): ask the LIVE skill. The import
+                # below is a second, never-started copy with an empty state,
+                # so it judged every queued finish line stale (10-28 22:26).
+                # No live skill loaded = keep the line.
+                _sv_live = None
+                try:
+                    import core.config as _sv_cfg
+                    if bool(getattr(_sv_cfg, "FINISH_LINE_KEEP", True)):
+                        _sv_live = sys.modules.get("skill_bambu_monitor") or False
+                except Exception:
+                    _sv_live = None
+                if _sv_live is False:
+                    _sv_ok = True
+                elif _sv_live is not None:
+                    _sv_ok = bool(_sv_live.speech_still_valid(str(_sv)))
+                else:
+                    import skills.bambu_monitor as _bm_sv
+                    _sv_ok = bool(_bm_sv.speech_still_valid(str(_sv)))
             except Exception:
                 _sv_ok = True
             if not _sv_ok:
