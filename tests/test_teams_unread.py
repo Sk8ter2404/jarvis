@@ -130,10 +130,10 @@ class ComposeTests(unittest.TestCase):
         self.assertIn("notification from Pat Example reached me", other)
 
     def test_graph_unavailable_says_why_and_never_guesses_a_count(self):
-        for status, words in (("unconfigured", "isn't signed in"),
-                              (0, "isn't signed in"),
-                              (403, "isn't allowed to read chats"),
-                              (401, "isn't allowed to read chats"),
+        for status, words in (("unconfigured", "because I'm not signed in to Microsoft"),
+                              (0, "because I'm not signed in to Microsoft"),
+                              (403, "won't let me read your Teams chats"),
+                              (401, "won't let me read your Teams chats"),
                               (500, "couldn't reach"),
                               (-1, "couldn't reach"),
                               (None, "couldn't reach")):
@@ -142,15 +142,28 @@ class ComposeTests(unittest.TestCase):
                 self.assertIn(words, out)
                 self.assertIn("can't say what's unread", out)
                 self.assertNotRegex(out, r"\d")
+                self.assertNotIn("Graph", out)
 
     def test_graph_unavailable_still_gives_the_toasts(self):
         out = tu.compose(None, 0, [self.toast(age=300), self.toast("Pat", age=60)], NOW)
-        self.assertIn("isn't signed in", out)
+        self.assertIn("not signed in to Microsoft", out)
         self.assertIn("2 Teams notifications have reached me", out)
         self.assertIn("the latest from Pat, just now", out)
         one = tu.compose(None, 0, [self.toast()], NOW)
         self.assertIn("One Teams notification has reached me", one)
         self.assertIn("from Sam Example, 12 minutes ago", one)
+
+    def test_a_recent_restart_never_claims_twelve_hours(self):
+        hour = 3600.0
+        toast = [self.toast()]
+        self.assertIn("No Teams notification has reached me since I started,",
+                      tu.compose(None, 0, [], NOW, since=NOW - 2 * hour))
+        self.assertIn("One Teams notification has reached me since I started, from",
+                      tu.compose(None, 0, toast, NOW, since=NOW - 2 * hour))
+        for since in (NOW - 12 * hour, NOW - 40 * hour, None, "junk"):
+            with self.subTest(since=since):
+                self.assertIn("in the last 12 hours",
+                              tu.compose(None, 0, [], NOW, since=since))
 
     def test_no_toasts_is_not_proof_of_nothing(self):
         out = tu.compose(None, 0, [], NOW)

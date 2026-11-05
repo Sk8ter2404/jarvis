@@ -155,18 +155,31 @@ def _graph_problem(status) -> str:
     """Why Graph gave nothing, in his words. ``status``: "unconfigured", 0 (no
     token), an HTTP code, or anything else for a failed call."""
     if status in ("unconfigured", 0):
-        return ("I can't read Teams directly, sir: Microsoft Graph isn't "
-                "signed in here.")
+        return ("I can't read Teams directly, sir, because I'm not signed in "
+                "to Microsoft.")
     if status in (401, 403):
-        return ("Microsoft Graph turned down the Teams read, sir: this "
-                "sign-in isn't allowed to read chats.")
-    return "I couldn't reach Microsoft Graph for Teams just now, sir."
+        return ("Microsoft won't let me read your Teams chats, sir, with the "
+                "sign-in I have.")
+    return "I couldn't reach Microsoft to read Teams just now, sir."
 
 
-def compose(graph, status, toasts, now: float) -> str:
+def _toast_span(now: float, since) -> str:
+    """The time the toast records cover, in words. ``since``: when triage's
+    in-memory records began, None when unknown."""
+    try:
+        if since is not None and float(now) - float(since) < TOAST_WINDOW_S:
+            return "since I started"
+    except (TypeError, ValueError):
+        pass
+    return "in the last 12 hours"
+
+
+def compose(graph, status, toasts, now: float, since=None) -> str:
     """The spoken answer. ``graph``: get_teams_unread_count()'s dict, or None
     when Graph gave nothing (``status`` says why). ``toasts``: triage's recent
-    records, or None when triage is not loaded. Says only what those hold."""
+    records, or None when triage is not loaded. ``since``: when those records
+    began (they live in memory, so a recent restart means "since I started", not
+    "in the last 12 hours"). Says only what those hold."""
     recent = None if toasts is None else teams_toasts(toasts, now)
     latest = recent[0] if recent else None
     name = toast_name(latest.get("title")) if latest else ""
@@ -193,12 +206,13 @@ def compose(graph, status, toasts, now: float) -> str:
     head = _graph_problem(status)
     if recent is None:
         return head + " So I can't say what's unread."
+    span = _toast_span(now, since)
     if not recent:
-        return (head + " No Teams notification has reached me in the last 12 "
-                "hours, though that doesn't prove nothing is unread.")
+        return (head + f" No Teams notification has reached me {span}, though "
+                "that doesn't prove nothing is unread.")
     n = len(recent)
     noun = "One Teams notification" if n == 1 else f"{n} Teams notifications"
     verb = "has" if n == 1 else "have"
     who = f", from {name}" if n == 1 and name else (
         f", the latest from {name}" if name else "")
-    return f"{head} {noun} {verb} reached me in the last 12 hours{who}, {when}."
+    return f"{head} {noun} {verb} reached me {span}{who}, {when}."

@@ -232,6 +232,7 @@ _state_lock           = threading.RLock()
 _rules: list[dict]    = []
 _seen_ids: set[int]   = set()                       # WinRT notification ids we've processed
 _recent: list[dict]   = []                          # in-memory ring buffer
+_recent_since         = time.time()                 # when it began (a reload empties it too)
 _snooze: dict[str, float] = {}                      # dedupe key → last-fire ts
 
 # task-75: persist _seen_ids and _snooze across bounces so a fresh JARVIS
@@ -1509,6 +1510,11 @@ def recent_notifications(n: int = 10) -> list[dict]:
     (shape matches the records in data/notifications/<date>.jsonl)."""
     with _state_lock:
         return list(_recent[-max(1, int(n)):])
+
+
+def recent_since() -> float:
+    """When recent_notifications' memory began: nothing older is in it."""
+    return _recent_since
 
 
 # ─── Action handlers ─────────────────────────────────────────────────────

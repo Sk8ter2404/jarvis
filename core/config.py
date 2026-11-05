@@ -2045,10 +2045,11 @@ CAMERA_ASK_ROUTE = True
 # 2026-11-05 14:58:14 "Jarvis, look again." right after a camera ask ran
 # recall_screen, then see_screen twice, reading the monitors. True (default):
 # "look again / harder / closer", "take another look" within 2 minutes (and
-# "try again", "check again" within 1) of a look re-run it: see_user with the
-# earlier question after a camera look, see_screen after a screen look. Any
-# other action since then leaves the line to the brain. False: the brain
-# decides, as before. Applies on the next start.
+# "try again", "check again" within 1, when the look was his previous turn) of a
+# look re-run it: see_user with the earlier question after a camera look, the
+# same screen action after a screen look. Any other action since then leaves the
+# line to the brain. False: the brain decides, as before. Applies on the next
+# start.
 LOOK_RETRY_ROUTE = True
 # ACTION_FIT_CAMERA_ASK_ENFORCE (bool, v3.0.11; core/action_fit rule 8) - the
 # same live turn: [ACTION: see_screen, what am I holding?]. True (default): a

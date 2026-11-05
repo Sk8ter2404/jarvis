@@ -4328,6 +4328,7 @@ def record_action_history(action_name: str, arg: str, result: str) -> None:
             "arg": arg,
             "result": result if isinstance(result, str) else str(result),
             "at": time.time(),
+            "turn": _last_line_turn[0],
         })
 
 
@@ -37381,7 +37382,8 @@ def _camera_ask_route_reply(text: str) -> "str | None":
             hist = list(_action_history)
         tok = _camera_ask.route_token(text, hist, ask_on=ask_on,
                                       retry_on=retry_on,
-                                      focus_changed=_focus_changed_recently)
+                                      focus_changed=_focus_changed_recently,
+                                      turn=_last_line_turn[0])
     except Exception:
         return None
     m = _ROUTE_TOKEN_RE.match(tok) if tok else None
@@ -44736,7 +44738,8 @@ def _camera_claim_grounding() -> list:
             if (str(row.get("action") or "").lower()
                     in _claim_validator.CAMERA_GROUND_ACTIONS
                     and now - float(row.get("at") or 0.0)
-                    <= _CAMERA_CLAIM_GROUND_S):
+                    <= _CAMERA_CLAIM_GROUND_S
+                    and _camera_ask.spoken_answer(row.get("result"))):
                 out.append(str(row.get("result") or ""))
     except Exception:
         pass
@@ -44764,14 +44767,15 @@ def _camera_claim_look_tried() -> bool:
 def _camera_claim_look(q: str, results: list, run_action) -> bool:
     """Run the look through ``run_action`` (parse_and_run_actions' own runner, so
     its gates, failure handling and bookkeeping apply). True when the result is
-    in ``results`` for the follow-up round. False when the look raised or was
-    refused: its row goes, so the brain gets no round to guess in. Never
-    raises."""
+    in ``results`` for the follow-up round. False when the look raised, was
+    refused or gave no answer: its row goes, so the brain gets no round to guess
+    in. Never raises."""
     n0 = len(results)
     try:
         run_action(_camera_ask.token("see_user", q))
         if any(str(n or "").lower() == "see_user" and bool(i)
-               for (n, _r, i) in results[n0:]):
+               and _camera_ask.spoken_answer(r)
+               for (n, r, i) in results[n0:]):
             return True
     except Exception as _e:
         print(f"  [validation] the look failed: {type(_e).__name__}")
@@ -53344,18 +53348,20 @@ def _camera_ask_after_run(spoken_text, action_results):
     """After the first parse_and_run_actions of a routed camera ask (CAMERA_ASK_
     ROUTE, v3.0.11): the vision model's answer is what gets spoken, with no
     follow-up round for the brain to embroider or to chain a screen look (live
-    2026-11-05 14:58:20). No camera or a failed look is left to the normal
-    failure path. Returns (spoken_text, action_results). Never raises."""
+    2026-11-05 14:58:20). A look that gave no answer says so, and gets no round
+    either: the brain's follow-up there was the invented can of Coke. Whether it
+    answered is its shape (spoken_answer), not its words: "I can't make out what
+    you're holding." is an answer. Returns (spoken_text, action_results). Never
+    raises."""
     try:
         looks = [r for (n, r, _i) in action_results or ()
                  if str(n or "").lower() in ("see_user", "look_around")]
         if not looks:
             return spoken_text, action_results
         answer = _camera_ask.spoken_answer(looks[-1])
-        if not answer or _action_result_failed(looks[-1]):
-            print("  [camera-ask] no answer from the look - the normal failure "
-                  "path reports it")
-            return spoken_text, action_results
+        if not answer:
+            print("  [camera-ask] no answer from the look - saying so")
+            answer = _camera_ask.failed_look_line(looks[-1])
         action_results = [
             (n, r, False if str(n or "").lower() in ("see_user", "look_around")
              else i) for (n, r, i) in action_results]
@@ -53617,6 +53623,8 @@ def _run_llm_dispatch_body(text: str) -> str:
         return _action_result_failed(result, name)
 
     current_results = action_results
+    if _camera_answered:
+        current_results = []   # the look's outcome is said: no follow-up round
     _chain_seen: set[str] = set()   # loop-break: actions already fired this chain
     # Action NAMES that already failed in an earlier round of this chain -
     # see the failure-repeat break below.

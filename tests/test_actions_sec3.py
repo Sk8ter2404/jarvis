@@ -1629,6 +1629,25 @@ class ReplayLastActionTests(unittest.TestCase):
         fn.assert_called_once_with("")
         self.assertEqual(out, "replayed screenshot: captured screen")
 
+    def test_replay_of_a_look_says_the_answer(self):
+        bc = self._bc([{"action": "see_user", "arg": "what am I holding?"}])
+        fn = mock.Mock(return_value="[local-vision] You are holding a can of Coke."
+                                    "\n\n[gaze: currently looking at the right monitor]")
+        bc.ACTIONS = {"see_user": fn}
+        with _patch_bc(bc):
+            out = A._act_replay_last_action()
+        fn.assert_called_once_with("what am I holding?")
+        self.assertEqual(out, "You are holding a can of Coke.")
+
+    def test_replay_of_a_look_that_failed_says_so(self):
+        bc = self._bc([{"action": "see_user", "arg": "what am I holding?"}])
+        bc.ACTIONS = {"see_user": mock.Mock(
+            return_value="failed to look: no cameras configured"
+                         "\n\n[gaze: user not currently in view]")}
+        with _patch_bc(bc):
+            out = A._act_replay_last_action()
+        self.assertEqual(out, "I couldn't get a look just now, sir, so I won't guess.")
+
     def test_replay_with_monitor_substitution(self):
         bc = self._bc([{"action": "see_screen", "arg": "middle"}])
         fn = mock.Mock(return_value="looked left")
@@ -1913,7 +1932,13 @@ class SeeUserTests(unittest.TestCase):
                 mock.patch.dict(sys.modules, {"cv2": _FakeCv2()}), \
                 mock.patch("core.config.CAMERAS", []):
             out = A._act_see_user()
-        self.assertEqual(out, "no cameras configured")
+        self.assertEqual(out, "failed to look: no cameras configured")
+        with _patch_bc(bc), \
+                mock.patch.dict(sys.modules, {"cv2": _FakeCv2()}), \
+                mock.patch("core.config.CAMERAS", []), \
+                mock.patch.multiple("core.config", CAMERA_ASK_ROUTE=False,
+                                    LOOK_RETRY_ROUTE=False, CAMERA_CLAIM_CHECK=False):
+            self.assertEqual(A._act_see_user(), "no cameras configured")
 
     def test_no_frames_with_last_error(self):
         bc = self._bc(last_err={2: "device busy"})
@@ -1922,6 +1947,7 @@ class SeeUserTests(unittest.TestCase):
                 mock.patch.dict(sys.modules, {"cv2": _FakeCv2()}), \
                 mock.patch("core.config.CAMERAS", cams):
             out = A._act_see_user()
+        self.assertTrue(out.startswith("failed to look: "), out)
         self.assertIn("no webcam frames available yet", out)
         self.assertIn("device busy", out)
 
@@ -1932,6 +1958,7 @@ class SeeUserTests(unittest.TestCase):
                 mock.patch.dict(sys.modules, {"cv2": _FakeCv2()}), \
                 mock.patch("core.config.CAMERAS", cams):
             out = A._act_see_user()
+        self.assertTrue(out.startswith("failed to look: "), out)
         self.assertIn("face tracker may not have started", out)
 
     def test_describes_user_from_best_frame(self):
@@ -1951,12 +1978,44 @@ class SeeUserTests(unittest.TestCase):
         self.assertEqual(out, "a person at a desk")
         bc.ask_vision.assert_called_once()
 
+    def test_a_frame_too_old_to_be_now_is_no_look(self):
+        frame = self._frame()
+        bc = self._bc(
+            last_seen={0: 0.0},
+            latest_frame={0: frame},
+            last_frame_at={0: 9400.0},   # 600s old
+            last_err={0: "timeout"},
+        )
+        cams = [{"index": 0, "label": "cam", "look_x": 0.5}]
+        with _patch_bc(bc), \
+                mock.patch.dict(sys.modules, {"cv2": _FakeCv2()}), \
+                mock.patch("core.config.CAMERAS", cams), \
+                mock.patch.object(A.time, "time", return_value=10_000.0):
+            out = A._act_see_user("what am I holding?")
+        self.assertEqual(out, "failed to look: the camera isn't giving a current "
+                              "picture (the last frame is 600s old)")
+        bc.ask_vision.assert_not_called()
+
+    def test_vision_unavailable_is_a_failed_look(self):
+        frame = self._frame()
+        bc = self._bc(last_seen={0: 5000.0}, latest_frame={0: frame},
+                      last_frame_at={0: 9999.5})
+        bc.ask_vision.return_value = "(local vision unavailable - Ollama not reachable)"
+        cams = [{"index": 0, "label": "cam", "look_x": 0.5}]
+        with _patch_bc(bc), \
+                mock.patch.dict(sys.modules, {"cv2": _FakeCv2()}), \
+                mock.patch("core.config.CAMERAS", cams), \
+                mock.patch.object(A.time, "time", return_value=10_000.0):
+            out = A._act_see_user("what am I holding?")
+        self.assertEqual(
+            out, "failed to look: local vision unavailable - Ollama not reachable")
+
     def test_stale_frame_appends_note(self):
         frame = self._frame()
         bc = self._bc(
             last_seen={0: 0.0},
             latest_frame={0: frame},
-            last_frame_at={0: 9000.0},   # 1000s old -> stale note
+            last_frame_at={0: 9980.0},   # 20s old -> stale note, still answered
             last_err={0: "timeout"},
         )
         cams = [{"index": 0, "label": "cam", "look_x": 0.5}]
@@ -1991,7 +2050,7 @@ class SeeUserTests(unittest.TestCase):
                 mock.patch("core.config.CAMERAS", cams), \
                 mock.patch.object(A.time, "time", return_value=10_000.0):
             out = A._act_see_user()
-        self.assertEqual(out, "no frame cached for that camera")
+        self.assertEqual(out, "failed to look: no frame cached for that camera")
 
     def test_custom_camera_hint_used_as_question(self):
         frame = self._frame()

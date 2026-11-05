@@ -844,6 +844,16 @@ def _teams_toast_records() -> "list | None":
         return None
 
 
+def _teams_toast_since() -> float | None:
+    """When the live triage's in-memory toasts began, None when unknown."""
+    try:
+        triage = sys.modules.get("skill_notification_triage")
+        fn = getattr(triage, "recent_since", None)
+        return float(fn()) if callable(fn) else None
+    except Exception:
+        return None
+
+
 def action_teams_unread(_arg: str = "") -> str:
     """Read-only: unread Teams chats and the newest sender from Graph, plus what
     notification triage caught. Says why when Graph gives nothing. Speaks counts,
@@ -858,7 +868,8 @@ def action_teams_unread(_arg: str = "") -> str:
     except Exception as e:
         print(f"  [ms_graph] teams_unread failed: {type(e).__name__}")
         graph, status = None, -1
-    return _tu.compose(graph, status, _teams_toast_records(), time.time())
+    return _tu.compose(graph, status, _teams_toast_records(), time.time(),
+                       since=_teams_toast_since())
 
 
 def _teams_unread_on() -> bool:

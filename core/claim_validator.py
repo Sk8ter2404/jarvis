@@ -105,6 +105,8 @@ from __future__ import annotations
 import re
 from typing import Iterable, Optional
 
+from core.camera_ask import LOOK_FAILED_LINE as _LOOK_FAILED_LINE
+
 from core import action_fit as _action_fit
 
 __all__ = [
@@ -2638,8 +2640,7 @@ CAMERA_GROUND_ACTIONS = frozenset({"see_user", "look_around", "where_am_i",
                                    "situational_awareness"})
 CAMERA_CLAIM_HONEST_LINE = ("I haven't actually looked, sir. Ask me to look and "
                             "I will.")
-CAMERA_CLAIM_LOOK_FAILED_LINE = ("I couldn't get a look just now, sir, so I "
-                                 "won't guess.")
+CAMERA_CLAIM_LOOK_FAILED_LINE = _LOOK_FAILED_LINE
 
 
 def _cc_noun_at(hay: str, start: int, end: int) -> bool:

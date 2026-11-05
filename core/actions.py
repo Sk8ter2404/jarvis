@@ -5829,6 +5829,10 @@ def _act_replay_last_action(arg: str = "") -> str:
         return res
     if bc._self_voiced_did_talk(name, res):
         return ""
+    # A look's result is spoken as an answer: never "replayed see_user:
+    # [local-vision] ...".
+    if name in _camera_ask.CAMERA_LOOK_ACTIONS and _camera_look_guard_on():
+        return _camera_ask.spoken_answer(res) or _camera_ask.failed_look_line(res)
     suffix = f" on monitor {arg.strip().lower()}" if arg else ""
     summary = res if isinstance(res, str) else str(res)
     head = summary.split("\n", 1)[0]
@@ -5921,8 +5925,29 @@ def _camera_ask_route_on() -> bool:
         return False
 
 
+def _camera_look_guard_on() -> bool:
+    """A look that gave no answer is a failure, under any of the three flags
+    that speak or trust a look (core/config.py), read at call time."""
+    try:
+        from core import config as _cfg
+        return any(bool(getattr(_cfg, n, False)) for n in (
+            "CAMERA_ASK_ROUTE", "LOOK_RETRY_ROUTE", "CAMERA_CLAIM_CHECK"))
+    except Exception:
+        return False
+
+
 def _act_see_user(camera_hint: str = "") -> str:
-    """Take a snapshot from a webcam and ask Claude vision to describe the user."""
+    """Take a snapshot from a webcam and ask Claude vision to describe the user.
+    Anything but an answer ("no cameras configured", "(local vision unavailable
+    - Ollama not reachable)", a frame too old to be now) comes back as "failed
+    to look: ...", so no path takes it for a look that worked (live 2026-11-05:
+    the look found no picture and the brain's guess that followed was spoken)."""
+    result = _see_user_look(camera_hint)
+    return _camera_ask.look_result(result) if _camera_look_guard_on() else result
+
+
+def _see_user_look(camera_hint: str = "") -> str:
+    """_act_see_user's snapshot and vision call, with what they said as it is."""
     import cv2
     bc = _bc()
     from core.config import CAMERAS
@@ -5959,6 +5984,12 @@ def _act_see_user(camera_hint: str = "") -> str:
             return "no frame cached for that camera"
         frame = frame.copy()
         frame_age = time.time() - last_frame_at if last_frame_at else None
+
+    if (frame_age is not None and frame_age > _camera_ask.STALE_FRAME_S
+            and _camera_look_guard_on()):
+        print(f"  [vision] camera {best_idx} frame is {frame_age:.0f}s old - "
+              "not asking about it", flush=True)
+        return _camera_ask.stale_frame_result(frame_age)
 
     print(f"  [vision] Looking at user via camera {best_idx}...", flush=True)
     ok, buf = cv2.imencode(".png", frame)

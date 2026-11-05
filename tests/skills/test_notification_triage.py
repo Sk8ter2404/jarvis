@@ -353,6 +353,7 @@ class NotificationTriageTests(unittest.TestCase):
         with self.mod._state_lock:
             self.mod._recent.append({"app": "only", "ts": 0})
         # n<=0 is floored to 1 (max(1, int(n))).
+        self.assertLessEqual(self.mod.recent_since(), time.time())
         out = self.mod.recent_notifications(0)
         self.assertEqual(len(out), 1)
 

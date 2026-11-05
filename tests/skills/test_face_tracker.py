@@ -300,6 +300,21 @@ class FaceTrackerActionTests(unittest.TestCase):
         self.assertIn("I see you at your desk.", out)
         self.assertIn("[gaze: currently looking at the right monitor]", out)
 
+    def test_see_user_wrapper_text_never_reaches_the_owner(self):
+        # What core.camera_ask.spoken_answer gets is this wrapper's real output.
+        from core import camera_ask
+        answer = "[local-vision] You are holding a can of Coke."
+        self.mod._state.update({"current_monitor": "right"})
+        wrapped = self.mod._build_see_user_wrapper(lambda a="": answer)
+        self.assertEqual(camera_ask.spoken_answer(wrapped("")),
+                         "You are holding a can of Coke.")
+        self.mod._state.update({"current_monitor": "away"})
+        self.assertEqual(camera_ask.spoken_answer(wrapped("")),
+                         "You are holding a can of Coke.")
+        failed = self.mod._build_see_user_wrapper(
+            lambda a="": "failed to look: no cameras configured")
+        self.assertIsNone(camera_ask.spoken_answer(failed("")))
+
     def test_gaze_status_monitor_none_after_sample(self):
         # A sample landed but no monitor committed yet → "haven't established".
         self.mod._state.update({"last_sample_at": time.time(),

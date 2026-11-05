@@ -103,8 +103,9 @@ class RouteTests(unittest.TestCase):
 class RetryTests(unittest.TestCase):
     NOW = 1000.0
 
-    def _row(self, name, arg="", ago=5.0):
-        return {"action": name, "arg": arg, "result": "x", "at": self.NOW - ago}
+    def _row(self, name, arg="", ago=5.0, turn=7):
+        return {"action": name, "arg": arg, "result": "x", "at": self.NOW - ago,
+                "turn": turn}
 
     def test_retry_forms(self):
         for t in ("Jarvis, look again.", "look harder", "look closer",
@@ -123,19 +124,47 @@ class RetryTests(unittest.TestCase):
     def test_after_a_camera_look_reruns_the_earlier_question(self):
         hist = [self._row("see_user", "what am I holding?")]
         for t in ("Jarvis, look again.", "look harder", "try again", "check again"):
-            self.assertEqual(ca.route_token(t, hist, now=self.NOW),
+            self.assertEqual(ca.route_token(t, hist, now=self.NOW, turn=8),
                              "[ACTION: see_user, what am I holding?]", t)
+
+    def test_a_bare_retry_needs_the_look_to_be_his_previous_turn(self):
+        # A look, "any messages I missed" (a shortcut, so no row), "try again".
+        hist = [self._row("see_user", "what am I holding?", turn=7)]
+        for t in ("try again", "check again"):
+            self.assertIsNone(ca.route_token(t, hist, now=self.NOW, turn=9), t)
+            self.assertIsNone(ca.route_token(t, hist, now=self.NOW, turn=7), t)
+            self.assertIsNone(ca.route_token(t, hist, now=self.NOW), t)
+            self.assertIsNone(ca.route_token(t, [{**hist[0], "turn": None}],
+                                             now=self.NOW, turn=8), t)
+
+    def test_a_retry_that_names_looking_keeps_its_window(self):
+        hist = [self._row("see_user", "what am I holding?", turn=7)]
+        self.assertEqual(ca.route_token("look again", hist, now=self.NOW, turn=12),
+                         "[ACTION: see_user, what am I holding?]")
+        self.assertEqual(ca.route_token("look harder", hist, now=self.NOW),
+                         "[ACTION: see_user, what am I holding?]")
 
     def test_after_a_screen_look_stays_a_screen_look(self):
         hist = [self._row("see_screen", "read this page")]
         self.assertEqual(ca.route_token("look again", hist, now=self.NOW),
                          "[ACTION: see_screen, read this page]")
-        self.assertEqual(ca.route_token("try again", [self._row("recall_screen")],
-                                        now=self.NOW), "[ACTION: see_screen]")
+        self.assertEqual(ca.route_token("try again", [self._row("see_screen")],
+                                        now=self.NOW, turn=8), "[ACTION: see_screen]")
+
+    def test_a_question_about_the_past_stays_one(self):
+        for name in ("recall_screen", "last_screen", "previous_screen",
+                     "screen_history"):
+            hist = [self._row(name, "ten minutes ago")]
+            self.assertEqual(ca.route_token("look again", hist, now=self.NOW),
+                             f"[ACTION: {name}, ten minutes ago]", name)
+            self.assertEqual(ca.route_token("try again", hist, now=self.NOW, turn=8),
+                             f"[ACTION: {name}, ten minutes ago]", name)
+            self.assertNotIn("see_screen",
+                             ca.route_token("look again", hist, now=self.NOW))
 
     def test_a_task_with_a_screen_look_in_it_stays_with_the_brain(self):
         hist = [self._row("click", "login", ago=10), self._row("see_screen", "", ago=5)]
-        self.assertIsNone(ca.route_token("try again", hist, now=self.NOW))
+        self.assertIsNone(ca.route_token("try again", hist, now=self.NOW, turn=8))
         self.assertEqual(ca.route_token("look again", hist, now=self.NOW),
                          "[ACTION: see_screen]")
 
@@ -146,13 +175,13 @@ class RetryTests(unittest.TestCase):
     def test_the_newest_action_decides(self):
         hist = [self._row("see_user", "what am I holding?", ago=20),
                 self._row("play_music", "x", ago=5)]
-        self.assertIsNone(ca.route_token("try again", hist, now=self.NOW))
+        self.assertIsNone(ca.route_token("try again", hist, now=self.NOW, turn=8))
         self.assertIsNone(ca.route_token("look again", hist, now=self.NOW))
 
     def test_window(self):
         hist = [self._row("see_user", "q", ago=90)]
         self.assertIsNotNone(ca.look_retry_token("look again", hist, self.NOW))
-        self.assertIsNone(ca.look_retry_token("try again", hist, self.NOW))
+        self.assertIsNone(ca.look_retry_token("try again", hist, self.NOW, 8))
         hist = [self._row("see_user", "q", ago=500)]
         self.assertIsNone(ca.look_retry_token("look again", hist, self.NOW))
 
@@ -178,6 +207,73 @@ class SpokenAnswerTests(unittest.TestCase):
                   "(vision failed: HTTP 500)", "(local vision unavailable)", "",
                   None, "⚠ nope"):
             self.assertIsNone(ca.spoken_answer(r), r)
+
+    # The result as the running action returns it: skills/face_tracker.py
+    # _build_see_user_wrapper puts the gaze note after everything else.
+    GAZE = "\n\n[gaze: currently looking at the right monitor]"
+    AWAY = "\n\n[gaze: user not currently in view]"
+
+    def test_the_gaze_note_comes_off(self):
+        for note in (self.GAZE, self.AWAY):
+            self.assertEqual(
+                ca.spoken_answer("[local-vision] You are holding a can of Coke." + note),
+                "You are holding a can of Coke.")
+
+    def test_a_stale_frame_note_ahead_of_the_gaze_note_comes_off(self):
+        for stale in ("(note: camera 0 frame is 6.2s old)",
+                      "(note: camera 0 frame is 6.2s old; last read error: "
+                      "read failed (code 5) twice)"):
+            self.assertEqual(
+                ca.spoken_answer(f"You are holding a can.\n\n{stale}{self.GAZE}"),
+                "You are holding a can.", stale)
+
+    def test_no_answer_with_a_gaze_note_is_still_no_answer(self):
+        for r in ("(local vision unavailable - Ollama not reachable)",
+                  "(vision failed: HTTP 500)", "no cameras configured",
+                  "no frame cached for that camera",
+                  "no webcam frames available yet - face tracker may not have started",
+                  "failed to look: no cameras configured", ""):
+            self.assertIsNone(ca.spoken_answer(r + self.GAZE), r)
+
+    def test_a_crashed_action_is_no_answer(self):
+        self.assertIsNone(ca.spoken_answer(
+            "That went wrong, sir. (action failed; class=crash; ValueError)"))
+        self.assertIsNone(ca.spoken_answer("failed (final): Windows said no."))
+
+    def test_an_answer_with_a_failure_word_is_an_answer(self):
+        for r in ("I can't make out what you're holding.",
+                  "You look like you couldn't sleep, sir."):
+            self.assertEqual(ca.spoken_answer(r + self.GAZE), r)
+
+    def test_look_result(self):
+        answer = "[local-vision] You are holding a can."
+        self.assertEqual(ca.look_result(answer), answer)
+        self.assertEqual(ca.look_result("I can't make out what you're holding."),
+                         "I can't make out what you're holding.")
+        self.assertEqual(ca.look_result("no cameras configured"),
+                         "failed to look: no cameras configured")
+        self.assertEqual(ca.look_result("(local vision unavailable - Ollama not reachable)"),
+                         "failed to look: local vision unavailable - Ollama not reachable")
+        self.assertEqual(ca.look_result("failed to encode webcam frame"),
+                         "failed to encode webcam frame")
+        self.assertEqual(ca.look_result(""), "failed to look: the look gave no answer")
+
+    def test_a_failed_look_is_a_failure_to_every_marker_reader(self):
+        from core.failure_markers import FAILURE_MARKERS
+        for r in ("no cameras configured", "(local vision unavailable)",
+                  "no frame cached for that camera",
+                  "no webcam frames available yet - face tracker may not have started"):
+            low = ca.look_result(r).lower()
+            self.assertTrue(any(m.lower() in low for m in FAILURE_MARKERS), r)
+
+    def test_a_stale_frame_has_its_own_line(self):
+        self.assertIsNone(ca.spoken_answer(ca.stale_frame_result(600.0)))
+        self.assertEqual(ca.failed_look_line(ca.stale_frame_result(600.0) + self.GAZE),
+                         ca.STALE_FRAME_LINE)
+        self.assertEqual(ca.look_result(ca.stale_frame_result(600.0)),
+                         ca.stale_frame_result(600.0))
+        self.assertEqual(ca.failed_look_line("failed to look: no cameras configured"),
+                         ca.LOOK_FAILED_LINE)
 
     def test_long_answer_is_cut_to_sentences(self):
         out = ca.spoken_answer("One. Two. Three. Four. Five.")

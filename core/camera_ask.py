@@ -22,16 +22,24 @@ a number" - never matches. Two strengths:
 
 A retry ("look again", "look harder", "try again", "check again") follows the
 last look when one ran a moment ago: a camera look re-runs see_user with the
-earlier question, a screen look stays a screen look. Any other action since
-then, or no look at all, leaves the line alone.
+earlier question, a screen look re-runs that same screen action. A bare "try
+again" says nothing about looking, so the look must also have been his previous
+turn. Any other action since then, or no look at all, leaves the line alone.
 
-Stdlib only, no I/O, nothing here raises.
+What see_user returns is judged by its shape here (spoken_answer), never by
+words in the answer: "I can't make out what you're holding." is an answer, and
+"(local vision unavailable)" is not. _act_see_user turns anything that is not an
+answer into a "failed to look: ..." result, the failure every other path knows.
+
+No I/O, nothing here raises.
 """
 from __future__ import annotations
 
 import re
 import time
 from typing import Callable, Iterable, Optional
+
+from core.failure_markers import ACTION_CRASH_MARK, TERMINAL_FAILURE_PREFIX
 
 # The actions that look through a camera, and the ones that read the monitors.
 CAMERA_LOOK_ACTIONS = frozenset({"see_user", "look_around", "recognize_face"})
@@ -47,6 +55,16 @@ LOOK_RETRY_WINDOW_S = 120.0
 GENERIC_RETRY_WINDOW_S = 60.0
 # "What is this?" right after another action is about that action.
 AMBIGUOUS_YIELD_S = 60.0
+# The frame cache keeps a dead camera's last picture for as long as the process
+# lives. Older than this it is not a picture of now, and says nothing about what
+# he is holding now.
+STALE_FRAME_S = 30.0
+
+LOOK_FAILED_PREFIX = "failed to look: "
+LOOK_FAILED_LINE = "I couldn't get a look just now, sir, so I won't guess."
+STALE_FRAME_LINE = ("The camera isn't giving me a current picture, sir, so I "
+                    "won't guess.")
+_STALE_WHY = "the camera isn't giving a current picture"
 
 _CONTRACTIONS = tuple((re.compile(p), r) for p, r in (
     (r"\bwhat'?s\b", "what is"),
@@ -158,7 +176,12 @@ _GENERIC_RETRY_RE = re.compile(
 _WAKE_LEAD_RAW_RE = re.compile(
     r"^\W*(?:(?:hey|hi|ok|okay|alright|so|and|um+|uh+|well|jarvis|sir|please|"
     r"now|wait|actually)\b[\s,.:;!-]*)+", re.IGNORECASE)
-_NOTE_RE = re.compile(r"\s*\(note: camera [^)]*\)\s*$", re.IGNORECASE)
+# The notes around a vision answer, which are for the log and the brain: the
+# stale-frame note (its read error may hold one pair of brackets) and the gaze
+# note skills/face_tracker.py appends after it.
+_NOTE_RE = re.compile(
+    r"\s*(?:\(note: camera\b[^()]*(?:\([^()]*\)[^()]*)*\)|\[gaze:[^\]]*\])",
+    re.IGNORECASE)
 _LOCAL_TAG_RE = re.compile(r"^\s*\[local-vision\]\s*", re.IGNORECASE)
 _NOT_AN_ANSWER_RE = re.compile(
     r"^\s*(?:\(|no cameras?\b|no webcam\b|no frame\b|failed to\b|refused\b|"
@@ -245,7 +268,8 @@ def token(action: str, arg: str = "") -> str:
 
 
 def _rows(history: Iterable, now: float, window_s: float) -> list:
-    """(name, arg) of the actions in the last ``window_s``, newest first."""
+    """(name, arg, owner turn or None) of the actions in the last ``window_s``,
+    newest first."""
     out = []
     try:
         for row in reversed(list(history or ())):
@@ -256,16 +280,21 @@ def _rows(history: Iterable, now: float, window_s: float) -> list:
                 continue
             nm = str(row.get("action") or "").strip().lower()
             if nm and not nm.startswith("_"):
-                out.append((nm, str(row.get("arg") or "")))
+                out.append((nm, str(row.get("arg") or ""), row.get("turn")))
     except Exception:
         pass
     return out
 
 
-def look_retry_token(text, history: Iterable = (), now: Optional[float] = None
-                     ) -> Optional[str]:
+def look_retry_token(text, history: Iterable = (), now: Optional[float] = None,
+                     turn: Optional[int] = None) -> Optional[str]:
     """The token a retry re-runs the last look with, when the newest action in
-    its window was a look; else None. Never raises."""
+    its window was a look; else None. ``turn``: this owner turn's number. Lines
+    that ran no action leave no row, so a bare "try again" needs the look to
+    carry the turn before this one ("look again" names looking, and only needs
+    the window). A question about the past (recall_screen and its names) stays
+    one: it is re-run, never turned into a look at the screen now. Never
+    raises."""
     try:
         kind = retry_kind(text)
         if not kind:
@@ -276,7 +305,10 @@ def look_retry_token(text, history: Iterable = (), now: Optional[float] = None
         rows = _rows(history, when, window)
         if not rows:
             return None
-        name, arg = rows[0]
+        name, arg, row_turn = rows[0]
+        if kind == "generic" and (turn is None or row_turn is None
+                                  or row_turn != turn - 1):
+            return None
         if name == "look_around":
             return token("look_around")
         if name in CAMERA_LOOK_ACTIONS:
@@ -285,9 +317,9 @@ def look_retry_token(text, history: Iterable = (), now: Optional[float] = None
             # A bare "try again" after a click and a look means the click: only
             # a turn of nothing but looks is a screen ask.
             if kind == "generic" and any(n not in SCREEN_LOOK_ACTIONS
-                                         for n, _a in rows):
+                                         for n, _a, _t in rows):
                 return None
-            return token("see_screen", arg)
+            return token(name, arg)
         return None
     except Exception:
         return None
@@ -295,15 +327,15 @@ def look_retry_token(text, history: Iterable = (), now: Optional[float] = None
 
 def route_token(text, history: Iterable = (), *, now: Optional[float] = None,
                 ask_on: bool = True, retry_on: bool = True,
-                focus_changed: Optional[Callable[[], bool]] = None
-                ) -> Optional[str]:
+                focus_changed: Optional[Callable[[], bool]] = None,
+                turn: Optional[int] = None) -> Optional[str]:
     """The token this line is claimed with, else None. ``focus_changed`` (asked
     only for an AMBIGUOUS line): the window in front just changed, so "what is
     this?" is about it. Never raises."""
     try:
         when = time.time() if now is None else float(now)
         if retry_on:
-            got = look_retry_token(text, history, when)
+            got = look_retry_token(text, history, when, turn)
             if got:
                 return got
         if not ask_on:
@@ -312,7 +344,7 @@ def route_token(text, history: Iterable = (), *, now: Optional[float] = None,
         if not kind:
             return None
         if kind == AMBIGUOUS:
-            for nm, _a in _rows(history, when, AMBIGUOUS_YIELD_S):
+            for nm, _a, _t in _rows(history, when, AMBIGUOUS_YIELD_S):
                 if nm not in CAMERA_LOOK_ACTIONS:
                     return None
             if focus_changed is not None and focus_changed():
@@ -329,15 +361,15 @@ def is_camera_route_token(reply) -> bool:
 
 def spoken_answer(result) -> Optional[str]:
     """What the vision model said, ready to speak: no local-model tag, no
-    stale-frame note, at most three sentences. None when the result is no
-    answer (no camera, vision failed), so the normal failure path reports it.
-    Never raises."""
+    stale-frame or gaze note, at most three sentences. None when the result is
+    no answer (no camera, vision failed, the action crashed). Never raises."""
     try:
         if not isinstance(result, str):
             return None
         s = _LOCAL_TAG_RE.sub("", result)
         s = _NOTE_RE.sub("", s).strip()
-        if not s or _NOT_AN_ANSWER_RE.match(s):
+        if (not s or _NOT_AN_ANSWER_RE.match(s) or ACTION_CRASH_MARK in s
+                or s.startswith(TERMINAL_FAILURE_PREFIX)):
             return None
         pieces = _SENTENCE_RE.split(" ".join(s.split()))
         out = " ".join(pieces[:_MAX_SPOKEN_SENTENCES]).strip()
@@ -347,3 +379,28 @@ def spoken_answer(result) -> Optional[str]:
         return out or None
     except Exception:
         return None
+
+
+def look_result(result) -> str:
+    """see_user's result for the action loop: an answer as it stands, anything
+    else a failure every path recognises, so it never backs a claim. Never
+    raises."""
+    try:
+        if spoken_answer(result) is not None:
+            return result
+        why = " ".join(_LOCAL_TAG_RE.sub("", str(result or "")).split())
+        if why.lower().startswith("failed to"):
+            return why
+        return LOOK_FAILED_PREFIX + (why.strip("() ") or "the look gave no answer")
+    except Exception:
+        return LOOK_FAILED_PREFIX + "the look gave no answer"
+
+
+def stale_frame_result(age_s: float) -> str:
+    """see_user's result for a frame older than STALE_FRAME_S."""
+    return f"{LOOK_FAILED_PREFIX}{_STALE_WHY} (the last frame is {age_s:.0f}s old)"
+
+
+def failed_look_line(result) -> str:
+    """What the owner hears for a look that gave no answer."""
+    return STALE_FRAME_LINE if _STALE_WHY in str(result or "") else LOOK_FAILED_LINE

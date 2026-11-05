@@ -1405,11 +1405,11 @@ class TeamsUnreadActionTests(unittest.TestCase):
                                   side_effect=AssertionError("called")), \
                 mock.patch.object(self.mod, "_teams_toast_records", return_value=None):
             out = self.mod.action_teams_unread("")
-        self.assertIn("isn't signed in", out)
+        self.assertIn("not signed in to Microsoft", out)
 
     def test_a_403_is_named(self):
         out = self._run(status=403)
-        self.assertIn("isn't allowed to read chats", out)
+        self.assertIn("won't let me read your Teams chats", out)
         self.assertNotRegex(out, r"\d")
 
     def test_a_raising_read_is_honest(self):
@@ -1441,6 +1441,20 @@ class TeamsUnreadActionTests(unittest.TestCase):
         with mock.patch.dict(sys.modules):
             sys.modules.pop("skill_notification_triage", None)
             self.assertIsNone(self.mod._teams_toast_records())
+
+    def test_a_recent_restart_is_said_from_the_live_triage(self):
+        import sys
+        import time
+        import types
+        live = types.SimpleNamespace(recent_notifications=lambda n: [],
+                                     recent_since=lambda: time.time() - 3600.0)
+        with mock.patch.dict(sys.modules, {"skill_notification_triage": live}),                 mock.patch.object(self.mod, "is_configured", return_value=False):
+            out = self.mod.action_teams_unread("")
+        self.assertIn("since I started", out)
+        self.assertNotIn("12 hours", out)
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop("skill_notification_triage", None)
+            self.assertIsNone(self.mod._teams_toast_since())
 
 
 if __name__ == "__main__":
