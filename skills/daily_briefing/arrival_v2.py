@@ -43,7 +43,7 @@ import re
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, wait as _futures_wait
 
 try:
     from . import _common
@@ -82,6 +82,7 @@ WATCH_POLL_SECONDS = 1.0
 # any section that overruns is dropped from the brief. News summarisation
 # does a per-headline LLM call, so 8s leaves headroom for ~3 hops.
 SECTION_TIMEOUT_SECONDS = 8.0
+NEWS_WAIT_POLL_SECONDS = 0.25
 
 # Overnight window for "did this print finish overnight" and "did this
 # email arrive overnight" framing. 14 hours covers a typical sleep window
@@ -338,12 +339,51 @@ def _news_warmup_cap() -> float:
         from core import brain_warmup, config as _c
         if not brain_warmup.warming():
             return 0.0
-        cap = float(getattr(_c, "ARRIVAL_NEWS_WARMUP_TIMEOUT_S", 25.0))
+        cap = float(getattr(_c, "ARRIVAL_NEWS_WARMUP_TIMEOUT_S", 45.0))
         print(f"  [arrival_v2] the brain is still warming up — the news section "
               f"gets up to {cap:.0f} s")
         return max(0.0, cap)
     except Exception:
         return 0.0
+
+
+def _news_after_warmup() -> float:
+    """Seconds the news keeps after the warm-up ends; 0.0 = no such window, only
+    the hard cap (ARRIVAL_NEWS_WINDOW_AFTER_WARMUP off). Never raises."""
+    try:
+        if not _cfg_on("ARRIVAL_NEWS_WINDOW_AFTER_WARMUP"):
+            return 0.0
+        from core import config as _c
+        return max(0.0, float(getattr(_c, "ARRIVAL_NEWS_AFTER_WARMUP_S", 25.0)))
+    except Exception:
+        return 0.0
+
+
+def _news_deadline(started, cap, warmup_ended_at, after_warmup) -> float:
+    """When the news section is given up on, in the same clock as `started`: the
+    hard cap, or the window after the warm-up ended if that comes first."""
+    hard = started + cap
+    if warmup_ended_at is None or after_warmup <= 0:
+        return hard
+    return min(hard, warmup_ended_at + after_warmup)
+
+
+def _await_news(fut, started, cap):
+    """The news future's result under _news_deadline, watching for the warm-up
+    to end while it waits. Raises FutureTimeoutError at the deadline."""
+    from core import brain_warmup
+    after = _news_after_warmup()
+    ended_at = None
+    while True:
+        if fut.done():
+            return fut.result()
+        now = time.monotonic()
+        if ended_at is None and not brain_warmup.warming():
+            ended_at = now
+        left = _news_deadline(started, cap, ended_at, after) - now
+        if left <= 0:
+            raise FutureTimeoutError()
+        _futures_wait([fut], timeout=min(NEWS_WAIT_POLL_SECONDS, left))
 
 
 def _section_weather() -> str:
@@ -613,10 +653,11 @@ def _gather_sections() -> dict:
         for fut in list(futures):
             name = futures[fut]
             try:
-                limit = SECTION_TIMEOUT_SECONDS
                 if name == "news" and news_cap:
-                    limit = max(0.1, started + news_cap - time.monotonic())
-                results[name] = (fut.result(timeout=limit) or "").strip()
+                    value = _await_news(fut, started, news_cap)
+                else:
+                    value = fut.result(timeout=SECTION_TIMEOUT_SECONDS)
+                results[name] = (value or "").strip()
             except FutureTimeoutError:
                 print(f"  [arrival_v2] section '{name}' timed out — dropping")
                 results[name] = ""

@@ -1191,7 +1191,16 @@ PENDING_GREETING_FIRST = True
 # news section gets up to ARRIVAL_NEWS_WARMUP_TIMEOUT_S from the start of the
 # gathering (the hard cap; every other section keeps its 8 s). False: 8 s always.
 ARRIVAL_NEWS_WAIT_FOR_BRAIN = True
-ARRIVAL_NEWS_WARMUP_TIMEOUT_S = 25.0
+ARRIVAL_NEWS_WARMUP_TIMEOUT_S = 45.0
+# ARRIVAL_NEWS_WINDOW_AFTER_WARMUP (bool, v3.0.11; arrival_v2._await_news) - same
+# boot: the gathering began about 10:54:16, the warm-up ended 10:54:26 and the
+# last headline summary landed 10:54:44, 28 s in and 18 s after the warm-up ended,
+# so a flat 25 s from the start would still have dropped it. True: once the
+# warm-up ends the news gets ARRIVAL_NEWS_AFTER_WARMUP_S from that moment, never
+# past the hard cap above, so the arrival is not held longer than the summaries
+# need. False: the news may use the whole hard cap.
+ARRIVAL_NEWS_WINDOW_AFTER_WARMUP = True
+ARRIVAL_NEWS_AFTER_WARMUP_S = 25.0
 # ARRIVAL_SAY_WHAT_FAILED (bool, v3.0.11; arrival_v2._compose_briefing) - same
 # moment: "Nothing of note overnight." was said although a section had been
 # dropped, not found empty. True: when nothing can be said and a section timed
