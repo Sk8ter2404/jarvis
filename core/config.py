@@ -2031,10 +2031,19 @@ SCREEN_REMARK_TITLE_PRECHECK = True
 # refuses any bracket, whatever the title. True: that one leading tag is removed
 # before validate, so remarks start being SPOKEN, for the first time, at most one per
 # SCREEN_REMARKS_MIN_GAP_S. Any other bracket still drops. False (default, the one
-# flag here that ships off, since turning a voice on is the owner's decision): every
-# remark on a title without hashtags still costs a brain call and is dropped.
+# flag here that ships off, since turning a voice on is the owner's decision): no
+# screen remark is spoken; see SCREEN_REMARK_SKIP_DOOMED_CALL for the brain call.
 # Read live.
 SCREEN_REMARK_STRIP_INTENT = False
+# SCREEN_REMARK_SKIP_DOOMED_CALL (bool, v3.0.11, core/screen_remarks.Remarker._remark)
+# - live 2026-11-05 12:18:34: a video title with no hashtag took a full brain call and
+# was still dropped as "carries a tag", because the persona's leading [intent:xxx] is
+# refused while SCREEN_REMARK_STRIP_INTENT is off. True (default): while that flag is
+# off nothing is sent to the brain for a screen remark and the title is dropped with
+# its own log line, so nothing changes aloud and the call is saved. False: the brain
+# is asked and the reply dropped as before. Turning SCREEN_REMARK_STRIP_INTENT on
+# brings the call back. Read live.
+SCREEN_REMARK_SKIP_DOOMED_CALL = True
 # VERBATIM_CONTENT_RESULTS (bool, v3.0.8, bobert_companion
 # _action_result_failed): live 2026-10-28 19:47 "what's new" - the changelog
 # summary said fixes as fixes ("no longer fails"), its words read as a failed

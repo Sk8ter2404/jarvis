@@ -1,5 +1,6 @@
 """v3.0.11 lane T wiring in the monolith: the post-STT Teams fix, the Teams hotword,
 the teams_unread shortcut, the prompt, and the idle remark's prompt and drop."""
+import inspect
 import unittest
 from unittest import mock
 
@@ -174,7 +175,12 @@ class IdleRemarkTests(_Base):
                       "time, sir; I trust you're contemplating something.",
                       "[intent:observation] I couldn't help but notice the "
                       "silence, sir; it's rather uncharacteristic.",
-                      "SKIP", "[intent:dry_wit] SKIP"):
+                      "SKIP", "[intent:dry_wit] SKIP",
+                      "[intent:fact] SKIP: nothing worth saying, sir.",
+                      "SKIP - nothing worth saying, sir.",
+                      "Nothing to add, sir.",
+                      "Not a peep out of you, sir.",
+                      "Just checking in, sir."):
             with self.subTest(reply=reply):
                 line, log = self._run(reply)
                 self.assertEqual(line, "")
@@ -187,6 +193,15 @@ class IdleRemarkTests(_Base):
         kw = self.llm.call_args.kwargs
         self.assertIn("a brief check-in", kw["system"])
         self.assertIn("There has been silence", kw["user"])
+
+
+@requires_monolith
+class ScreenRemarkWiringTests(_Base):
+    def test_the_boot_says_the_adapter_leads_with_the_tag(self):
+        # The adapter sends the persona, whose rule is one leading [intent:xxx].
+        src = inspect.getsource(self.bc._screen_vision_boot)
+        self.assertIn("llm_leads_with_tag=True", src)
+        self.assertIn("_system_prompt", inspect.getsource(self.bc._screen_remark_llm))
 
 
 if __name__ == "__main__":

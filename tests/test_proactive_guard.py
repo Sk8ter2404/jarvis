@@ -318,6 +318,81 @@ class UngroundedRemarkTests(unittest.TestCase):
                 self.assertEqual(pg.check_remark(text, hour=11, pool=(),
                                                  grounded_only=True), (True, ""))
 
+    def test_skip_with_trailing_words_says_nothing(self):
+        for text in (
+            "[intent:fact] SKIP: nothing worth saying, sir.",
+            "SKIP - nothing worth saying, sir.",
+            "SKIP, sir.",
+            "skip nothing today",
+            "Nothing to add, sir.",
+            "I have nothing to say, sir.",
+            "Nothing worth mentioning, sir.",
+            "I've nothing interesting to offer, sir.",
+            "Nothing comes to mind, sir.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(pg.ungrounded_remark(text), "said nothing")
+                self.assertFalse(pg.check_remark(text, hour=11, pool=(),
+                                                 grounded_only=True)[0])
+
+    def test_paraphrases_of_the_silence_and_of_attention(self):
+        for text in (
+            "Not a word in an hour, sir.",
+            "Not a peep out of you, sir.",
+            "Not so much as a peep, sir.",
+            "It has been a while since you last spoke, sir.",
+            "It's been an hour, sir.",
+            "Some time since you said anything, sir.",
+            "An hour without a word, sir.",
+            "Just checking in, sir.",
+            "Thought I'd check in on you, sir.",
+            "How's the project coming along, sir?",
+            "How is the build going, sir?",
+            "The room is very peaceful, sir.",
+            "So peaceful this morning, sir.",
+            "A rather tranquil afternoon, sir.",
+            "It's been silent, sir.",
+            "The silence of this room is striking.",
+            "Quite productive today, sir.",
+            "A productive afternoon, sir.",
+            "You're being productive, sir.",
+            "Your productivity is admirable.",
+            "So busy, sir.",
+            "You've kept busy, sir.",
+            "Keeping busy, sir?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(pg.ungrounded_remark(text))
+                self.assertFalse(pg.check_remark(text, hour=11, pool=(),
+                                                 grounded_only=True)[0])
+
+    def test_facts_that_share_the_words_pass(self):
+        for text in (
+            "Silent films often had live orchestras, sir.",
+            "The k in knight is silent, sir.",
+            "The Silence of the Lambs won five Oscars, sir.",
+            "Silent Spring was published in 1962, sir.",
+            "The guns fell silent in November 1918, sir.",
+            "Cicadas stay silent for seventeen years, sir.",
+            "Hush puppies are a fried cornmeal dish, sir.",
+            "Bees are famously busy in the spring, sir.",
+            "Heathrow is the busiest airport in Europe, sir.",
+            "Dwarf wheat made farms far more productive, sir.",
+            "Soil productivity doubled with crop rotation, sir.",
+            "Owls fly almost without a sound, sir.",
+            "Not a word of the Voynich manuscript has been read, sir.",
+            "All Quiet on the Western Front appeared in 1929, sir.",
+            "Magellan named the Pacific for its peaceful waters, sir.",
+            "The Peaceful Revolution ended in 1989, sir.",
+            "Skipping stones is a sport with world records, sir.",
+            "Checking in a bag was free until 2008, sir.",
+            "Ninety years since the first jet engine ran, sir.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(pg.ungrounded_remark(text), "")
+                self.assertEqual(pg.check_remark(text, hour=11, pool=(),
+                                                 grounded_only=True), (True, ""))
+
     def test_off_by_default_for_other_callers(self):
         self.assertEqual(pg.check_remark("Rather quiet in here, sir.", hour=11, pool=()),
                          (True, ""))

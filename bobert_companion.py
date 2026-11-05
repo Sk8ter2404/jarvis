@@ -35454,7 +35454,7 @@ def _screen_vision_boot() -> None:
         from core import screen_remarks as _sr
         _sr.set_state_publisher(_publish_screen_remarks_state)
         _sr.start(announce=_screen_remark_announce, llm=_screen_remark_llm,
-                  busy=_screen_remark_busy)
+                  busy=_screen_remark_busy, llm_leads_with_tag=True)
     except Exception as _e:
         print(f"  [screen-remark] boot wiring failed: {_e}")
 

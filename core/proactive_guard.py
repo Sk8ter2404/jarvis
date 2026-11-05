@@ -231,28 +231,70 @@ def repeats_recent(text, recent) -> str:
 # Live 2026-11-05: "it's a remarkably productive morning so far" (11:35:27),
 # "You've been quite still for some time, sir" (13:07:48), "I couldn't help but
 # notice the silence, sir" (14:56:48). JARVIS knows nothing about the owner's
-# productivity, and the silence is the very thing that triggered the prompt. A
-# fact that merely uses "still" or "noticed" is not caught ("Honey is still
-# edible", "Fleming noticed the mould"); a remark is optional, so a fact that
-# says "busy" or "productive" may be lost, and that is fine.
+# productivity, and the silence is the very thing that triggered the prompt.
+# Each rule looks for the word used ABOUT THE OWNER OR THE ROOM, so a fact that
+# merely uses it stays ("Honey is still edible", "Fleming noticed the mould",
+# "Silent films had live orchestras", "Bees are famously busy", "Owls fly
+# without a sound", "the Pacific was named for its peaceful waters"). A remark
+# is optional, so the odd fact lost here is fine; an empty remark spoken is not.
 _NOTHING_REPLY_RE = re.compile(
-    r"^\W*(?:skip|nothing|none|n/?a|no comment)\W*(?:sir\W*)?$")
+    r"^\W*(?:skip\b|(?:nothing|none|n/?a|no comment)\W*(?:sir\W*)?$)|"
+    r"\bnothing (?:\w+ ){0,2}(?:to (?:add|say|offer|report|share|mention)|"
+    r"worth (?:saying|adding|mentioning|noting|sharing)|comes to mind)\b")
 _UNGROUNDED_RES: tuple = (
-    ("the silence", re.compile(r"\bsilen(?:ce|t)\b|\bhush\b")),
+    ("the silence", re.compile(
+        r"\bsilence\b(?!\s+of\s+(?!(?:this|your|these|the (?:room|house|"
+        r"office|desk|morning|afternoon|evening))\b))|"
+        r"\b(?:been|so|very|rather|quite|awfully|remarkably|unusually|"
+        r"uncharacteristically|it's|it is|all|too|room is|house is|office is|"
+        r"you're|you are|stayed|remained)\s+silent\b|"
+        r"\bsilent\s+(?:in here|around here|today|lately|so far|tonight|"
+        r"treatment|for (?:a while|a bit|a time|some time|quite|so long|an? "
+        r"\w+|\w+ (?:minutes|hours)))\b|"
+        r"\bhush\b(?!\s+(?:pupp|money))")),
     ("the quiet", re.compile(
         r"\b(?:been|so|very|rather|quite|awfully|remarkably|unusually|"
-        r"uncharacteristically|it's|it is|all|too)\s+quiet\b|"
+        r"uncharacteristically|it's|it is|all|too)\s+quiet\b(?!\s+on\b)|"
         r"\bquiet\s+(?:in here|around here|today|for|lately|so far)\b|"
-        r"\bpeace and quiet\b")),
+        r"\bpeace and quiet\b|"
+        r"\b(?:very|so|quite|rather|how|awfully|remarkably|most|it's|it is|"
+        r"all is|such a|what a)\s+(?:peaceful|tranquil|serene)\b|"
+        r"\b(?:peaceful|tranquil|serene)\s+(?:in here|around here|here|today|"
+        r"morning|afternoon|evening|night|day)\b|"
+        r"\b(?:room|house|office|desk)\b[^.?!]{0,20}"
+        r"\b(?:peaceful|tranquil|serene|calm)\b")),
     ("not speaking", re.compile(
         r"\b(?:haven't|have not|hasn't|not)\s+(?:said|spoken|uttered)\b|"
-        r"\bsaid a word\b")),
+        r"\bsaid a word\b|"
+        r"\bnot (?:so much as )?a (?:word|peep|sound|murmur)\b(?!\s+of\b)|"
+        r"\bwithout (?:so much as )?a word\b|"
+        r"\bsince (?:you|we)(?:'ve| have)? (?:last )?"
+        r"(?:spoke|spoken|said|talked|stirred)\b|"
+        r"\b(?:a while|an hour|some time|a long time|ages) since\b|"
+        r"\b(?:it's|it has|it is) been (?:quite )?"
+        r"(?:a while|an hour|some time|a long time|ages)\b")),
+    ("a check-in", re.compile(
+        r"\bcheck(?:ing)? in\b(?!\s+(?:a|your|baggage|luggage|bags?)\b)|"
+        r"\bcheck(?:ing)? on you\b|\b(?:a|quick|brief) check-in\b|"
+        r"\bcoming along\b|"
+        r"\bhow(?:'s| is| are)\b[^.?!]{0,40}"
+        r"\b(?:going|getting on|progressing)\b")),
     ("stillness", re.compile(
         r"\bstillness\b|\b(?:haven't|have not|not)\s+moved\b|"
         r"\b(?:quite|very|rather|so|awfully|remarkably|unusually|sitting|sat|"
         r"stayed|remained|been)\s+still\b(?!\s+\w+ing\b)")),
     ("how productive he is", re.compile(
-        r"\bproductiv\w+\b|\bbusy\b|\bhard at (?:work|it)\b|"
+        r"\bproductive\s+(?:morning|day|afternoon|evening|night|session|week|"
+        r"stretch|streak|start|one|today|so far)\b|"
+        r"\byou(?:'re| are|'ve been| have been)?\s+(?:\w+\s+)?productive\b|"
+        r"\byour\s+(?:\w+\s+)?productivity\b|"
+        r"^\W*(?:so|very|quite|rather|awfully|remarkably|terribly|how|most)\s+"
+        r"(?:productive|busy)\b|"
+        r"\bbusy\s+(?:day|morning|afternoon|evening|night|week|today|as ever|"
+        r"as always|so far|lately)\b|"
+        r"\b(?:you(?:'re| are)?|you've been|you have been|you've kept|keeping|"
+        r"keeps you|kept you)\s+(?:\w+\s+)?busy\b|"
+        r"\bhard at (?:work|it)\b|"
         r"\bworking (?:\w+ )?hard\b|\bon a roll\b|\bdiligent\w*\b|"
         r"\bgetting (?:a lot|lots|much|plenty) done\b")),
     # JARVIS as the one noticing, not "Fleming noticed the mould".
@@ -267,12 +309,14 @@ _UNGROUNDED_RES: tuple = (
 
 
 def ungrounded_remark(text) -> str:
-    """What makes ``text`` an empty remark, or "": it says nothing ("SKIP"), or
-    talks about the silence, the quiet, stillness, how productive or busy the
-    owner is, or what JARVIS has noticed. Never raises."""
+    """What makes ``text`` an empty remark, or "": it says nothing ("SKIP", with
+    or without trailing words, or "nothing to add"), it is a check-in, or it
+    talks about the silence, the quiet, how long he has not spoken, stillness,
+    how productive or busy the owner is, or what JARVIS has noticed. Never
+    raises."""
     try:
         s = _plain(text).strip()
-        if _NOTHING_REPLY_RE.match(s):
+        if _NOTHING_REPLY_RE.search(s):
             return "said nothing"
         for name, rx in _UNGROUNDED_RES:
             if rx.search(s):

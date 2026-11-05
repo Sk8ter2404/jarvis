@@ -537,6 +537,9 @@ class Remarker:
         self.clock = clock or time.time
         self.announce = announce
         self.llm = llm
+        # True when the wired brain speaks through the persona, which leads
+        # every reply with [intent:xxx] (only the monolith's adapter does).
+        self.llm_leads_with_tag = False
         self.busy = busy
         self.grace_s = float(grace_s)
         self.persist = bool(persist)
@@ -861,6 +864,15 @@ class Remarker:
             _log(f"dropped before the brain (title has hashtags) for "
                  f"'{item['title'][:60]}'")
             return {"action": "dropped", "why": "title has hashtags"}
+        # The persona's leading tag fails validate unless it is stripped, so
+        # with stripping off the reply is lost before it is written.
+        if (self.llm_leads_with_tag
+                and bool(_cfg("SCREEN_REMARK_SKIP_DOOMED_CALL", True))
+                and not bool(_cfg("SCREEN_REMARK_STRIP_INTENT", False))):
+            self._consume(item)
+            _log(f"dropped before the brain (its reply would carry a tag) for "
+                 f"'{item['title'][:60]}'")
+            return {"action": "dropped", "why": "reply would carry a tag"}
         self.last_attempt = now
         if not callable(self.llm) or not callable(self.announce):
             return {"action": "hold", "why": "no voice wired"}
@@ -943,9 +955,11 @@ def get() -> Remarker:
         return _singleton["r"]
 
 
-def start(*, announce=None, llm=None, busy=None) -> bool:
-    """Start the thread with the monolith's adapters. Not in a test process
-    (nothing may read the owner's screen). Never raises."""
+def start(*, announce=None, llm=None, busy=None,
+          llm_leads_with_tag=False) -> bool:
+    """Start the thread with the monolith's adapters. ``llm_leads_with_tag``:
+    the adapter answers through the persona, which leads with [intent:xxx]. Not
+    in a test process (nothing may read the owner's screen). Never raises."""
     try:
         from core.screen_privacy import reads_blocked
         if reads_blocked():
@@ -955,6 +969,7 @@ def start(*, announce=None, llm=None, busy=None) -> bool:
             r.announce = announce
         if llm is not None:
             r.llm = llm
+            r.llm_leads_with_tag = bool(llm_leads_with_tag)
         if busy is not None:
             r.busy = busy
         ok = r.start()
