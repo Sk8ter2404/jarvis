@@ -18055,6 +18055,10 @@ _TURN_FLAG_KEYS = (
     "STT_TEAMS_FIX", "STT_TEAMS_HOTWORD", "TEAMS_UNREAD_ACTION",
     "PROACTIVE_GROUNDED_ONLY", "SCREEN_REMARK_TITLE_PRECHECK",
     "SCREEN_REMARK_STRIP_INTENT",
+    # v3.0.11 lane B: stale announcements at boot and arrival.
+    "PENDING_SOURCE_POLICY", "PENDING_GREETING_FIRST",
+    "ARRIVAL_NEWS_WAIT_FOR_BRAIN", "ARRIVAL_NEWS_WINDOW_AFTER_WARMUP",
+    "ARRIVAL_SAY_WHAT_FAILED", "CLAP_MEDIA_WIDE",
 )
 
 
@@ -18653,6 +18657,9 @@ _parakeet_primary = _stt_parakeet.Primary(
     # needs a wake hint ('on' skips it otherwise; 'shadow' only counts).
     gate=lambda t, a, w: _music_gate_rescue(t, a, w),
     shadow=lambda w, res, a: _music_gate_rescue_seen(w, res, a),
+    # Measure only (v3.0.11): the stat line's "usable" count - Whisper's text
+    # is words the live wake gates would let in.
+    useful=lambda t: bool((t or "").strip()) and not _parakeet_wake_lost(t),
 )
 
 
@@ -24131,6 +24138,8 @@ def _warm_up_local_llm_async() -> None:
         return
 
     def _do() -> None:
+        # ARRIVAL_NEWS_WAIT_FOR_BRAIN: the arrival's news section asks this.
+        _brain_warmup_mod.note_start()
         try:
             if not _ollama_alive():
                 # Ollama not up yet — the normal lazy path (_call_local_llm)
@@ -24195,6 +24204,8 @@ def _warm_up_local_llm_async() -> None:
         except Exception as _e:
             print(f"  [local-llm] warm-up error (non-fatal): "
                   f"{type(_e).__name__}: {_e}")
+        finally:
+            _brain_warmup_mod.note_done()
 
     threading.Thread(target=_do, daemon=True, name="local-llm-warmup").start()
 
@@ -25871,6 +25882,8 @@ def _note_owner_voice() -> None:
 # an owner MIC turn, a sustained face, or PHYSICAL input. Single-element cells,
 # the GIL-atomic idiom of this file.
 from core import owner_presence as _owner_presence_mod  # noqa: E402
+from core import pending_policy as _pending_policy_mod  # noqa: E402
+from core import brain_warmup as _brain_warmup_mod  # noqa: E402
 # time.monotonic() of the last non-wake speech the main loop captured and
 # dropped at the background-audio gate (people, or a show, talking). 0.0 = none.
 _last_room_talk_at = [0.0]
@@ -39003,6 +39016,9 @@ def _music_state_refresh() -> None:
                     _music_state.update(music=False, peak=None,
                                         room=False, playing=False)
                 _music_state["at"] = time.monotonic()
+                if _music_state.get("playing"):
+                    # CLAP_MEDIA_WIDE: _clap_media_recent's linger.
+                    _music_state["playing_at"] = _music_state["at"]
             finally:
                 _music_state_lock.release()
     except Exception:
@@ -39423,6 +39439,25 @@ def _pc_media_playing(refresh: bool = True) -> bool:
         if at is None or time.monotonic() - float(at) > _MUSIC_STATE_STALE_S:
             return False
         return bool(_music_state.get("playing"))
+    except Exception:
+        return False
+
+
+def _clap_media_recent() -> bool:
+    """CLAP_MEDIA_WIDE (v3.0.11, skills/clap_trigger): was the PC or the room
+    playing, by the music gate's reading now or within CLAP_MEDIA_LINGER_S, or
+    is the media hold on? Reads only what other threads refreshed: no new meter
+    read on the clap worker. Never raises (False: a real clap still works)."""
+    try:
+        if _pc_media_playing(refresh=False):
+            return True
+        at = _music_state.get("playing_at")
+        linger = float(globals().get("CLAP_MEDIA_LINGER_S", 0) or 0)
+        if (at is not None and linger > 0
+                and time.monotonic() - float(at) <= linger):
+            return True
+        return bool(globals().get("MEDIA_HOLD_ENABLED", False)
+                    and _media_hold_active())
     except Exception:
         return False
 
@@ -50499,6 +50534,19 @@ def _speak_pending(only_sources=None):
         try: os.remove(consume_path)
         except Exception: pass
         return False
+    _source_policy = bool(globals().get("PENDING_SOURCE_POLICY", False))
+    if _source_policy and isinstance(items, list):
+        # A line past its age is not said, whatever else is going on: the
+        # queue survives restarts (live 2026-11-05: a week-old evening briefing
+        # at 10:54). One table, core/pending_policy.QUEUE_RULES.
+        items, _too_old = _pending_policy_mod.plan_ages(items, now=time.time())
+        for _e, _why in _too_old:
+            print(f"  [pending] too old to say ({_e.get('source', '?')}; "
+                  f"{_why}): {str(_e.get('message', ''))[:80]}")
+        if not items:
+            try: os.remove(consume_path)
+            except Exception: pass
+            return False
     if _return_drain and isinstance(items, list):
         # He is here: a status line that waited longer than
         # PRESENCE_STALE_STATUS_S is not read out on its own — the stale ones
@@ -50506,7 +50554,9 @@ def _speak_pending(only_sources=None):
         # moment-line (a break nudge, a habit offer) is simply over.
         items, _dropped, _folded = _owner_presence_mod.plan_return_drain(
             items, now=time.time(), stale_s=PRESENCE_STALE_STATUS_S,
-            away=_return_away)
+            away=_return_away,
+            never_fold=(_pending_policy_mod.never_fold if _source_policy
+                        else None))
         for _e in _dropped:
             print(f"  [pending] expired while away ({_e.get('source', '?')}): "
                   f"{str(_e.get('message', ''))[:80]}")
@@ -50517,6 +50567,10 @@ def _speak_pending(only_sources=None):
             try: os.remove(consume_path)
             except Exception: pass
             return False
+    if (only_sources is None and isinstance(items, list)
+            and globals().get("PENDING_GREETING_FIRST", False)):
+        # He hears the greeting, then the recap (live 2026-11-05 10:55).
+        items = _pending_policy_mod.greeting_first(items)
     # Speak each reminder under its own try/except so a single edge-tts
     # failure doesn't crash the main loop or strand the rest of the queue.
     # Second-layer dedup: skip messages we've already spoken inside the

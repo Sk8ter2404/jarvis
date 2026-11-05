@@ -47,6 +47,8 @@ WHEN A DOUBLE CLAP IS IGNORED (handle_double_clap's gates, in order)
     Apple Music, YouTube), music JARVIS started in the last
     _JARVIS_MUSIC_WINDOW_S, the room-music detector (the monolith's
     _ambient_media_is_playing);
+  * the PC's audio reading or the media hold said so within the last
+    CLAP_MEDIA_LINGER_S (CLAP_MEDIA_WIDE, the monolith's _clap_media_recent);
   * the speakers are playing anything at all (the playback device's peak
     meter): a game, a call, a clip — the claps may have come out of them.
 
@@ -363,6 +365,19 @@ def _media_playing(bc) -> bool:
         return False
 
 
+def _media_recent(bc) -> bool:
+    """CLAP_MEDIA_WIDE (v3.0.11): the shared PC-media reading and the media
+    hold, with a short linger (bobert_companion._clap_media_recent): a clap in
+    a gap of a programme is still the programme. Never raises."""
+    try:
+        if not _cfg_bool("CLAP_MEDIA_WIDE", True):
+            return False
+        fn = getattr(bc, "_clap_media_recent", None)
+        return bool(fn()) if callable(fn) else False
+    except Exception:
+        return False
+
+
 _com_ready = threading.local()
 
 
@@ -455,6 +470,8 @@ def handle_double_clap(bc, event: dict, now: "float | None" = None) -> str:
             return _note_ignored("the TV is on", now)
         if _media_playing(bc):
             return _note_ignored("media is playing", now)
+        if _media_recent(bc):
+            return _note_ignored("media was playing a moment ago", now)
         if _speaker_output_active():
             return _note_ignored("the speakers were playing something", now)
         with _lock:

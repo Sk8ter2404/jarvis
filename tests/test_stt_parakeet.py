@@ -436,6 +436,47 @@ class PrimaryTests(unittest.TestCase):
         self.assertFalse(any("Travis" in ln or "time is it" in ln
                              for ln in log))
 
+    def test_the_stat_line_counts_usable_rescues_per_reason(self):
+        # Measure only (v3.0.11): live 11-05 646 of 780 decodes were rescued
+        # and nothing said whether a rescue ever found anything.
+        clock = [0.0]
+        log = []
+        whisper_says = ["", "Jarvis, lights on", "the telly talking", "Jarvis"]
+
+        def _whisper(_a):
+            return whisper_says.pop(0), {}
+        decoded = ["", "Travis", "the telly", "Travis, hi", ""]
+        whisper_says.append("nothing")
+        p = sp.Primary(
+            lambda a: (decoded.pop(0), {}), _whisper,
+            latch=sp.Latch(log=log.append),
+            rescue=lambda t, a: sp.rescue_reason(
+                t, wake_lost=lambda x: not _prefix(x),
+                head_speech=lambda: True),
+            log=log.append, clock=lambda: clock[0],
+            useful=lambda t: bool(t.strip()) and _prefix(t))
+        for _ in range(4):
+            res = p.run(self.AUDIO)
+            self.assertIsInstance(res, tuple, "the turn's result changed")
+            clock[0] += sp.RESCUE_LOG_EVERY_S + 1
+        self.assertEqual(p.rescue_yield,
+                         {"empty": [1, 0], "no-wake": [3, 2]})
+        p.run(self.AUDIO)
+        self.assertIn(" - usable: empty 0 of 1, no-wake 2 of 3", log[-1])
+        # First line: nothing finished yet, so no count to show.
+        self.assertNotIn("usable", log[0])
+        self.assertTrue(log[0].startswith(
+            "  [stt] parakeet -> whisper rescue (empty; 1 of 1"))
+
+    def test_a_broken_usable_check_never_touches_the_turn(self):
+        def _boom(_t):
+            raise RuntimeError("boom")
+        w = _Whisper()
+        p = sp.Primary(lambda a: ("", {}), w, latch=sp.Latch(log=lambda _l: None),
+                       log=lambda _l: None, useful=_boom)
+        self.assertEqual(p.run(self.AUDIO), w.res)
+        self.assertEqual(p.rescue_yield, {"empty": [1, 0]})
+
     def test_no_rescue_when_the_head_is_silent(self):
         p, w, _log, notes = _primary(
             lambda a: ("he said lights", {}), wake=True, head=False)
