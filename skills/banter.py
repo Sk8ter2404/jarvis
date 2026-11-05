@@ -7,7 +7,10 @@ behavioural tells, and once every 30+ minutes injects ONE in-character
 zinger via the pending_speech queue.
 
 Tells detected:
-  • repeat_question     — same (or near-same) utterance ≥ 2× in the last 10 min
+  • repeat_question     — same (or near-same) question again today, more than
+                          10 min after the last time and that answer not
+                          corrected (BANTER_REPEAT_RETRY_SUPPRESS; off = 2× in
+                          the last 10 min)
   • repeat_open         — same target opened ≥ 5× today
   • tab_clutter         — > 40 chrome.exe processes (~one per tab) OR > 40
                           total visible top-level windows
@@ -62,6 +65,8 @@ INITIAL_DELAY_SECONDS = 180      # let JARVIS settle before the first scan
 FIRE_PROBABILITY      = 0.5      # post-match dice roll
 
 REPEAT_QUESTION_WINDOW = 10 * 60     # "same question twice in 10 min"
+REPEAT_RETRY_GAP       = 10 * 60     # closer than this he is retrying (v3.0.11)
+REPEAT_CORRECTION_WINDOW = 3 * 60    # a correction this soon after an answer
 REPEAT_OPEN_THRESHOLD  = 5           # "same URL opened 5+ times today"
 TAB_CLUTTER_THRESHOLD  = 40          # chrome procs OR total windows
 MUSIC_REPEAT_WINDOW    = 30 * 60     # "music while music already playing"
@@ -307,6 +312,13 @@ _QUESTION_LEAD_RE = re.compile(
     r"is|are|was|were|do|does|did|can|could|will|would|should|have|has)\b")
 
 
+# "This is a coke can", "that's a phone", "it's a mug": he told JARVIS what the
+# thing is. Not a question.
+_CORRECTED_THING_RE = re.compile(
+    r"^(?:(?:hey |ok |okay |no |nope )?(?:jarvis,? )?)"
+    r"(?:this|that|it)(?:'s| is) (?:a|an|my|not)\b(?!.*\?\s*$)")
+
+
 def _looks_like_question(text: str) -> bool:
     """A question, not a request: a repeated "talk to the robot" / "play it
     again" asks for the action AGAIN (and gets a new result), so "asking again
@@ -317,10 +329,77 @@ def _looks_like_question(text: str) -> bool:
     return bool(_QUESTION_LEAD_RE.match(raw.lower()))
 
 
+def _retry_suppress_on() -> bool:
+    """BANTER_REPEAT_RETRY_SUPPRESS (core/config.py), read at call time. Never
+    raises."""
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, "BANTER_REPEAT_RETRY_SUPPRESS", False))
+    except Exception:
+        return False
+
+
+def _is_correction_or_retry(text: str) -> bool:
+    """The owner put an answer right or asked for it again: "no", "that's
+    wrong", "this is a <thing>", "look again", "try again". Never raises."""
+    try:
+        from core import action_fit, camera_ask, tone_detector
+        return bool(action_fit.is_correction(text)
+                    or tone_detector.is_plain_retry(text)
+                    or camera_ask.retry_kind(text)
+                    or _CORRECTED_THING_RE.match((text or "").strip().lower()))
+    except Exception:
+        return False
+
+
+def _detect_spaced_repeat_question(entries: list[dict], now: float) -> dict | None:
+    """The same QUESTION again more than REPEAT_RETRY_GAP after the last time
+    it was asked today, its earlier answer not corrected (v3.0.11,
+    BANTER_REPEAT_RETRY_SUPPRESS). Closer than that he is retrying, and the
+    line would mock him for an answer that failed."""
+    midnight = datetime.datetime.fromtimestamp(now).replace(
+        hour=0, minute=0, second=0, microsecond=0).timestamp()
+    rows = sorted(
+        ((float(e["ts"]), e.get("text", "")) for e in entries
+         if isinstance(e.get("ts"), (int, float)) and e["ts"] >= midnight),
+        key=lambda r: r[0])
+    from collections import defaultdict
+    buckets: dict[str, list[float]] = defaultdict(list)
+    for ts, text in rows:
+        norm = _normalize_text(text)
+        if len(norm.split()) >= 3 and _looks_like_question(text):
+            buckets[norm].append(ts)
+    best_norm = ""
+    best_ts: list[float] = []
+    for norm, ts_list in buckets.items():
+        if len(ts_list) < 2 or ts_list[-1] < now - REPEAT_QUESTION_WINDOW:
+            continue
+        prev, last = ts_list[-2], ts_list[-1]
+        if last - prev < REPEAT_RETRY_GAP:
+            continue
+        if any(_is_correction_or_retry(text) for ts, text in rows
+               if prev < ts <= prev + REPEAT_CORRECTION_WINDOW or ts > last):
+            continue
+        if len(ts_list) > len(best_ts):
+            best_norm, best_ts = norm, ts_list
+    if not best_ts:
+        return None
+    return {
+        "tell":  "repeat_question",
+        "key":   f"repeat_question:{best_norm}",
+        "n":     len(best_ts),
+        "minutes": max(1, int((now - best_ts[-2]) / 60)),
+        "text":  best_norm,
+    }
+
+
 def _detect_repeat_question(entries: list[dict]) -> dict | None:
     """Same canonical QUESTION ≥ 2× within the last 10 min (a repeated
-    request is not a repeated question)."""
+    request is not a repeated question). With BANTER_REPEAT_RETRY_SUPPRESS on,
+    that is a retry and _detect_spaced_repeat_question decides instead."""
     now = time.time()
+    if _retry_suppress_on():
+        return _detect_spaced_repeat_question(entries, now)
     cutoff = now - REPEAT_QUESTION_WINDOW
     recent = [e for e in entries
               if isinstance(e.get("ts"), (int, float)) and e["ts"] >= cutoff]

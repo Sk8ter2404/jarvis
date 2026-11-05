@@ -66,6 +66,14 @@ the action fits, else a short reason. Seven rules only:
      turn did not accept an open offer. Live 2026-10-29 18:55:26 "All
      right." ran the robot's speak action again with the same line. "Yes",
      "sure", "again" and any line with a request in it are never bare.
+  8. A look at the monitors (see_screen, recall_screen ...: core.camera_ask.
+     SCREEN_LOOK_ACTIONS) when the owner's words, or the question handed to
+     it, can only be about the physical world (v3.0.11, ACTION_FIT_CAMERA_ASK_
+     ENFORCE). Live 2026-11-05 14:58:15-23 "Jarvis, look again." after "what
+     am I holding?" ran recall_screen, then [ACTION: see_screen, what am I
+     holding?] twice: the monitors cannot show what is in his hand. "What is
+     this" may be the screen, so it never counts; "what's on my screen" is
+     not a physical ask.
 
 ``check_rule`` returns (rule number, reason) - (0, None) when the action
 fits - so the monolith can enforce rules 6 and 7 while the rest stay in
@@ -90,6 +98,7 @@ from __future__ import annotations
 import re
 from typing import Iterable, Optional, Sequence
 
+from core import camera_ask as _camera_ask
 from core.robot_words import ROBOT_WORD_STRICT
 
 MODES = ("off", "shadow", "on")
@@ -102,6 +111,7 @@ RULE_FACE_LOOK = 4
 RULE_REMARK_RERUN = 5
 RULE_ROBOT_SPEECH = 6
 RULE_ACK_REPEAT = 7
+RULE_CAMERA_ASK = 8
 
 # ── Rule 1 / 3: what counts as a list / status (read-only) action ──────────
 # A name pattern, plus a few read-only names the pattern misses. Every name
@@ -560,7 +570,8 @@ def check_rule(user_text, name, arg="",
                ack_repeat: bool = True,
                accepted_offer: bool = False,
                offer_open: bool = False,
-               offer_text: str = "") -> tuple:
+               offer_text: str = "",
+               camera_ask: bool = False) -> tuple:
     """(rule number, reason) when ``name(arg)`` misfits the owner's words,
     (0, None) when it fits - see the module docstring for the rules and
     check for ``prior_actions`` / ``reply_actions``.
@@ -574,12 +585,21 @@ def check_rule(user_text, name, arg="",
     may accept it. ``offer_text``: the offer this turn TOOK (a clear yes, or
     an affirmative acknowledgement while it was open), else "" - with
     ``robot_speaker`` on, an offer that makes the robot the speaker ("Shall
-    I have the robot say it?") lets rule 6 fit. Never raises."""
+    I have the robot say it?") lets rule 6 fit. ``camera_ask``: rule 8 is on;
+    False = no rule 8. Never raises."""
     try:
         text = _norm(user_text)
         nm = str(name or "").strip().lower()
         if not text or not nm:
             return 0, None
+        # Rule 8: the monitors for what is in front of the camera.
+        if (camera_ask and nm in _camera_ask.SCREEN_LOOK_ACTIONS
+                and (_camera_ask.is_strict_ask(text)
+                     or _camera_ask.is_strict_ask(arg))):
+            return RULE_CAMERA_ASK, (
+                f"not run: {nm} reads the monitors, and sir asked about "
+                f"what is physically in front of the camera - use "
+                f"see_user with his question")
         # Rule 7: the same action again for a bare acknowledgement or
         # decline (and no accepted offer; only a decline while an offer
         # was open).

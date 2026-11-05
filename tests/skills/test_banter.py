@@ -45,6 +45,7 @@ import types
 import unittest
 from unittest import mock
 
+import core.config as _cfg
 from tests._skill_harness import load_skill_isolated
 
 
@@ -220,8 +221,74 @@ class BanterNormalizeTests(_BanterTestBase):
         self.assertEqual(self.mod._normalize_text(""), "")
 
 
+# ─── repeat_question, a retry is not a tell (v3.0.11) ──────────────────────
+class BanterRetrySuppressTests(_BanterTestBase):
+    """Live 2026-11-05 15:01:08: "That's the 2nd time you've asked me that
+    today, sir." right after he retried an answer that had been wrong."""
+    Q = "Jarvis, what am I holding?"
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(_cfg, "BANTER_REPEAT_RETRY_SUPPRESS", True, create=True)
+        p.start()
+        self.addCleanup(p.stop)
+        # Noon today, so "today" never crosses midnight.
+        self.now = datetime.datetime.now().replace(hour=12, minute=0, second=0,
+                                                   microsecond=0).timestamp()
+        t = mock.patch.object(self.mod.time, "time", return_value=self.now)
+        t.start()
+        self.addCleanup(t.stop)
+
+    def _row(self, text, ago_min):
+        return {"ts": self.now - ago_min * 60, "iso": "x", "text": text}
+
+    def test_live_retry_is_no_tell(self):
+        self.assertIsNone(self.mod._detect_repeat_question(
+            [self._row(self.Q, 3.1), self._row(self.Q, 2.6)]))
+
+    def test_two_asks_far_apart_are_a_tell(self):
+        tell = self.mod._detect_repeat_question(
+            [self._row(self.Q, 90), self._row(self.Q, 1)])
+        self.assertEqual(tell["tell"], "repeat_question")
+        self.assertEqual(tell["n"], 2)
+        self.assertEqual(tell["minutes"], 90)
+
+    def test_an_old_pair_is_stale(self):
+        self.assertIsNone(self.mod._detect_repeat_question(
+            [self._row(self.Q, 90), self._row(self.Q, 30)]))
+
+    def test_a_corrected_answer_is_no_tell(self):
+        for fix in ("Jarvis, this is a coke can, dude.", "no, that's wrong",
+                    "look again", "try again"):
+            with self.subTest(fix=fix):
+                self.assertIsNone(self.mod._detect_repeat_question(
+                    [self._row(self.Q, 90), self._row(fix, 89),
+                     self._row(self.Q, 1)]))
+
+    def test_an_unrelated_line_after_it_changes_nothing(self):
+        self.assertIsNotNone(self.mod._detect_repeat_question(
+            [self._row(self.Q, 90), self._row("what time is it", 89),
+             self._row(self.Q, 1)]))
+
+    def test_a_correction_after_the_last_ask_is_no_tell(self):
+        self.assertIsNone(self.mod._detect_repeat_question(
+            [self._row(self.Q, 90), self._row(self.Q, 2),
+             self._row("no, that's wrong", 0.5)]))
+
+    def test_a_request_is_not_a_question(self):
+        self.assertIsNone(self.mod._detect_repeat_question(
+            [self._row("play some jazz", 90), self._row("play some jazz", 1)]))
+
+
 # ─── repeat_question detector ──────────────────────────────────────────────
 class BanterRepeatQuestionTests(_BanterTestBase):
+    """The old tell, BANTER_REPEAT_RETRY_SUPPRESS off: two asks within 10 min."""
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(_cfg, "BANTER_REPEAT_RETRY_SUPPRESS", False, create=True)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_detects_near_duplicate_within_window(self):
         entries = [
             _entry("What's the weather today", 60),

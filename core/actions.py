@@ -43,6 +43,7 @@ import time
 import urllib.parse
 import webbrowser
 
+from core import camera_ask as _camera_ask
 from core import window_scope as _window_scope
 
 
@@ -5905,6 +5906,21 @@ def _act_run_shell(command: str) -> str:
 
 # ─── Webcam snapshot + vision (Phase 4I) ───────────────────────────────
 
+_SEE_USER_SPOKEN_ASK = (
+    "The person in this webcam image asked that. Answer them directly as "
+    "\"you\", in one or two short spoken sentences, with no markdown. If you "
+    "cannot make it out, say so plainly; never guess.")
+
+
+def _camera_ask_route_on() -> bool:
+    """CAMERA_ASK_ROUTE (core/config.py), read at call time."""
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, "CAMERA_ASK_ROUTE", False))
+    except Exception:
+        return False
+
+
 def _act_see_user(camera_hint: str = "") -> str:
     """Take a snapshot from a webcam and ask Claude vision to describe the user."""
     import cv2
@@ -5954,6 +5970,11 @@ def _act_see_user(camera_hint: str = "") -> str:
         "their posture, expression, what they're wearing, and anything notable "
         "in the background."
     )
+    # His own question (v3.0.11, CAMERA_ASK_ROUTE): the answer is spoken as it
+    # stands, so it has to talk to him and may not guess.
+    if (camera_hint.strip() and _camera_ask_route_on()
+            and _camera_ask.mentions_physical(camera_hint)):
+        question = f"{question}\n\n{_SEE_USER_SPOKEN_ASK}"
     print("  [vision] Analyzing user image...", flush=True)
     result = bc.ask_vision(question, png_bytes, caller="see_user")
     print("  [vision] Got description", flush=True)

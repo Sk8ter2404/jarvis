@@ -20,6 +20,8 @@ from __future__ import annotations
 import re
 import time
 
+from core import repeat_line as _repeat_line
+
 RECALL_WINDOW_S = 60.0
 RECALL_MAX_ENTRIES = 3
 RECALL_MAX_CHARS = 300
@@ -75,6 +77,10 @@ def is_recall_question(user_text) -> bool:
         if not t or len(t) > 240:
             return False
         if _DID_YOU_KNOW_RE.match(t):
+            return False
+        # "What did you say?" (REPEAT_LAST_LINE, v3.0.11; live 2026-11-05
+        # 14:57:42) wants his last sentence, not a retelling of what ran.
+        if _repeat_line.repeat_line_on() and _repeat_line.is_repeat_ask(t):
             return False
         if _RECALL_ASK_RE.match(t) or _SURPRISE_OPEN_RE.match(t):
             return True

@@ -1971,6 +1971,90 @@ ACK_CLAIM_NO_FOLLOWUP = True
 # him ...), memory claims (NOTE_CLAIM_CHECK) or offers. False: such promises
 # are spoken as before. Applies on the next start.
 SELF_CHANGE_PROMISE_CHECK = True
+# SELF_CHANGE_RECORDS_CHECK (bool, v3.0.11; core/claim_validator._sc_records_
+# phrase) - live 2026-11-05 14:58:44 "Jarvis, this is a coke can, dude." got
+# "My apologies, sir; I'll update my visual database to include 'can' instead
+# of 'smartphone'." He has no such database and nothing ran. True (default): a
+# sentence promising to update, retrain, add to or correct his own database,
+# model, recognition or records ("my visual memory" included) is not spoken
+# when no action ran; "my apologies" stays and JARVIS says "I've no database of
+# my own to update, sir, so I can only go by what you tell me." "I'll check my
+# records" and "your records" are untouched. Needs SELF_CHANGE_PROMISE_CHECK.
+# False: such promises are spoken as before. Applies on the next start.
+SELF_CHANGE_RECORDS_CHECK = True
+# CAMERA_ASK_ROUTE (bool, v3.0.11; core/camera_ask.route_token, wired in the
+# monolith's _utterance_route_reply) - live 2026-11-05 14:58:03 "Jarvis, what
+# am I holding?" got "You're holding a box of Tic Tacs", and 14:58:31 "a
+# smartphone", with NO action run: the brain made it up. True (default): a whole
+# question about the physical world in front of the camera ("what am I holding
+# / wearing / doing", "what's in my hand", "what's this I've got", "how do I
+# look"; "what is this", "look at this", "can you see this", "what colour is
+# this" unless another action just ran or the front window just changed) runs
+# [ACTION: see_user, <his words>] before the brain, and the vision answer is
+# what gets spoken. "What's on my screen", "what is this page / error / song"
+# never match. False: the brain answers, as before (CAMERA_CLAIM_CHECK still
+# guards it). Applies on the next start.
+CAMERA_ASK_ROUTE = True
+# LOOK_RETRY_ROUTE (bool, v3.0.11; core/camera_ask.look_retry_token) - live
+# 2026-11-05 14:58:14 "Jarvis, look again." right after a camera ask ran
+# recall_screen, then see_screen twice, reading the monitors. True (default):
+# "look again / harder / closer", "take another look" within 2 minutes (and
+# "try again", "check again" within 1) of a look re-run it: see_user with the
+# earlier question after a camera look, see_screen after a screen look. Any
+# other action since then leaves the line to the brain. False: the brain
+# decides, as before. Applies on the next start.
+LOOK_RETRY_ROUTE = True
+# ACTION_FIT_CAMERA_ASK_ENFORCE (bool, v3.0.11; core/action_fit rule 8) - the
+# same live turn: [ACTION: see_screen, what am I holding?]. True (default): a
+# look at the monitors does not run when sir's words, or its own question, can
+# only be about the physical world, even while ACTION_FIT_MODE is 'shadow' (the
+# follow-up round is told to use see_user; ACTION_FIT_MODE 'off' still turns
+# every rule off). "What is this" may be the screen and never counts. False: no
+# rule 8. Applies on the next start.
+ACTION_FIT_CAMERA_ASK_ENFORCE = True
+# CAMERA_CLAIM_CHECK (bool, v3.0.11; core/claim_validator.find_camera_claim) -
+# live 2026-11-05 14:58:04 and 14:58:33: what sir was holding, stated as fact
+# with no look. True (default): in your turn a sentence saying what he is
+# holding, wearing, eating or drinking, with no camera look before it and
+# nothing in his words or a recent look to back it, is not spoken: when his
+# line was about it the look runs instead, otherwise JARVIS says "I haven't
+# actually looked, sir. Ask me to look and I will." "You're holding up well" and
+# "you are holding a meeting at 3" pass. False: spoken as before. Applies on
+# the next start.
+CAMERA_CLAIM_CHECK = True
+# CHAIN_LEAD_DEDUPE (bool, v3.0.11; core/chain_lines) - live 2026-11-05 14:58:15,
+# :20 and :23: "Apologies, sir." three times in one turn, once per follow-up
+# round. True (default): a follow-up round's lead sentence identical to one
+# already spoken this turn is not spoken again (the history keeps it). False:
+# each round says its whole reply, as before. Applies on the next start.
+CHAIN_LEAD_DEDUPE = True
+# REPEAT_LAST_LINE (bool, v3.0.11; core/repeat_line) - live 2026-11-05 14:57:42
+# "Jarvis, what did you say?" got a retelling of an earlier action result (the
+# v3.0.10 recall grounding steered it) instead of the sentence he last spoke.
+# True (default): a repeat request (core.tone_detector.is_repeat_request, but
+# not "what is that") speaks the last voiced line word for word with no brain
+# call, within 10 minutes of it (45 s for "what was that", which may be a
+# noise), and recall grounding never fires on one. False: the brain answers, as
+# before. Applies on the next start.
+REPEAT_LAST_LINE = True
+# TONE_PLAIN_RETRY_EXEMPT (bool, v3.0.11; core/tone_detector.is_plain_retry) -
+# live 2026-11-05 14:58:14 "Jarvis, look again." was tagged frustrated, then
+# voice-mood stressed, then 15 minutes of proactive suppression and a stressed
+# voice, on the one word 'again'. True (default): a whole line that is only a
+# plain retry ("look again", "try again", "check that again", with courtesy)
+# carries no mood. "No, look again", "I said try again", "try again!!" and the
+# same retry twice running are classified as before. False: 'again' counts, as
+# before. Applies on the next start.
+TONE_PLAIN_RETRY_EXEMPT = True
+# BANTER_REPEAT_RETRY_SUPPRESS (bool, v3.0.11; skills/banter._detect_repeat_
+# question) - live 2026-11-05 15:01:08 "That's the 2nd time you've asked me that
+# today, sir." fired right after he retried an answer that had been wrong. True
+# (default): the same question again within 10 minutes is a retry, not a tell,
+# and neither is one whose earlier answer he corrected ("no", "this is a ...",
+# "look again"); the tell now means two asks more than 10 minutes apart today.
+# False: two asks within 10 minutes fire it, as before. Applies on the next
+# start.
+BANTER_REPEAT_RETRY_SUPPRESS = True
 # RECALL_ACTION_GROUNDING (bool, v3.0.10, core/recall_actions) - live
 # 2026-10-29 18:54:51: 14 s after the robot's speak action ran ("The robot
 # said it, sir."), sir asked, surprised, whether it had been sent to the

@@ -491,6 +491,14 @@ from core import loop_guard as _loop_guard  # noqa: E402
 # "Wait, what? Did it send that?" - the actions of the last minute go into
 # that turn's prompt (RECALL_ACTION_GROUNDING; see _recall_action_note).
 from core import recall_actions as _recall_actions  # noqa: E402
+from core import camera_ask as _camera_ask  # noqa: E402
+from core import chain_lines as _chain_lines  # noqa: E402
+from core import repeat_line as _repeat_line  # noqa: E402
+
+# What JARVIS last voiced, whole (REPEAT_LAST_LINE, v3.0.11; _speak records it,
+# _repeat_last_line_shortcut says it back), and the owner turn it belongs to.
+_last_line = _repeat_line.LastLine()
+_last_line_turn = [0]
 _AUTOCORRECT_THRESHOLD = 0.75
 # When two candidates both clear the threshold and sit within this gap of
 # each other, the dispatcher asks 'did you mean X or Y' instead of silently
@@ -18013,6 +18021,10 @@ _TURN_FLAG_KEYS = (
     "VOICE_MOOD_CALMING_LIGHTS", "VOICE_MOOD_HONEST_ADDENDUM",
     "MEDIA_TOGGLE_NO_FOLLOWUP", "ACTION_TOPIC_GATE",
     "ACTION_TOPIC_SHARED_SKIP", "RECALL_ACTION_GROUNDING",
+    # v3.0.11 lane V: camera asks and retries, physical claims, the repeated
+    # lead line, the last line said back.
+    "CAMERA_ASK_ROUTE", "LOOK_RETRY_ROUTE", "ACTION_FIT_CAMERA_ASK_ENFORCE",
+    "CAMERA_CLAIM_CHECK", "CHAIN_LEAD_DEDUPE", "REPEAT_LAST_LINE",
     # v3.0.10 lane F: print finish / milestone lines, media AEC bounds, the
     # adaptive TV floor, the requeue supersede pass.
     "FINISH_LINE_KEEP", "PRINT_MILESTONE_SUPERSEDE",
@@ -25267,6 +25279,16 @@ class _SentenceFlushBuffer:
                     and _claim_validator.find_self_change_promise(
                         piece, ran_actions=_turn_actions_ran(),
                         user_text=_turn_user_text())):
+                self._stopped = True
+                return True
+            # "You're holding a box of Tic Tacs" (v3.0.11): held so
+            # parse_and_run_actions can run the look instead, or drop it
+            # (CAMERA_CLAIM_CHECK). Early speech cannot be unsaid.
+            if (globals().get("CAMERA_CLAIM_CHECK", True)
+                    and _claim_validator.find_camera_claim(
+                        piece, ran_actions=_turn_actions_ran(),
+                        user_text=_turn_user_text(),
+                        grounding=_camera_claim_grounding())):
                 self._stopped = True
                 return True
             # A volume / battery / temperature number nothing has read yet
@@ -37278,6 +37300,30 @@ def _video_transport_route_reply(text: str) -> "str | None":
     return tok
 
 
+def _camera_ask_route_reply(text: str) -> "str | None":
+    """The token core.camera_ask.route_token claims ``text`` with (a question
+    about the physical world in front of the camera, or a retry of the last
+    look), when its action is registered and its flag is on, read live; else
+    None. Never raises."""
+    try:
+        ask_on = bool(globals().get("CAMERA_ASK_ROUTE", True))
+        retry_on = bool(globals().get("LOOK_RETRY_ROUTE", True))
+        if not (ask_on or retry_on):
+            return None
+        with _action_history_lock:
+            hist = list(_action_history)
+        tok = _camera_ask.route_token(text, hist, ask_on=ask_on,
+                                      retry_on=retry_on,
+                                      focus_changed=_focus_changed_recently)
+    except Exception:
+        return None
+    m = _ROUTE_TOKEN_RE.match(tok) if tok else None
+    if not m or m.group(1) not in ACTIONS:
+        return None
+    print(f"  [route] camera ask -> {m.group(1)}")
+    return tok
+
+
 def _utterance_route_reply(text: str) -> "str | None":
     """The action token a registered route claims ``text`` with, or None.
     Never raises; a failing or malformed route is logged and skipped.
@@ -37302,6 +37348,13 @@ def _utterance_route_reply(text: str) -> "str | None":
     _scr_tok = _screen_route_reply(text)
     if _scr_tok:
         return _scr_tok
+    # BUILT-IN route (v3.0.11, CAMERA_ASK_ROUTE / LOOK_RETRY_ROUTE): "what am I
+    # holding?" -> see_user with his words, and "look again" after a look ->
+    # that look again (core.camera_ask). Live 2026-11-05 14:58:03 the brain made
+    # the answer up with no action run; 14:58:14 "look again" read the monitors.
+    _cam_tok = _camera_ask_route_reply(text)
+    if _cam_tok:
+        return _cam_tok
     # "Delete / close that website" = the browser tab in FRONT (2026-10-15,
     # live 22:06: the model clicked at a 'delete' button instead, twice).
     # Only when the window in front IS a browser; else the model keeps it.
@@ -44544,15 +44597,21 @@ def _self_change_promise_apply(cleaned: str) -> str:
         if not flagged:
             return cleaned
         directive = _claim_validator.is_behaviour_directive(user_text)
+        # "I'll update my visual database" (SELF_CHANGE_RECORDS_CHECK, v3.0.11;
+        # live 2026-11-05 14:58:44): he has none, so he says that, and an
+        # "My apologies, sir." in front of it stays.
+        records = any(_claim_validator.is_records_promise(p) for p in flagged)
         if directive and _self_change_note(user_text):
             line = _claim_validator.SELF_CHANGE_NOTED_LINE
+        elif records:
+            line = _claim_validator.SELF_CHANGE_RECORDS_LINE
         elif directive or not substance:
             line = _claim_validator.SELF_CHANGE_HONEST_LINE
         else:
             line = ""
         if not line:
             out = kept
-        elif substance:
+        elif substance or records:
             out = f"{kept} {line}".strip()
         else:
             lead = _SC_LEAD_TAGS_RE.match(kept or "").group(0).strip()
@@ -44563,6 +44622,78 @@ def _self_change_promise_apply(cleaned: str) -> str:
         return out
     except Exception as _e:
         print(f"  [validation] self-change check failed: {type(_e).__name__}")
+        return cleaned
+
+
+# How long a look's result still backs a claim about what he is holding.
+_CAMERA_CLAIM_GROUND_S = 300.0
+
+
+def _camera_claim_grounding() -> list:
+    """What can back "you're holding a can" besides a look this turn: what the
+    recent looks said (he may ask about the same thing again) and his recent
+    lines ("this is a coke can"). Brain replies do not count: they may be the
+    invention itself. Never raises ([])."""
+    out: list = []
+    try:
+        now = time.time()
+        with _action_history_lock:
+            hist = list(_action_history)
+        for row in hist:
+            if (str(row.get("action") or "").lower()
+                    in _claim_validator.CAMERA_GROUND_ACTIONS
+                    and now - float(row.get("at") or 0.0)
+                    <= _CAMERA_CLAIM_GROUND_S):
+                out.append(str(row.get("result") or ""))
+    except Exception:
+        pass
+    try:
+        for m in list(conversation_history[-8:]):
+            if isinstance(m, dict) and m.get("role") == "user":
+                out.append(str(m.get("content") or ""))
+    except Exception:
+        pass
+    return out
+
+
+def _camera_claim_apply(cleaned: str, results: list, ran_before) -> str:
+    """``cleaned`` without a statement of what the owner is holding, wearing or
+    doing that no look backs (CAMERA_CLAIM_CHECK, see parse_and_run_actions). A
+    look this same reply ran will report it: the guess just goes. When his line
+    was about it the look runs now and its result joins ``results`` for the
+    follow-up round; otherwise the honest line. ``cleaned`` unchanged when
+    there is no such claim. Never raises."""
+    try:
+        user_text = _turn_user_text()
+        kept, flagged, substance = _claim_validator.drop_camera_claims(
+            cleaned, ran_actions=ran_before, user_text=user_text,
+            grounding=_camera_claim_grounding())
+        if not flagged:
+            return cleaned
+        if any(str(n or "").lower() in _claim_validator.CAMERA_GROUND_ACTIONS
+               for (n, _r, _i) in results):
+            print(f"  [validation] dropped '{flagged[0]}': written before the "
+                  "look this reply ran")
+            return kept
+        if _camera_ask.mentions_physical(user_text) and "see_user" in ACTIONS:
+            q = _camera_ask.question_words(user_text)
+            print(f"  [validation] dropped '{flagged[0]}': no look ran - "
+                  "looking now")
+            res = ACTIONS["see_user"](q)
+            res = res if isinstance(res, str) else str(res)
+            record_action_history("see_user", q, res)
+            _note_turn_action_ran("see_user", res, q)
+            results.append(("see_user", res, True))
+            return ""
+        line = _claim_validator.CAMERA_CLAIM_HONEST_LINE
+        print(f"  [validation] dropped '{flagged[0]}': no look ran - said the "
+              "honest line")
+        if substance:
+            return f"{kept} {line}".strip()
+        lead = _SC_LEAD_TAGS_RE.match(kept or "").group(0).strip()
+        return f"{lead} {line}".strip()
+    except Exception as _e:
+        print(f"  [validation] camera-claim check failed: {type(_e).__name__}")
         return cleaned
 
 
@@ -44609,6 +44740,7 @@ def _action_fit_refusal(name: str, arg: str, reply_names=()) -> "str | None":
             return None
         robot_on = _action_fit_flag("ACTION_FIT_ROBOT_SPEAK_ENFORCE")
         ack_on = _action_fit_flag("ACTION_FIT_ACK_REPEAT_ENFORCE")
+        camera_on = _action_fit_flag("ACTION_FIT_CAMERA_ASK_ENFORCE")
         prior = _action_fit_prior_actions()
         fit_name, fit_arg = name, arg
         if ack_on:
@@ -44628,12 +44760,14 @@ def _action_fit_refusal(name: str, arg: str, reply_names=()) -> "str | None":
             robot_speaker=robot_on, ack_repeat=ack_on,
             accepted_offer=ack_on and _turn_accepted_offer(),
             offer_open=ack_on and _turn_offer_open(),
-            offer_text=_turn_taken_offer_text() if robot_on else "")
+            offer_text=_turn_taken_offer_text() if robot_on else "",
+            camera_ask=camera_on)
         if not reason:
             return None
         shown = f"{name}({arg})" if arg else name
         enforced = ((robot_on and rule == _action_fit.RULE_ROBOT_SPEECH)
-                    or (ack_on and rule == _action_fit.RULE_ACK_REPEAT))
+                    or (ack_on and rule == _action_fit.RULE_ACK_REPEAT)
+                    or (camera_on and rule == _action_fit.RULE_CAMERA_ASK))
         if mode != "on" and not enforced:
             print(f"  [action-fit] would block {shown}: {reason}")
             return None
@@ -45562,6 +45696,15 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
         except Exception as _sc_err:
             print(f"  [validation] self-change check failed: "
                   f"{type(_sc_err).__name__}")
+
+    # Physical claims with no look (v3.0.11, CAMERA_CLAIM_CHECK; live
+    # 2026-11-05 14:58:04 "You're holding a box of Tic Tacs, sir." and 14:58:33
+    # "You are holding a smartphone, sir." with no action run). _camera_claim_
+    # apply runs the look or says it has not looked. Only what ran BEFORE this
+    # reply backs it: prose written ahead of its own look is a guess too.
+    if (cleaned and globals().get("CAMERA_CLAIM_CHECK", True)
+            and getattr(_turn_grounding, "frame", None) is not None):
+        cleaned = _camera_claim_apply(cleaned, results, _ran_before_reply)
 
     # Invented readings (live 2026-10-09 17:53): "why can't I hear my
     # YouTube video?" -> "I'm afraid the volume is currently set to 20%,
@@ -47472,6 +47615,8 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
     # panel can render "what JARVIS just said" alongside last_transcript.
     if spoken_text:
         _write_hud_state(last_spoken=spoken_text, last_spoken_at=time.time())
+        if globals().get("REPEAT_LAST_LINE", True):
+            _last_line.note(spoken_text, turn=_last_line_turn[0])
     # Blue/green: a staging instance must not open the audio device — that
     # device belongs to prod for the duration of the smoke test. Route the
     # spoken text to data_staging/replies.jsonl instead so the pipeline
@@ -50799,6 +50944,31 @@ def _run_fast_paths(text: str) -> bool:
     return True
 
 
+def _repeat_last_line_shortcut(text: str) -> bool:
+    """REPEAT_LAST_LINE (v3.0.11, core/repeat_line): "what did you say?" speaks
+    the last voiced line word for word, with no brain call. Live 2026-11-05
+    14:57:42 the brain retold an earlier action result instead of the sentence
+    it had just said. False when off, when the line is no repeat request or
+    there is nothing fresh to repeat. Never raises."""
+    try:
+        if not globals().get("REPEAT_LAST_LINE", True):
+            return False
+        line = _last_line.line_for(text)
+        if not line:
+            return False
+        print("  [repeat] the last line, word for word")
+        print(f"  JARVIS: {line}")
+        _last_user_text[0] = text
+        _last_turn_ctx_at[0] = time.monotonic()   # TTS_TURN_CONTEXT_TTL_S
+        _append_turn(text, line)
+        _speak(line)
+        set_state("idle")
+        return True
+    except Exception as _e:
+        print(f"  [repeat] failed: {type(_e).__name__}")
+        return False
+
+
 def _run_voice_shortcuts(text: str) -> bool:
     """Normal-mode voice shortcuts that bypass the LLM round-trip: replay-
     last-action, the TTS-backend toggle, conversation-mode toggle /
@@ -50812,6 +50982,11 @@ def _run_voice_shortcuts(text: str) -> bool:
     # v3.0.8 F3: "stop" / "never mind" while a browser task runs in the
     # background cancels it (no-op when none is running).
     if _browser_bg_stop_shortcut(text):
+        return True
+    # A new owner turn: what is voiced from here on is a new "last line"
+    # (REPEAT_LAST_LINE); asking for the old one reads it first.
+    _last_line_turn[0] += 1
+    if _repeat_last_line_shortcut(text):
         return True
     # Replay-last-action voice trigger: 'do that again' / 'replay that'
     # / 'do it again' / 'do that on monitor right' — re-fires the most
@@ -52997,6 +53172,33 @@ def _persona_hygiene_apply(spoken: str, user_text: str, action_ran: bool) -> str
     return out
 
 
+def _camera_ask_after_run(spoken_text, action_results):
+    """After the first parse_and_run_actions of a routed camera ask (CAMERA_ASK_
+    ROUTE, v3.0.11): the vision model's answer is what gets spoken, with no
+    follow-up round for the brain to embroider or to chain a screen look (live
+    2026-11-05 14:58:20). No camera or a failed look is left to the normal
+    failure path. Returns (spoken_text, action_results). Never raises."""
+    try:
+        looks = [r for (n, r, _i) in action_results or ()
+                 if str(n or "").lower() in ("see_user", "look_around")]
+        if not looks:
+            return spoken_text, action_results
+        answer = _camera_ask.spoken_answer(looks[-1])
+        if not answer or _action_result_failed(looks[-1]):
+            print("  [camera-ask] no answer from the look - the normal failure "
+                  "path reports it")
+            return spoken_text, action_results
+        action_results = [
+            (n, r, False if str(n or "").lower() in ("see_user", "look_around")
+             else i) for (n, r, i) in action_results]
+        print(f"  JARVIS: {answer}")
+        conversation_history.append({"role": "assistant", "content": answer})
+        return answer, action_results
+    except Exception as _e:
+        print(f"  [camera-ask] failed: {type(_e).__name__}")
+        return spoken_text, action_results
+
+
 def _run_llm_dispatch_body(text: str) -> str:
     """Single-utterance LLM turn: the glance fast-path or a full LLM
     response, execution of any [ACTION:] tokens, then the informative /
@@ -53112,6 +53314,13 @@ def _run_llm_dispatch_body(text: str) -> str:
         spoken_text, action_results = _instant_action_after_run(
             _instant, spoken_text, action_results, ran=_instant_on,
             brain=not _instant_on and _glance_reply is None)
+    _camera_answered = False
+    if (_route_reply is not None
+            and _camera_ask.is_camera_route_token(_route_reply)):
+        _before_look = spoken_text
+        spoken_text, action_results = _camera_ask_after_run(spoken_text,
+                                                            action_results)
+        _camera_answered = spoken_text != _before_look
     # Sentence-flush streaming TTS: the leading sentence(s) may already have
     # been voiced while the reply streamed (_call_llm's flush buffer). Strip
     # exactly that prefix so they aren't spoken twice; if the whole reply was
@@ -53178,7 +53387,8 @@ def _run_llm_dispatch_body(text: str) -> str:
     # model's own prose, BEFORE the quip layer, so a random aside never flips
     # it; a skipped lead-in gets no quip. See _answer_first_drop_count.
     _af_words = 0
-    if spoken_text and not _barged and not _stream_spoken_prefix[0]:
+    if (spoken_text and not _barged and not _stream_spoken_prefix[0]
+            and not _camera_answered):
         _af_words = _answer_first_drop_count(
             reply, spoken_text, action_results, _answer_first_filler_state())
     # No "Right away, sir." before a refusal (2026-09-30): an action of this
@@ -53208,9 +53418,13 @@ def _run_llm_dispatch_body(text: str) -> str:
     # final and about to be spoken. A no-op unless the main loop armed this
     # owner turn; time-boxed, so it never holds up the speech below.
     _after_reply_ready(text, spoken_text, action_results, _barged, _barge_seq0)
+    # Every sentence voiced so far this turn (CHAIN_LEAD_DEDUPE, v3.0.11): a
+    # follow-up round's lead that repeats one is not said again.
+    _chain_spoken = _chain_lines.spoken_keys(_stream_spoken_prefix[0])
     if spoken_text and not _barged:
         _after_reply_note(spoke=_speak(spoken_text))
         _spoke_substance = _says_something(spoken_text)
+        _chain_spoken |= _chain_lines.spoken_keys(spoken_text)
 
     # Speak verbatim-result actions (version_info, system_pulse, …) directly.
     # Their result is a finished sentence the user asked for, but they're not
@@ -53429,6 +53643,15 @@ def _run_llm_dispatch_body(text: str) -> str:
         if f_spoken and globals().get("SPEECH_HYGIENE", True):
             f_spoken = _persona_hygiene_apply(f_spoken, text,
                                               bool(current_results))
+        # Live 2026-11-05 14:58:15, :20 and :23: "Apologies, sir." once per
+        # round (CHAIN_LEAD_DEDUPE). Before the quip, so none hangs off nothing;
+        # the history below keeps what the model wrote.
+        if f_spoken and globals().get("CHAIN_LEAD_DEDUPE", True):
+            f_spoken, _lead_cut = _chain_lines.drop_repeated_lead(f_spoken,
+                                                                  _chain_spoken)
+            if _lead_cut:
+                print(f"  [chain-lead] not repeating {_lead_cut} line(s) "
+                      f"already spoken this turn")
         f_spoken = _apply_quip_layer(f_spoken, current_results)
         # Append follow-up to history so context carries forward
         conversation_history.append({"role": "assistant", "content": followup})
@@ -53443,6 +53666,7 @@ def _run_llm_dispatch_body(text: str) -> str:
         if f_spoken and not _barged:
             _speak(f_spoken)
             _spoke_substance = _spoke_substance or _says_something(f_spoken)
+            _chain_spoken |= _chain_lines.spoken_keys(f_spoken)
         # A follow-up reply can itself emit a verbatim-result action (e.g. the
         # LLM chains system_pulse). Voice its result here too, deduped against
         # the follow-up prose just spoken.

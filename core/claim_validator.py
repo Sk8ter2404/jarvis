@@ -108,17 +108,23 @@ from typing import Iterable, Optional
 from core import action_fit as _action_fit
 
 __all__ = [
+    "CAMERA_CLAIM_HONEST_LINE",
+    "CAMERA_GROUND_ACTIONS",
     "NOTE_CLAIM_HONEST_LINES",
+    "SELF_CHANGE_RECORDS_LINE",
     "asks_owner",
+    "drop_camera_claims",
     "drop_note_claims",
     "drop_ungrounded_readings",
     "drop_ungrounded_screen_facts",
+    "find_camera_claim",
     "find_completed_claim",
     "find_note_claim",
     "find_ungrounded_reading",
     "find_ungrounded_screen_fact",
     "find_unverified_claim",
     "is_progress_only",
+    "is_records_promise",
     "looks_like_question",
     "note_claim_honest_line",
     "reading_was_read",
@@ -2275,11 +2281,118 @@ _SC_NOT_RE = re.compile(
     r"schedul\w*|calendar|appointment)\b")
 
 
+# A promise to change his OWN records (v3.0.11, SELF_CHANGE_RECORDS_CHECK). Live
+# 2026-11-05 14:58:44 "Jarvis, this is a coke can, dude." got "My apologies,
+# sir; I'll update my visual database to include 'can' instead of 'smartphone'."
+# He has no such database and nothing ran. A sentence is such a promise (or
+# claim) when JARVIS says, in the future or as done, that he updates, retrains,
+# adds to or corrects his database, model, recognition or records. Checked
+# BEFORE _SC_NOT_RE, whose "memory" must not let "my visual memory" through.
+# "I'll check my records" changes nothing, and "your records" / "the calendar"
+# are not his own. "My apologies" stays: only the clause with the promise goes.
+_SC_REC_VERB = (r"(?:update|updat\w+|retrain\w*|train|training|add|adding|added|"
+                r"amend\w*|correct\w*|revis\w+|refresh\w*|recalibrat\w+|fix|"
+                r"fixed|fixing|tweak\w*|adjust\w*|chang\w+|modif\w+|log|logg\w+|"
+                r"record|recording|recorded|note|noted|file|filed|filing|store|"
+                r"stored|storing|save|saved|saving|teach|taught|include|"
+                r"included|make\s+a\s+note|made\s+a\s+note)")
+_SC_REC_ADJ = (r"(?:visual|image|object|vision|recognition|optical|sight|"
+               r"camera|internal|own)")
+_SC_REC_THING = (r"(?:data\s*bases?|db|data\s*sets?|training\s+data|models?|"
+                 r"classifiers?|recognition|records?|knowledge\s+base|"
+                 r"lexicon|vocabulary|catalog(?:ue)?|library|index)")
+_SC_REC_TARGET = (
+    r"\b(?:my\s+(?:(?:own\s+)?" + _SC_REC_ADJ + r"\s+)*" + _SC_REC_THING
+    + r"|(?:my|the)\s+(?:(?:own|internal)\s+)?(?:visual|image|object|vision)\s+"
+    r"(?:memory|memories|banks?|systems?|algorithms?|sensors?|processing|"
+    r"files?|" + _SC_REC_THING + r")"
+    r"|my\s+memory\s+banks?)\b")
+_SC_REC_DOER = (
+    r"(?:\b(?:i'?ll|i\s+will|i\s+shall|i'?m\s+going\s+to|i\s+am\s+going\s+to|"
+    r"i'?m\s+gonna|let\s+me|allow\s+me\s+to|i'?m|i\s+am|i'?ve|i\s+have|i\s+just|"
+    r"i)\s+"
+    r"(?:(?:also|now|certainly|definitely|just|simply|then|absolutely|"
+    r"personally|already|immediately|be\s+sure\s+to|make\s+sure\s+to|"
+    r"be|have)\s+)*)")
+_SC_RECORDS_RE = re.compile(_SC_REC_DOER + r"\b" + _SC_REC_VERB
+                            + r"\b(?!\s+(?:you|sir)\b)[^.!?;]{0,80}?"
+                            + _SC_REC_TARGET)
+_SC_RECORDS_DONE_RE = re.compile(
+    r"\bmy\s+(?:(?:own\s+)?" + _SC_REC_ADJ + r"\s+)*" + _SC_REC_THING
+    + r"\s+(?:has|have|is|are)\s+(?:now\s+)?(?:been\s+)?"
+    r"(?:updated|corrected|retrained|amended|revised)\b")
+_SC_RECORDS_NOT_RE = re.compile(
+    r"\b(?:can'?t|cannot|won'?t|unable|don'?t|do\s+not|haven'?t|have\s+no|"
+    r"i\s+could|i\s+can|if\s+you|would\s+you|shall\s+i|should\s+i|"
+    r"want\s+me\s+to|no\s+\w*\s*(?:database|model|records?))\b")
+SELF_CHANGE_RECORDS_LINE = ("I've no database of my own to update, sir, so "
+                            "I can only go by what you tell me.")
+
+
+def _sc_records_on() -> bool:
+    """SELF_CHANGE_RECORDS_CHECK (core/config.py), read at call time. Never
+    raises."""
+    try:
+        from core import config as _cfg
+        return bool(getattr(_cfg, "SELF_CHANGE_RECORDS_CHECK", False))
+    except Exception:
+        return False
+
+
+def _sc_records_phrase(low: str) -> Optional[str]:
+    """The promise when the normalised sentence promises a change to JARVIS's
+    own database, model, recognition or records."""
+    if _OFFER_RE.search(low) or _SC_RECORDS_NOT_RE.search(low):
+        return None
+    m = _SC_RECORDS_RE.search(low) or _SC_RECORDS_DONE_RE.search(low)
+    return m.group(0).strip() if m else None
+
+
+def is_records_promise(phrase_or_text) -> bool:
+    """True when this text carries a promise to change his own records (the
+    honest answer is then SELF_CHANGE_RECORDS_LINE). Never raises."""
+    try:
+        low = _norm(str(phrase_or_text or ""))
+        return (bool(low) and "?" not in low and _sc_records_on()
+                and _sc_records_phrase(low) is not None)
+    except Exception:
+        return False
+
+
+# The clause before a records promise, when it is only courtesy: "My apologies,
+# sir; I'll update ..." keeps "My apologies, sir."
+_SC_REC_LEAD_SPLIT_RE = re.compile(
+    r"^(?P<lead>[^;:]{1,60}?)\s*(?:[;:—–]|\s-\s|,)\s*(?=(?:i'?ll|i\s+will|"
+    r"i\s+shall|i'?m|i\s+am|i'?ve|i\s+have|let\s+me|allow\s+me)\b)",
+    re.IGNORECASE)
+_SC_REC_COURTESY_RE = re.compile(
+    r"^(?:(?:my|many|sincere|profuse)\s+)*(?:apolog\w+|sorry|pardon|mistake|"
+    r"error|bad|quite\s+right|right|understood|of\s+course|indeed|very\s+good|"
+    r"noted|fair\s+enough|thank\s+you|thanks|ah|oh|i\s+stand\s+corrected)\b",
+    re.IGNORECASE)
+
+
+def _sc_keep_courtesy(part: str) -> str:
+    """The courtesy clause in front of a records promise, as its own sentence,
+    else ""."""
+    m = _SC_REC_LEAD_SPLIT_RE.match(part.strip())
+    if not m:
+        return ""
+    lead = m.group("lead").strip()
+    if not _SC_REC_COURTESY_RE.match(lead):
+        return ""
+    return lead if lead[-1:] in ".!?" else lead + "."
+
+
 def _sc_sentence(sentence: str) -> Optional[str]:
     """The promise phrase when ``sentence`` is a self-change promise."""
     low = _norm(sentence)
     if not low or "?" in low:
         return None
+    if _sc_records_on():
+        got = _sc_records_phrase(low)
+        if got:
+            return got
     if _OFFER_RE.search(low) or _SC_NOT_RE.search(low):
         return None
     m = _SC_CHANGE_RE.search(low)
@@ -2343,6 +2456,10 @@ def drop_self_change_promises(text: str, *, ran_actions: Iterable[str] = (),
             got = _sc_sentence(part)
             if got:
                 flagged.append(got)
+                if _sc_records_on() and _sc_records_phrase(_norm(part)):
+                    courtesy = _sc_keep_courtesy(part)
+                    if courtesy:
+                        kept.append(courtesy)
             else:
                 kept.append(part.strip())
         if not flagged:
@@ -2384,3 +2501,175 @@ def is_behaviour_directive(user_text: str) -> bool:
         return _SC_DIRECTIVE_RE.search(low) is not None
     except Exception:
         return False
+
+
+# ── Physical claims with no look (v3.0.11, CAMERA_CLAIM_CHECK) ────────────────
+# Live 2026-11-05 14:58:04 "Jarvis, what am I holding?" got "You're holding a
+# box of Tic Tacs, sir." and 14:58:33 "You are holding a smartphone, sir." with
+# no action run: pure invention, spoken as fact. core.camera_ask claims such a
+# question before the brain; this is what is left when the brain still says it.
+# A sentence is such a claim when it says what the owner is holding, wearing,
+# eating or drinking ("you're holding a ...", "you appear to be wearing ...",
+# "that's a ... in your hand") and neither a camera look that ran before this
+# reply nor his own words say so. When his line was a strict camera ask, any
+# flat description is one too ("It's a can, sir.", "You're typing."). Narrow:
+# never "you're holding up well", "you are holding a meeting at 3", "while
+# you're holding the door", a question, or "I can't see what you're holding".
+_CC_SUBJECT = (r"(?:you(?:'re|\s+are)|you\s+(?:appear|seem|look)\s+to\s+be|"
+               r"looks?\s+like\s+you(?:'re|\s+are)|"
+               r"i\s+(?:can\s+)?see\s+(?:that\s+)?you(?:'re|\s+are))")
+_CC_ADVERB = (r"(?:(?:currently|just|still|now|clearly|obviously|quite|merely|"
+              r"simply|apparently|actually|plainly)\s+)*")
+_CC_VERB = (r"(?:holding(?:\s+up)?|wearing|clutching|gripping|brandishing|"
+            r"sporting|drinking|eating|sipping)")
+_CC_OBJECT = (r"(?P<obj>(?:(?:a|an|the|some|your|two|three|"
+              r"what\s+(?:appears|looks|seems)\s+(?:to\s+be|like))\s+"
+              r"[^.!?;,]{1,60}|glasses|sunglasses|headphones|nothing|something|"
+              r"coffee|water|soda))")
+_CC_CLAIM_RE = re.compile(r"\b" + _CC_SUBJECT + r"\s+" + _CC_ADVERB + _CC_VERB
+                          + r"\s+" + _CC_OBJECT)
+_CC_HAND_RE = re.compile(
+    r"\b(?:you\s+have|you'?ve\s+got|you\s+have\s+got|that'?s|that\s+is|"
+    r"there'?s|there\s+is|it'?s|it\s+is)\s+(?P<obj>[^.!?;,]{1,60}?)\s+in\s+your\s+"
+    r"(?:left\s+|right\s+)?hands?\b")
+# Set phrases and things no camera could see.
+_CC_IDIOM_RE = re.compile(
+    r"^(?:(?:a|an|the|some|your|two|three)\s+)?(?:(?:big|small|quick|short|"
+    r"long|team|video|conference|board|staff|sales)\s+)*"
+    r"(?:meetings?|calls?|conferences?|webinars?|seminars?|sessions?|workshops?|"
+    r"events?|party|parties|class(?:es)?|lectures?|interviews?|sales?|votes?|"
+    r"grudges?|records?|leads?|positions?|stakes?|shares?|stocks?|bonds?|lot|"
+    r"licen[cs]es?|patents?|degrees?|titles?|office|views?|opinions?|beliefs?|"
+    r"torch|line|fort|floor|reins|cards|breath|ground|own|nerve|tongue|horses|"
+    r"peace|fire|thought|process|show|queue|traffic|project|heart|words?|"
+    r"patience)\b")
+# "if you're holding ...", "while you're wearing ...": not a statement of fact.
+_CC_PRE_RE = re.compile(
+    r"\b(?:if|when|while|as|unless|whether|what|whatever|because|since|once|"
+    r"until|that|before|after|though|although|assuming|suppose|provided)"
+    r"\s+$")
+# A flat description, counted only after a strict camera ask.
+_CC_ASKED_RE = re.compile(
+    r"^(?:(?:well|ah|oh|right|sir)[,\s]+)*(?:you(?:'re|\s+are)|it(?:'s|\s+is)|"
+    r"that(?:'s|\s+is)|this\s+is|those\s+are|looks\s+like|you\s+look|"
+    r"you\s+(?:appear|seem)|i\s+(?:can\s+)?see)\b")
+_CC_ASKED_NOT_RE = re.compile(
+    r"\b(?:can'?t|cannot|not|don'?t|unable|haven'?t|no\s+idea|unsure|let\s+me|"
+    r"allow\s+me|one\s+moment|i'?ll|i\s+will|checking|looking|take\s+a\s+look|"
+    r"have\s+a\s+look|hard\s+to\s+(?:say|tell))\b")
+_CC_STOPWORDS = frozenset({
+    "what", "appears", "looks", "seems", "like", "the", "some", "your", "two",
+    "three", "that", "this", "with", "and", "for", "sir", "little", "bit",
+    "pair", "kind", "sort", "type", "piece", "one", "looking"})
+# The actions whose result can say what he holds or does (a face match cannot).
+CAMERA_GROUND_ACTIONS = frozenset({"see_user", "look_around", "where_am_i",
+                                   "situational_awareness"})
+CAMERA_CLAIM_HONEST_LINE = ("I haven't actually looked, sir. Ask me to look and "
+                            "I will.")
+
+
+def _cc_grounded(obj: str, sources: Iterable[str]) -> bool:
+    """True when a word of the claimed thing is in his words or a look's
+    result."""
+    hay = " ".join(str(s or "") for s in sources).lower()
+    if not hay.strip():
+        return False
+    for w in re.findall(r"[a-z][a-z'-]{2,}", str(obj or "").lower()):
+        if w in _CC_STOPWORDS:
+            continue
+        stem = w[:-1] if w.endswith("s") and len(w) > 3 else w
+        if re.search(r"\b" + re.escape(stem) + r"s?\b", hay):
+            return True
+    return False
+
+
+def _cc_sentence(sentence: str, sources: Iterable[str],
+                 asked: bool) -> Optional[str]:
+    """The claim phrase when ``sentence`` states a physical fact nothing
+    grounds."""
+    low = _norm(sentence)
+    if not low or "?" in low:
+        return None
+    for m in list(_CC_CLAIM_RE.finditer(low)) + list(_CC_HAND_RE.finditer(low)):
+        obj = m.group("obj").strip()
+        if _CC_IDIOM_RE.match(obj) or _CC_PRE_RE.search(low[:m.start()]):
+            continue
+        if _cc_grounded(obj, sources):
+            continue
+        return m.group(0).strip()
+    if asked and _CC_ASKED_RE.match(low) and not _CC_ASKED_NOT_RE.search(low):
+        if not _cc_grounded(low, list(sources)[1:]):
+            return low[:80]
+    return None
+
+
+def _cc_setup(ran_actions: Iterable[str], user_text: str,
+              grounding: Iterable[str]):
+    """(what grounds a claim, his words first; his line was a strict camera
+    ask), or None when a camera look already ran."""
+    for n in ran_actions or ():
+        if str(n or "").strip().lower() in CAMERA_GROUND_ACTIONS:
+            return None
+    from core import camera_ask as _camera_ask
+    return ([user_text] + list(grounding or ()),
+            _camera_ask.is_strict_ask(user_text))
+
+
+def find_camera_claim(text: str, *, ran_actions: Iterable[str] = (),
+                      user_text: str = "", grounding: Iterable[str] = ()
+                      ) -> Optional[str]:
+    """The phrase when ``text`` states what the owner is holding, wearing or
+    doing and no camera look grounds it (see the section comment), else None.
+    ``grounding``: what recent looks said, and his recent words. Never
+    raises."""
+    try:
+        if not text or not str(text).strip():
+            return None
+        setup = _cc_setup(ran_actions, user_text, grounding)
+        if setup is None:
+            return None
+        sources, asked = setup
+        for sentence in _SENTENCE_SPLIT_RE.split(str(text)):
+            got = _cc_sentence(sentence, sources, asked)
+            if got:
+                return got
+    except Exception:
+        return None
+    return None
+
+
+def drop_camera_claims(text: str, *, ran_actions: Iterable[str] = (),
+                       user_text: str = "", grounding: Iterable[str] = ()
+                       ) -> tuple:
+    """(``text`` without its physical claims, [the phrases], whether what is
+    left says something of substance). Leading [tags] are kept. ``text``
+    unchanged, [] and True when there is no such claim. Never raises."""
+    try:
+        setup = _cc_setup(ran_actions, user_text, grounding)
+        if setup is None or not text or not str(text).strip():
+            return text, [], True
+        sources, asked = setup
+        src = str(text)
+        lead = _NC_LEAD_TAGS_RE.match(src).group(0)
+        kept: list = []
+        flagged: list = []
+        for part in _NC_PIECE_SPLIT_RE.split(src[len(lead):]):
+            if not part or not part.strip():
+                continue
+            got = _cc_sentence(part, sources, asked)
+            if got:
+                flagged.append(got)
+            else:
+                kept.append(part.strip())
+        if not flagged:
+            return text, [], True
+        substance = any(
+            _substantive(_strip_leadins(c.strip()))
+            for k in kept for c in _CLAUSE_SPLIT_RE.split(_norm(k)))
+        if kept and kept[0][:1].isalpha():
+            kept[0] = kept[0][0].upper() + kept[0][1:]
+        out = " ".join(kept).strip()
+        out = (lead.strip() + " " + out).strip() if lead.strip() else out
+        return out, flagged, substance
+    except Exception:
+        return text, [], True

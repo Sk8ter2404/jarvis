@@ -92,7 +92,8 @@ class RepeatRequestTests(unittest.TestCase):
     def test_frustrated_repeats_stay_frustrated(self):
         for text in ("say that again, you idiot",
                      "that's wrong, say it again", "I said say that again",
-                     "do it again", "try again", "say it again damn it",
+                     "do it again", "try again, damn it",
+                     "say it again damn it",
                      "no, say it again", "ugh, say that again"):
             with self.subTest(text=text):
                 self.assertEqual(et.classify_emotion(text, DAY).label,

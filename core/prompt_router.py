@@ -119,6 +119,10 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "WEBCAM AWARENESS": [
         "camera", "webcam", "see me", "can you see", "pointed at me",
         "look at me", "how do i look",
+        # v3.0.11: the see_user line (live 2026-11-05 14:58:03 "what am I
+        # holding?" was invented, with no action run).
+        "am i holding", "am i wearing", "in my hand", "i'm holding",
+        "i'm wearing",
     ],
     # UNIFIED documents camera_status / situational_awareness (where_am_i) /
     # look_around — cover every trigger phrase its body spells out, not just

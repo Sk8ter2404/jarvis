@@ -37,7 +37,8 @@ from typing import Optional
 
 # One definition of "repeating himself", shared with the tone detector so the
 # two classifiers cannot drift apart on it. Stdlib-only, import-light.
-from core.tone_detector import is_repeat_request, is_restatement
+from core.tone_detector import (is_repeat_request, is_restatement,
+                                plain_retry_carries_no_mood)
 # v3.0.10: "say <X>" carries no mood, and a lone swear word is not stress
 # (VOICE_MOOD_QUOTED_WORDS_IGNORED / VOICE_MOOD_SWEAR_ALONE_STRESSED, read at
 # call time, the same switches the tone detector reads).
@@ -368,6 +369,12 @@ def classify_emotion(
         frust_phrase = swear_phrase = stress_phrase = None
         clipped = False
         excl_count = 0
+    # "Look again" (TONE_PLAIN_RETRY_EXEMPT, v3.0.11; live 2026-11-05 14:58:14
+    # "[emotion] frustrated (phrase='again')"): a plain retry's words carry no
+    # emotion. "!!" and the same retry twice running still do.
+    elif plain_retry_carries_no_mood(clean, prev_user_text, excl_count):
+        frust_phrase = swear_phrase = stress_phrase = None
+        clipped = False
     if frust_phrase or (swear_phrase and clipped):
         return _build(
             "frustrated",

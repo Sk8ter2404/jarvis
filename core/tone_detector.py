@@ -287,6 +287,48 @@ def is_repeat_request(text) -> bool:
         return False
 
 
+# A plain retry (v3.0.11, TONE_PLAIN_RETRY_EXEMPT; live 2026-11-05 14:58:14
+# "Jarvis, look again." came out 'frustrated', then voice-mood stressed, then
+# 15 minutes of proactive suppression and a stressed voice, on the one word
+# "again"). The WHOLE line is a retry with nothing but courtesy around it, so a
+# real marker still counts: "no, look again", "ugh, try again", "I said try
+# again", "try again, damn it" and "open it again" are classified as before.
+_PLAIN_RETRY_RE = re.compile(
+    rf"(?:{_REPEAT_FILLER} )*"
+    r"(?:(?:can|could|would|will) you )?(?:please )?"
+    r"(?:(?:look|try|check|recheck)(?: (?:at )?(?:it|that|this))?"
+    r"|(?:have|take) a look)"
+    r" (?:again|once more|one more time)"
+    rf"(?: {_REPEAT_FILLER})*")
+
+
+def is_plain_retry(text) -> bool:
+    """True when the whole utterance is a plain retry ("look again", "try
+    again", "check that again"), with nothing else in it but courtesy. Never
+    raises."""
+    try:
+        t = _clean(text)
+        return bool(t) and len(t) <= 120 and bool(_PLAIN_RETRY_RE.fullmatch(t))
+    except Exception:
+        return False
+
+
+def plain_retry_carries_no_mood(clean, prev_user_text=None,
+                                excl_count: int = 0) -> bool:
+    """TONE_PLAIN_RETRY_EXEMPT (core/config.py): the words of this line carry
+    no mood because it is a plain retry. "!!" and saying the same retry twice
+    running still count as push-back. Shared with core.emotion_tracker. Never
+    raises."""
+    try:
+        return (_config_flag("TONE_PLAIN_RETRY_EXEMPT", False)
+                and excl_count < 2
+                and is_plain_retry(clean)
+                and _clean(clean) != _clean(prev_user_text or "")
+                and not is_restatement(clean, prev_user_text))
+    except Exception:
+        return False
+
+
 def _config_flag(name: str, old: bool) -> bool:
     """A core.config bool read at CALL time (tests patch core.config). Any
     trouble reading it - no package on sys.path when run as a script - keeps
@@ -395,6 +437,10 @@ def detect_tone(user_text: str, prev_user_text: str | None = None,
     # "Jarvis, say <X>" (VOICE_MOOD_QUOTED_WORDS_IGNORED, v3.0.10): the words
     # are the line to say, so they carry no tone; only the clock still does.
     if quoted_words_ignored() and is_quote_request(clean):
+        return "late_night" if _late_night_tone_applies() else None
+    # "Look again" (TONE_PLAIN_RETRY_EXEMPT, v3.0.11): a plain retry is no
+    # tone either; only the clock still counts.
+    if plain_retry_carries_no_mood(clean, prev_user_text, excl_count):
         return "late_night" if _late_night_tone_applies() else None
 
     def _has_any(phrases) -> bool:

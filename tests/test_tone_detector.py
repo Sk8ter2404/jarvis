@@ -286,7 +286,8 @@ class RepeatRequestTests(unittest.TestCase):
                     "sorry I wasn't listening, say that again")
     MORE_FRUSTRATED = ("say that again, you idiot",
                        "that's wrong, say it again", "I said say that again",
-                       "do it again", "try again", "say it again damn it",
+                       "do it again", "try again, damn it",
+                       "say it again damn it",
                        "no, say it again", "ugh, say that again")
 
     def test_more_didnt_hear_phrasings_are_neutral(self):
