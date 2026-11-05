@@ -1010,6 +1010,107 @@ class GatherAndFireTests(unittest.TestCase):
             out = self.mod._gather_sections()
         self.assertEqual(set(out.values()), {""})   # all sections dropped
 
+    # ── ARRIVAL_SAY_WHAT_FAILED / ARRIVAL_NEWS_WAIT_FOR_BRAIN (v3.0.11) ──
+    def _sections(self, news, **others):
+        names = ("weather", "teams", "print", "deliveries", "calendar")
+        patches = [mock.patch.object(self.mod, "_section_news", side_effect=news)]
+        for n in names:
+            patches.append(mock.patch.object(
+                self.mod, f"_section_{n}", return_value=others.get(n, "")))
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    @staticmethod
+    def _slow(seconds, text="Headlines here"):
+        def _fn():
+            time.sleep(seconds)
+            return text
+        return _fn
+
+    def _warming(self, on=True):
+        from core import brain_warmup
+        brain_warmup.note_done()
+        self.addCleanup(brain_warmup.note_done)
+        if on:
+            brain_warmup.note_start()
+
+    def test_a_timed_out_section_is_not_called_nothing_of_note(self):
+        # Live 2026-11-05 10:54:24.
+        self._warming(False)
+        self._sections(self._slow(0.3))
+        with mock.patch.object(self.mod, "SECTION_TIMEOUT_SECONDS", 0.02):
+            out = self.mod._build_briefing()
+        self.assertNotIn("Nothing of note", out)
+        self.assertIn("Good morning, sir.", out)
+        self.assertIn("I couldn't get the news just now.", out)
+
+    def test_two_failed_sections_are_both_named(self):
+        self._warming(False)
+        self._sections(self._slow(0.3))
+        with mock.patch.object(self.mod, "SECTION_TIMEOUT_SECONDS", 0.02), \
+             mock.patch.object(self.mod, "_section_calendar",
+                               side_effect=RuntimeError("boom")):
+            out = self.mod._build_briefing()
+        self.assertIn("I couldn't get the calendar or the news just now.", out)
+
+    def test_truly_nothing_still_says_nothing_of_note(self):
+        self._warming(False)
+        self._sections(lambda: "")
+        self.assertIn("Nothing of note overnight.", self.mod._build_briefing())
+
+    def test_a_briefing_with_news_of_its_own_does_not_apologise(self):
+        self._warming(False)
+        self._sections(self._slow(0.3), weather="Rain later")
+        with mock.patch.object(self.mod, "SECTION_TIMEOUT_SECONDS", 0.02):
+            out = self.mod._build_briefing()
+        self.assertIn("Rain later.", out)
+        self.assertNotIn("couldn't", out)
+        self.assertNotIn("Nothing of note", out)
+
+    def test_failed_wording_can_be_turned_off(self):
+        from core import config as cfg
+        self._warming(False)
+        self._sections(self._slow(0.3))
+        with mock.patch.object(self.mod, "SECTION_TIMEOUT_SECONDS", 0.02), \
+             mock.patch.object(cfg, "ARRIVAL_SAY_WHAT_FAILED", False,
+                               create=True):
+            out = self.mod._build_briefing()
+        self.assertIn("Nothing of note overnight.", out)
+
+    def test_news_gets_longer_while_the_brain_warms_up(self):
+        from core import config as cfg
+        self._warming(True)
+        self._sections(self._slow(0.2))
+        with mock.patch.object(self.mod, "SECTION_TIMEOUT_SECONDS", 0.02), \
+             mock.patch.object(cfg, "ARRIVAL_NEWS_WARMUP_TIMEOUT_S", 5.0,
+                               create=True):
+            parts = self.mod._gather_sections()
+        self.assertEqual(parts["news"], "Headlines here")
+        self.assertEqual(self.mod._last_failed, [])
+
+    def test_the_warmup_extension_has_a_hard_cap(self):
+        from core import config as cfg
+        self._warming(True)
+        self._sections(self._slow(0.5))
+        with mock.patch.object(self.mod, "SECTION_TIMEOUT_SECONDS", 0.02), \
+             mock.patch.object(cfg, "ARRIVAL_NEWS_WARMUP_TIMEOUT_S", 0.05,
+                               create=True):
+            t0 = time.monotonic()
+            parts = self.mod._gather_sections()
+        self.assertEqual(parts["news"], "")
+        self.assertEqual(self.mod._last_failed, ["news"])
+        self.assertLess(time.monotonic() - t0, 0.45)
+
+    def test_no_extension_once_the_brain_is_warm_or_with_the_flag_off(self):
+        from core import config as cfg
+        self._warming(False)
+        self.assertEqual(self.mod._news_warmup_cap(), 0.0)
+        self._warming(True)
+        with mock.patch.object(cfg, "ARRIVAL_NEWS_WAIT_FOR_BRAIN", False,
+                               create=True):
+            self.assertEqual(self.mod._news_warmup_cap(), 0.0)
+
     def test_compose_within_budget_break_after_single_drop(self):
         # news is empty (the first TTS_DROP_ORDER key → `continue`), weather is
         # the oversized payload; dropping weather brings it under → loop breaks.

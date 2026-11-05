@@ -343,6 +343,37 @@ class GateTests(_Base):
                                                            now=10.0))
         self.assertEqual(self.setup_calls, [])
 
+    def test_media_a_moment_ago_ignores(self):
+        """Live 2026-11-05 11:05:19: 25 s after the room music "ended", in a
+        gap of what was playing (CLAP_MEDIA_WIDE)."""
+        bc = self.bc()
+        bc._clap_media_recent = lambda: True
+        self.assertIn("a moment ago",
+                      self.mod.handle_double_clap(bc, _event(), now=10.0))
+        self.assertEqual(self.setup_calls, [])
+
+    def test_nothing_playing_lately_still_fires(self):
+        bc = self.bc()
+        bc._clap_media_recent = lambda: False
+        self.assertEqual(self.mod.handle_double_clap(bc, _event(), now=10.0),
+                         "fired")
+
+    def test_the_wide_check_can_be_turned_off(self):
+        from core import config as cfg
+        bc = self.bc()
+        bc._clap_media_recent = lambda: True
+        with mock.patch.object(cfg, "CLAP_MEDIA_WIDE", False, create=True):
+            self.assertEqual(
+                self.mod.handle_double_clap(bc, _event(), now=10.0), "fired")
+
+    def test_a_broken_wide_check_does_not_lose_the_clap(self):
+        def _boom():
+            raise RuntimeError("boom")
+        bc = self.bc()
+        bc._clap_media_recent = _boom
+        self.assertEqual(self.mod.handle_double_clap(bc, _event(), now=10.0),
+                         "fired")
+
     def test_music_jarvis_started_recently_ignores(self):
         bc = self.bc()
         bc._jarvis_played_music_at = [time.time() - 120.0]

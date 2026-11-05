@@ -1162,6 +1162,43 @@ MEDIA_HOLD_PASS_ASKED      = True
 MEDIA_HOLD_ALBUM_IS_MUSIC  = True
 MEDIA_HOLD_SIGNAL_CACHE_S  = 5
 
+# PENDING_SOURCE_POLICY (bool, v3.0.11; core/pending_policy) - live 2026-11-05
+# 10:54:24-10:55:06: the queue survives a restart and nothing limited how old a
+# queued line could be, so the evening briefing and recap of 2026-10-29 22:30, a
+# clap "You rang, sir?" and a mic-change line waited seven days on disk and were
+# spoken in the morning, with a week-old forecast and headlines. True: one table
+# (core/pending_policy.QUEUE_RULES) says per kind of line how old it may be and
+# whether it may go into the "While you were away" recap: a clap acknowledgement
+# 10 s, a mic change 5 min, a RAM alert 3 min (none of them ever folded; live
+# 12:55:14 and 14:44:19 for RAM), a briefing or digest 6 h (never cut to a
+# fragment), anything else 24 h; "Good evening" is not spoken between 04:00 and
+# 17:00 unless it was queued in the last 2 minutes (he asked for it). His own
+# timers, schedules, promises, the guard alert and urgent lines are untouched.
+# False: every queued line waits as long as it takes, as before. Applies on the
+# next start.
+PENDING_SOURCE_POLICY = True
+# PENDING_GREETING_FIRST (bool, v3.0.11; core/pending_policy.greeting_first) -
+# live 2026-11-05: "Good morning, sir." queued 10:54:24 was spoken at 10:55:11,
+# last, behind the recap, because the queue is first in, first out. True: a
+# queued greeting goes ahead of everything but his own reminders and urgent
+# lines. False: strict queue order. Applies on the next start.
+PENDING_GREETING_FIRST = True
+
+# ARRIVAL_NEWS_WAIT_FOR_BRAIN (bool, v3.0.11; skills/daily_briefing/arrival_v2) -
+# live 2026-11-05: the arrival's news section timed out at 10:54:24 under its 8 s
+# limit, the brain's boot warm-up finished at 10:54:26 and the three headline
+# summaries then ran for nothing. True: while the warm-up is still running the
+# news section gets up to ARRIVAL_NEWS_WARMUP_TIMEOUT_S from the start of the
+# gathering (the hard cap; every other section keeps its 8 s). False: 8 s always.
+ARRIVAL_NEWS_WAIT_FOR_BRAIN = True
+ARRIVAL_NEWS_WARMUP_TIMEOUT_S = 25.0
+# ARRIVAL_SAY_WHAT_FAILED (bool, v3.0.11; arrival_v2._compose_briefing) - same
+# moment: "Nothing of note overnight." was said although a section had been
+# dropped, not found empty. True: when nothing can be said and a section timed
+# out or crashed, the line says which ("I couldn't get the news just now.").
+# False: "Nothing of note overnight." as before.
+ARRIVAL_SAY_WHAT_FAILED = True
+
 # Arrival spacing (v3.0.10, core/arrival_quiet.py). Live 2026-10-29 07:21-07:23
 # he walked in to a "while you were away" recap, the morning briefing, a
 # pattern offer and a stretch nudge inside 90 s; the nudge ("You've been on
@@ -2404,6 +2441,15 @@ CLAP_TRIGGER_ACTION = "acknowledge"
 CLAP_TRIGGER_WAKE = False
 CLAP_TRIGGER_COOLDOWN_S = 60.0
 CLAP_TRIGGER_MIN_PEAK = 0.12
+# CLAP_MEDIA_WIDE (bool, v3.0.11; skills/clap_trigger, bobert_companion.
+#   _clap_media_recent) - live 2026-11-05 11:05:19: a double clap fired 25 s
+#   after the room-music detector said "music ended" (it came back at 11:05:55),
+#   in a gap the media checks could not see. True: a clap is also ignored while
+#   the music gate's PC-audio reading says playing, while the media hold is on,
+#   and for CLAP_MEDIA_LINGER_S after that reading last said playing. With nothing
+#   playing a clap still fires. False: only the checks at the moment of the clap.
+CLAP_MEDIA_WIDE = True
+CLAP_MEDIA_LINGER_S = 30.0
 
 
 # ─── Phone pings (core/phone_ping.py, skills/phone_bridge.py) ──────────

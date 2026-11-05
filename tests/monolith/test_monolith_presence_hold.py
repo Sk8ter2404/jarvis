@@ -292,7 +292,9 @@ class ReturnRecapTests(_Base):
     def test_a_stale_briefing_is_spoken_whole(self):
         brief = "Good evening, sir. 12 voice interactions logged today."
         self._write([self._e(brief, "evening", age_s=45 * 60)])
-        self._drain()
+        # v3.0.11 (PENDING_SOURCE_POLICY): at 22:45, not whenever the suite runs.
+        with mock.patch("core.pending_policy._local_hour", return_value=22):
+            self._drain()
         self.assertEqual(self.spoke, [brief])
 
     def test_fresh_lines_are_spoken_as_they_are(self):

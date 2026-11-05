@@ -100,6 +100,15 @@ TTS_CHARS_PER_SECOND = 15.0
 # overnight printer status update.
 TTS_DROP_ORDER = ("news", "weather", "deliveries", "print", "teams", "calendar")
 
+# The sections the last gathering lost to a timeout or a crash.
+_last_failed: list = []
+
+# How a failed section is named out loud (ARRIVAL_SAY_WHAT_FAILED).
+_SECTION_NAMES = {
+    "weather": "the weather", "teams": "Teams", "calendar": "the calendar",
+    "print": "the printer", "deliveries": "the deliveries", "news": "the news",
+}
+
 _speech_lock = threading.Lock()
 _state_lock  = threading.Lock()
 
@@ -309,6 +318,33 @@ def _within_morning_window() -> bool:
 
 
 # ─── data-source sections ───────────────────────────────────────────────
+
+def _cfg_on(name: str, default: bool = True) -> bool:
+    """A live core.config switch. Never raises."""
+    try:
+        from core import config as _c
+        return bool(getattr(_c, name, default))
+    except Exception:
+        return bool(default)
+
+
+def _news_warmup_cap() -> float:
+    """Seconds the news section may take from the start of the gathering, while
+    the brain is still warming up at boot and ARRIVAL_NEWS_WAIT_FOR_BRAIN is on;
+    0.0 = no extension (SECTION_TIMEOUT_SECONDS). Never raises."""
+    try:
+        if not _cfg_on("ARRIVAL_NEWS_WAIT_FOR_BRAIN"):
+            return 0.0
+        from core import brain_warmup, config as _c
+        if not brain_warmup.warming():
+            return 0.0
+        cap = float(getattr(_c, "ARRIVAL_NEWS_WARMUP_TIMEOUT_S", 25.0))
+        print(f"  [arrival_v2] the brain is still warming up — the news section "
+              f"gets up to {cap:.0f} s")
+        return max(0.0, cap)
+    except Exception:
+        return 0.0
+
 
 def _section_weather() -> str:
     """Forward-looking weather alert for today. '' when no rain expected
@@ -561,6 +597,11 @@ def _gather_sections() -> dict:
         "news":       _section_news,
     }
     results: dict = {k: "" for k in workers}
+    failed: list = []
+    # ARRIVAL_NEWS_WAIT_FOR_BRAIN: while the brain is warming up the news section
+    # gets longer, measured from here (a hard cap on the whole gathering).
+    news_cap = _news_warmup_cap()
+    started = time.monotonic()
     # NOT a `with` block: ThreadPoolExecutor.__exit__ calls shutdown(wait=True),
     # which would block the manual action on the SLOWEST section even though each
     # fut.result() already returned/timed out under SECTION_TIMEOUT_SECONDS. We
@@ -572,13 +613,18 @@ def _gather_sections() -> dict:
         for fut in list(futures):
             name = futures[fut]
             try:
-                results[name] = (fut.result(timeout=SECTION_TIMEOUT_SECONDS) or "").strip()
+                limit = SECTION_TIMEOUT_SECONDS
+                if name == "news" and news_cap:
+                    limit = max(0.1, started + news_cap - time.monotonic())
+                results[name] = (fut.result(timeout=limit) or "").strip()
             except FutureTimeoutError:
                 print(f"  [arrival_v2] section '{name}' timed out — dropping")
                 results[name] = ""
+                failed.append(name)
             except Exception as e:
                 print(f"  [arrival_v2] section '{name}' crashed: {e}")
                 results[name] = ""
+                failed.append(name)
     finally:
         # Don't join: cancel queued futures and let any still-running section
         # finish on its daemon worker without holding up the briefing.
@@ -588,7 +634,19 @@ def _gather_sections() -> dict:
             print(f"  [arrival_v2] section '{name}' left out: it reads like "
                   f"setup instructions, not news")
             results[name] = ""
+    _last_failed[:] = failed
     return results
+
+
+def _skipped_phrase(failed) -> str:
+    """'the news' / 'the news or the calendar' for the sections that failed
+    (ARRIVAL_SAY_WHAT_FAILED); '' when none did."""
+    names = [_SECTION_NAMES.get(n, n) for n in (failed or ())]
+    if not names:
+        return ""
+    if len(names) == 1:
+        return names[0]
+    return ", ".join(names[:-1]) + " or " + names[-1]
 
 
 def _compose_briefing(parts: dict) -> str:
@@ -623,7 +681,10 @@ def _compose_briefing(parts: dict) -> str:
     if len(sentences) == 1:
         # Nothing to brief on; surface that explicitly so the manual trigger
         # gives the caller a useful answer instead of an empty TTS payload.
-        sentences.append("Nothing of note overnight.")
+        # ARRIVAL_SAY_WHAT_FAILED: a section that failed was not found empty.
+        skipped = _skipped_phrase(parts.get("_failed"))
+        sentences.append(f"I couldn't get {skipped} just now." if skipped
+                         else "Nothing of note overnight.")
 
     return "[intent:briefing] " + " ".join(sentences)
 
@@ -655,7 +716,10 @@ def _compose_within_budget(parts: dict) -> str:
 
 
 def _build_briefing() -> str:
+    _last_failed[:] = []
     parts = _gather_sections()
+    if _last_failed and _cfg_on("ARRIVAL_SAY_WHAT_FAILED"):
+        parts = dict(parts, _failed=list(_last_failed))
     return _compose_within_budget(parts)
 
 

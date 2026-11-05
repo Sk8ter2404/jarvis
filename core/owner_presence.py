@@ -228,7 +228,7 @@ def recap_line(fragments: list, extra: int = 0, *, away: bool = True) -> str:
 def plan_return_drain(items: list, *, now: float, stale_s: float,
                       exempt=EXEMPT_SOURCES, keep_whole=KEEP_WHOLE_SOURCES,
                       expire_quietly=EXPIRE_QUIETLY_SOURCES,
-                      away: bool = True) -> tuple:
+                      away: bool = True, never_fold=None) -> tuple:
     """What a drain does with the claimed queue now that the owner is here.
 
     Returns (items_out, dropped, folded):
@@ -241,8 +241,9 @@ def plan_return_drain(items: list, *, now: float, stale_s: float,
     Entries with no usable 'ts' count as fresh; an urgent entry (is_urgent)
     is never folded or dropped. ``away``: whether the owner was away while
     they waited - only then does the recap say "While you were away"
-    (recap_line). Never raises: on an error the queue is returned
-    unchanged."""
+    (recap_line). ``never_fold`` (v3.0.11, core/pending_policy.never_fold): a
+    predicate for lines that stay whole however stale they are. Never raises:
+    on an error the queue is returned unchanged."""
     try:
         out: list = []
         dropped: list = []
@@ -259,7 +260,8 @@ def plan_return_drain(items: list, *, now: float, stale_s: float,
                 age = 0.0
             stale = age > float(stale_s)
             if (not stale or root in exempt or root in keep_whole
-                    or is_urgent(item)):
+                    or is_urgent(item)
+                    or (never_fold is not None and never_fold(item))):
                 out.append(item)
                 continue
             if root in expire_quietly:

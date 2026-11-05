@@ -405,7 +405,7 @@ class Primary:
 
     def __init__(self, decode, whisper, *, latch, post_text=None,
                  rescue=None, note=None, hotwords=None, log=print,
-                 clock=time.monotonic, gate=None, shadow=None):
+                 clock=time.monotonic, gate=None, shadow=None, useful=None):
         self._decode = decode
         self._whisper = whisper
         self.latch = latch
@@ -430,6 +430,12 @@ class Primary:
         self.decodes = 0
         self.rescues = 0
         self.gated = 0          # rescues the music gate skipped
+        # Measure only (v3.0.11): did a rescue earn its decode? Per reason:
+        # [rescues Whisper finished, those whose text was usable]. ``useful``
+        # (text -> bool) is the monolith's "the live wake gates would let this
+        # line in"; the default is "Whisper heard words".
+        self._useful = useful or (lambda t: bool((t or "").strip()))
+        self.rescue_yield = {}
 
     def _say(self, line: str) -> None:
         try:
@@ -442,6 +448,30 @@ class Primary:
             self._note(value)
         except Exception:
             pass
+
+    def _note_yield(self, why: str, res) -> None:
+        """Count one finished rescue for the stat line. Measure only: it never
+        changes what the turn gets. Never raises."""
+        try:
+            text = res[0] if isinstance(res, (tuple, list)) and res else res
+            good = bool(self._useful(text))
+        except Exception:
+            good = False
+        try:
+            with self._mu:
+                row = self.rescue_yield.setdefault(str(why), [0, 0])
+                row[0] += 1
+                row[1] += 1 if good else 0
+        except Exception:
+            pass
+
+    def _yield_note(self) -> str:
+        """' - usable: empty 3 of 80, no-wake 5 of 120' (self._mu held), '' before
+        the first finished rescue."""
+        if not self.rescue_yield:
+            return ""
+        return " - usable: " + ", ".join(
+            f"{k} {v[1]} of {v[0]}" for k, v in sorted(self.rescue_yield.items()))
 
     def _hotwords_once(self) -> None:
         try:
@@ -500,7 +530,7 @@ class Primary:
                     line = (f"  [stt] parakeet -> whisper rescue ({why}; {n}"
                             f" of {of} parakeet decodes"
                             + (f"; {quiet} more not logged" if quiet else "")
-                            + ")")
+                            + ")" + self._yield_note())
                 else:
                     self._rescue_quiet += 1
             if line:
@@ -508,6 +538,7 @@ class Primary:
             self._note_engine("parakeet-rescued")
             self.last_rescue = why
             res = self._whisper(audio)
+            self._note_yield(why, res)
             if verdict == "shadow" and self._shadow is not None:
                 try:
                     self._shadow(why, res, audio)
