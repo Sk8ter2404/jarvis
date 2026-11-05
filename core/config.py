@@ -2017,10 +2017,14 @@ ACTION_FIT_CAMERA_ASK_ENFORCE = True
 # with no look. True (default): in your turn a sentence saying what he is
 # holding, wearing, eating or drinking, with no camera look before it and
 # nothing in his words or a recent look to back it, is not spoken: when his
-# line was about it the look runs instead, otherwise JARVIS says "I haven't
-# actually looked, sir. Ask me to look and I will." "You're holding up well" and
-# "you are holding a meeting at 3" pass. False: spoken as before. Applies on
-# the next start.
+# line was about it the look runs instead (through the normal action gates; a
+# look that fails says "I couldn't get a look just now, sir, so I won't guess."),
+# otherwise JARVIS says "I haven't actually looked, sir. Ask me to look and I
+# will." Unless his line was about it, only a thing a camera could see counts
+# ("a phone", not "a conversation", "a ticket" or "a total of 14 tabs"), and only
+# a noun in his words backs it ("a can", not "can you see me?"). "You're holding
+# up well" and "you are holding a meeting at 3" pass. False: spoken as before.
+# Applies on the next start.
 CAMERA_CLAIM_CHECK = True
 # CHAIN_LEAD_DEDUPE (bool, v3.0.11; core/chain_lines) - live 2026-11-05 14:58:15,
 # :20 and :23: "Apologies, sir." three times in one turn, once per follow-up

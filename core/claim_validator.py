@@ -2515,6 +2515,11 @@ def is_behaviour_directive(user_text: str) -> bool:
 # flat description is one too ("It's a can, sir.", "You're typing."). Narrow:
 # never "you're holding up well", "you are holding a meeting at 3", "while
 # you're holding the door", a question, or "I can't see what you're holding".
+# Unless his line was about what he has, "holding a ..." counts only when the
+# thing held is an object a camera could see (_CC_PHYSICAL_HEADS): "holding a
+# conversation", "holding a ticket with the carrier" and "holding a total of 14
+# tabs" are ordinary answers. What backs a claim is a content word sitting as a
+# noun in his words or a look ("a can"), never "can you see me?".
 _CC_SUBJECT = (r"(?:you(?:'re|\s+are)|you\s+(?:appear|seem|look)\s+to\s+be|"
                r"looks?\s+like\s+you(?:'re|\s+are)|"
                r"i\s+(?:can\s+)?see\s+(?:that\s+)?you(?:'re|\s+are))")
@@ -2542,7 +2547,7 @@ _CC_IDIOM_RE = re.compile(
     r"licen[cs]es?|patents?|degrees?|titles?|office|views?|opinions?|beliefs?|"
     r"torch|line|fort|floor|reins|cards|breath|ground|own|nerve|tongue|horses|"
     r"peace|fire|thought|process|show|queue|traffic|project|heart|words?|"
-    r"patience)\b")
+    r"patience|(?:two|three)\s+hats|the\s+bag)\b")
 # "if you're holding ...", "while you're wearing ...": not a statement of fact.
 _CC_PRE_RE = re.compile(
     r"\b(?:if|when|while|as|unless|whether|what|whatever|because|since|once|"
@@ -2557,34 +2562,143 @@ _CC_ASKED_NOT_RE = re.compile(
     r"\b(?:can'?t|cannot|not|don'?t|unable|haven'?t|no\s+idea|unsure|let\s+me|"
     r"allow\s+me|one\s+moment|i'?ll|i\s+will|checking|looking|take\s+a\s+look|"
     r"have\s+a\s+look|hard\s+to\s+(?:say|tell))\b")
+# Never what backs a claim, wherever they turn up in his words.
 _CC_STOPWORDS = frozenset({
     "what", "appears", "looks", "seems", "like", "the", "some", "your", "two",
     "three", "that", "this", "with", "and", "for", "sir", "little", "bit",
-    "pair", "kind", "sort", "type", "piece", "one", "looking"})
+    "pair", "kind", "sort", "type", "piece", "one", "looking",
+    # Function words: "Jarvis, can you see me?" says nothing about a can.
+    "you", "you're", "you've", "you'll", "are", "aren't", "it's", "its", "is",
+    "isn't", "was", "were", "be", "been", "see", "seen", "saw", "got", "get",
+    "gets", "have", "has", "had", "having", "look", "looked", "hold", "holding",
+    "held", "wearing", "hand", "hands", "left", "right", "from", "into", "onto",
+    "about", "there", "there's", "here", "here's", "that's", "now", "just",
+    "not", "very", "really", "them", "they", "his", "her", "our", "their",
+    "mine", "thing", "things", "stuff", "something", "nothing", "item", "object",
+    "currently", "clearly", "actually", "apparently",
+    # Colours and sizes: "I feel blue" backs no blue shirt.
+    "red", "blue", "green", "black", "white", "grey", "gray", "yellow", "purple",
+    "pink", "brown", "big", "small", "large", "new", "old", "nice"})
+# The word before a noun: "a can", "my phone", "this hat".
+_CC_DET_BEFORE_RE = re.compile(
+    r"\b(?:a|an|the|this|these|those|my|your|his|her|our|their|some|any|of|new|"
+    r"old|another)\s+$")
+# The word before a verb or a modal: "I can", "you can", "to phone", "will hat".
+_CC_VERBAL_BEFORE_RE = re.compile(
+    r"\b(?:i|you|we|they|he|she|it|who|to|not|will|would|could|should|shall|can|"
+    r"may|might|must|do|does|did|i'll|you'll|we'll|they'll|i'd|you'd|we'd)\s+$")
+# The word after a verb or a modal: "can you", "phone him", "can see".
+_CC_VERBAL_AFTER_RE = re.compile(
+    r"^\s+(?:i|you|we|they|he|she|it|me|him|her|them|us|not|be|see|hear|do|go|"
+    r"get|have|help|look|tell|find|show|say)\b")
+# Where the thing held stops: "a phone in your hand", "a quiz due at midnight"
+# ("control" so "a remote control" is a remote, and "firm control" nothing held).
+_CC_HEAD_END_RE = re.compile(
+    r"\b(?:of|in|on|at|with|from|for|to|that|which|who|whose|due|and|or|while|"
+    r"near|by|up|under|over|about|as|but|because|so|if|when|right|there|here|"
+    r"today|tonight|tomorrow|now|again|still|sir|like|you|i|control)\b")
+_CC_LEAD_WORDS_RE = re.compile(
+    r"^what\s+(?:appears|looks|seems)\s+(?:to\s+be|like)\s+")
+_CC_MEASURE_HEADS = frozenset({"pair", "piece", "slice", "bit", "kind", "sort",
+                               "type"})
+# Things a camera could see in his hand or on him. The list decides only when
+# his line was not about it: a camera ask or "what do you think of what I'm
+# holding?" counts anything held, and core.camera_ask takes those asks first.
+_CC_PHYSICAL_HEADS = frozenset({
+    # Things to hold.
+    "phone", "smartphone", "iphone", "cellphone", "mobile", "remote", "controller",
+    "mouse", "keyboard", "headset", "headphones", "earbuds", "airpods",
+    "laptop", "tablet", "ipad", "camera", "pen", "pencil", "marker", "stapler",
+    "scissors", "ruler", "notebook", "book", "paper", "envelope", "box", "package",
+    "wrapper", "bag", "backpack", "purse", "wallet", "keys", "screwdriver", "wrench",
+    "hammer", "pliers", "drill", "knife", "fork", "spoon", "plate", "bowl",
+    "flashlight", "lighter", "cigarette", "vape", "toy", "figurine",
+    "lightsaber", "sword", "cable", "charger", "tool", "stick", "umbrella", "towel",
+    "pillow", "blanket", "flower", "plant", "doll", "ball", "opener", "lanyard",
+    "badge", "bracelet", "necklace", "receipt", "magazine", "newspaper",
+    # Drinks and food.
+    "cup", "mug", "glass", "bottle", "can", "jar", "thermos", "tumbler", "flask",
+    "tin", "tac", "mint", "gum", "candy", "sandwich", "burger", "pizza", "apple",
+    "banana", "orange", "chip", "cookie", "snack", "soda", "coffee", "water", "tea",
+    "beer", "juice", "coke", "pepsi", "drink", "donut", "cereal", "soup", "salad",
+    "taco", "burrito", "pretzel", "wine", "milk",
+    # Things to wear.
+    "hat", "beanie", "shirt", "t-shirt", "tee", "hoodie", "sweater", "sweatshirt",
+    "jacket", "coat", "vest", "tie", "suit", "jeans", "pants", "shorts", "dress",
+    "uniform", "jersey", "glasses", "sunglasses", "goggles", "mask", "scarf",
+    "glove", "shoe", "boot", "sneaker", "sock", "ring", "earring", "headband",
+    "watch", "helmet", "apron", "outfit", "cardigan"})
+# Never in his hand, even when his line was about it.
+_CC_ABSTRACT_HEADS = frozenset({
+    "conversation", "discussion", "pace", "ticket", "total", "number", "bunch",
+    "amount", "print", "quiz", "exam", "test", "reservation", "appointment",
+    "balance", "tab", "count", "sum", "budget", "deadline"})
 # The actions whose result can say what he holds or does (a face match cannot).
 CAMERA_GROUND_ACTIONS = frozenset({"see_user", "look_around", "where_am_i",
                                    "situational_awareness"})
 CAMERA_CLAIM_HONEST_LINE = ("I haven't actually looked, sir. Ask me to look and "
                             "I will.")
+CAMERA_CLAIM_LOOK_FAILED_LINE = ("I couldn't get a look just now, sir, so I "
+                                 "won't guess.")
+
+
+def _cc_noun_at(hay: str, start: int, end: int) -> bool:
+    """True when the word at hay[start:end] reads as a noun, not as "can you"
+    or "I can see"."""
+    if _CC_DET_BEFORE_RE.search(hay[:start]):
+        return True
+    if _CC_VERBAL_BEFORE_RE.search(hay[:start]):
+        return False
+    return _CC_VERBAL_AFTER_RE.match(hay[end:]) is None
 
 
 def _cc_grounded(obj: str, sources: Iterable[str]) -> bool:
-    """True when a word of the claimed thing is in his words or a look's
-    result."""
-    hay = " ".join(str(s or "") for s in sources).lower()
+    """True when a content word of the claimed thing sits as a noun in his
+    words or a look's result."""
+    hay = _norm(" ".join(str(s or "") for s in sources))
     if not hay.strip():
         return False
     for w in re.findall(r"[a-z][a-z'-]{2,}", str(obj or "").lower()):
         if w in _CC_STOPWORDS:
             continue
         stem = w[:-1] if w.endswith("s") and len(w) > 3 else w
-        if re.search(r"\b" + re.escape(stem) + r"s?\b", hay):
-            return True
+        for m in re.finditer(r"\b" + re.escape(stem) + r"s?\b", hay):
+            if _cc_noun_at(hay, m.start(), m.end()):
+                return True
     return False
 
 
+def _cc_head(obj: str) -> str:
+    """The word naming the thing held: "phone" in "a red phone in your hand",
+    "glasses" in "a pair of glasses", "number" in "a phone number"."""
+    t = _CC_LEAD_WORDS_RE.sub("", str(obj or "").lower().strip())
+    while True:
+        cut = _CC_HEAD_END_RE.search(t)
+        words = re.findall(r"[a-z0-9][a-z0-9'-]*", t[:cut.start()] if cut else t)
+        head = words[-1] if words else ""
+        if head in _CC_MEASURE_HEADS and cut and cut.group(0) == "of":
+            t = t[cut.end():]
+            continue
+        return head
+
+
+def _cc_head_in(head: str, heads: frozenset) -> bool:
+    """``head`` or its singular is in ``heads``."""
+    return (head in heads or (head.endswith("s") and head[:-1] in heads)
+            or (head.endswith("es") and head[:-2] in heads))
+
+
+def _cc_counts_as_held(obj: str, physical: bool) -> bool:
+    """True when ``obj`` is something a look could report. His line being about
+    what he has (``physical``) widens it to anything but the abstract."""
+    head = _cc_head(obj)
+    if _cc_head_in(head, _CC_ABSTRACT_HEADS):
+        return False
+    return physical or _cc_head_in(head, _CC_PHYSICAL_HEADS)
+
+
 def _cc_sentence(sentence: str, sources: Iterable[str],
-                 asked: bool) -> Optional[str]:
+                 asked: bool, physical: bool = False) -> Optional[str]:
     """The claim phrase when ``sentence`` states a physical fact nothing
     grounds."""
     low = _norm(sentence)
@@ -2594,11 +2708,15 @@ def _cc_sentence(sentence: str, sources: Iterable[str],
         obj = m.group("obj").strip()
         if _CC_IDIOM_RE.match(obj) or _CC_PRE_RE.search(low[:m.start()]):
             continue
+        if not _cc_counts_as_held(obj, physical or asked):
+            continue
         if _cc_grounded(obj, sources):
             continue
         return m.group(0).strip()
     if asked and _CC_ASKED_RE.match(low) and not _CC_ASKED_NOT_RE.search(low):
-        if not _cc_grounded(low, list(sources)[1:]):
+        # What the sentence says it is, not its "it's" or "you're".
+        rest = _CC_ASKED_RE.sub("", low, count=1)
+        if not _cc_grounded(rest, list(sources)[1:]):
             return low[:80]
     return None
 
@@ -2606,13 +2724,15 @@ def _cc_sentence(sentence: str, sources: Iterable[str],
 def _cc_setup(ran_actions: Iterable[str], user_text: str,
               grounding: Iterable[str]):
     """(what grounds a claim, his words first; his line was a strict camera
-    ask), or None when a camera look already ran."""
+    ask; his line was about what he has), or None when a camera look already
+    ran."""
     for n in ran_actions or ():
         if str(n or "").strip().lower() in CAMERA_GROUND_ACTIONS:
             return None
     from core import camera_ask as _camera_ask
     return ([user_text] + list(grounding or ()),
-            _camera_ask.is_strict_ask(user_text))
+            _camera_ask.is_strict_ask(user_text),
+            _camera_ask.mentions_physical(user_text))
 
 
 def find_camera_claim(text: str, *, ran_actions: Iterable[str] = (),
@@ -2628,9 +2748,9 @@ def find_camera_claim(text: str, *, ran_actions: Iterable[str] = (),
         setup = _cc_setup(ran_actions, user_text, grounding)
         if setup is None:
             return None
-        sources, asked = setup
+        sources, asked, physical = setup
         for sentence in _SENTENCE_SPLIT_RE.split(str(text)):
-            got = _cc_sentence(sentence, sources, asked)
+            got = _cc_sentence(sentence, sources, asked, physical)
             if got:
                 return got
     except Exception:
@@ -2648,7 +2768,7 @@ def drop_camera_claims(text: str, *, ran_actions: Iterable[str] = (),
         setup = _cc_setup(ran_actions, user_text, grounding)
         if setup is None or not text or not str(text).strip():
             return text, [], True
-        sources, asked = setup
+        sources, asked, physical = setup
         src = str(text)
         lead = _NC_LEAD_TAGS_RE.match(src).group(0)
         kept: list = []
@@ -2656,7 +2776,7 @@ def drop_camera_claims(text: str, *, ran_actions: Iterable[str] = (),
         for part in _NC_PIECE_SPLIT_RE.split(src[len(lead):]):
             if not part or not part.strip():
                 continue
-            got = _cc_sentence(part, sources, asked)
+            got = _cc_sentence(part, sources, asked, physical)
             if got:
                 flagged.append(got)
             else:

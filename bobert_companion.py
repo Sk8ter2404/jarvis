@@ -44656,13 +44656,47 @@ def _camera_claim_grounding() -> list:
     return out
 
 
-def _camera_claim_apply(cleaned: str, results: list, ran_before) -> str:
+def _camera_claim_look_tried() -> bool:
+    """True when this turn already ran see_user, whatever it said: a look that
+    failed in an earlier round is not run again for the next invented line.
+    Never raises."""
+    try:
+        frame = getattr(_turn_grounding, "frame", None) or {}
+        return any(str(n or "").lower() == "see_user"
+                   for (n, _a) in frame.get("calls") or ())
+    except Exception:
+        return False
+
+
+def _camera_claim_look(q: str, results: list, run_action) -> bool:
+    """Run the look through ``run_action`` (parse_and_run_actions' own runner, so
+    its gates, failure handling and bookkeeping apply). True when the result is
+    in ``results`` for the follow-up round. False when the look raised or was
+    refused: its row goes, so the brain gets no round to guess in. Never
+    raises."""
+    n0 = len(results)
+    try:
+        run_action(_camera_ask.token("see_user", q))
+        if any(str(n or "").lower() == "see_user" and bool(i)
+               for (n, _r, i) in results[n0:]):
+            return True
+    except Exception as _e:
+        print(f"  [validation] the look failed: {type(_e).__name__}")
+    del results[n0:]
+    return False
+
+
+def _camera_claim_apply(cleaned: str, results: list, ran_before,
+                        run_action=None) -> str:
     """``cleaned`` without a statement of what the owner is holding, wearing or
     doing that no look backs (CAMERA_CLAIM_CHECK, see parse_and_run_actions). A
     look this same reply ran will report it: the guess just goes. When his line
-    was about it the look runs now and its result joins ``results`` for the
-    follow-up round; otherwise the honest line. ``cleaned`` unchanged when
-    there is no such claim. Never raises."""
+    was about it the look runs now (``run_action``, taking an action token) and
+    its result joins ``results`` for the follow-up round; a look that cannot run
+    says so, otherwise the honest line. ``cleaned`` unchanged when there is no
+    such claim. A claim once found is never spoken, whatever fails after. Never
+    raises."""
+    flagged: list = []
     try:
         user_text = _turn_user_text()
         kept, flagged, substance = _claim_validator.drop_camera_claims(
@@ -44675,17 +44709,18 @@ def _camera_claim_apply(cleaned: str, results: list, ran_before) -> str:
             print(f"  [validation] dropped '{flagged[0]}': written before the "
                   "look this reply ran")
             return kept
-        if _camera_ask.mentions_physical(user_text) and "see_user" in ACTIONS:
-            q = _camera_ask.question_words(user_text)
-            print(f"  [validation] dropped '{flagged[0]}': no look ran - "
-                  "looking now")
-            res = ACTIONS["see_user"](q)
-            res = res if isinstance(res, str) else str(res)
-            record_action_history("see_user", q, res)
-            _note_turn_action_ran("see_user", res, q)
-            results.append(("see_user", res, True))
-            return ""
         line = _claim_validator.CAMERA_CLAIM_HONEST_LINE
+        if _camera_ask.mentions_physical(user_text) and "see_user" in ACTIONS:
+            if _camera_claim_look_tried():
+                line = _claim_validator.CAMERA_CLAIM_LOOK_FAILED_LINE
+            else:
+                q = _camera_ask.question_words(user_text)
+                print(f"  [validation] dropped '{flagged[0]}': no look ran - "
+                      "looking now")
+                if run_action is not None and _camera_claim_look(q, results,
+                                                                 run_action):
+                    return ""
+                line = _claim_validator.CAMERA_CLAIM_LOOK_FAILED_LINE
         print(f"  [validation] dropped '{flagged[0]}': no look ran - said the "
               "honest line")
         if substance:
@@ -44694,7 +44729,8 @@ def _camera_claim_apply(cleaned: str, results: list, ran_before) -> str:
         return f"{lead} {line}".strip()
     except Exception as _e:
         print(f"  [validation] camera-claim check failed: {type(_e).__name__}")
-        return cleaned
+        return (_claim_validator.CAMERA_CLAIM_HONEST_LINE if flagged
+                else cleaned)
 
 
 _ACTION_FIT_TRANSPORT_CANON = {
@@ -45704,7 +45740,9 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
     # reply backs it: prose written ahead of its own look is a guess too.
     if (cleaned and globals().get("CAMERA_CLAIM_CHECK", True)
             and getattr(_turn_grounding, "frame", None) is not None):
-        cleaned = _camera_claim_apply(cleaned, results, _ran_before_reply)
+        cleaned = _camera_claim_apply(
+            cleaned, results, _ran_before_reply,
+            run_action=lambda _tok: _ACTION_RE.sub(_runner, _tok))
 
     # Invented readings (live 2026-10-09 17:53): "why can't I hear my
     # YouTube video?" -> "I'm afraid the volume is currently set to 20%,

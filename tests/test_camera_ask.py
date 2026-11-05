@@ -215,6 +215,67 @@ class CameraClaimTests(unittest.TestCase):
                   "Your meeting is at 3."):
             self.assertIsNone(self._find(t), t)
 
+    def test_only_an_object_counts_when_he_did_not_ask(self):
+        for t in ("You're holding a conversation with a machine, sir.",
+                  "You're holding a steady pace on the savings floor, sir.",
+                  "You're holding an open ticket with the carrier, sir.",
+                  "You're holding a total of 14 open tabs, sir.",
+                  "You're holding a 3D print in the queue, sir.",
+                  "You're holding a CCNA quiz due at midnight, sir.",
+                  "You are holding a reservation at 7, sir.",
+                  "You're holding a phone number for the office, sir.",
+                  "You're holding firm control of the budget, sir.",
+                  "You're holding something back, sir.",
+                  "You're holding the bag on this one, sir.",
+                  "You're eating the cost, sir.",
+                  "You're wearing two hats today, sir.",
+                  "It's all in your hands, sir.",
+                  "That's a decision in your hands, sir."):
+            self.assertIsNone(self._find(t), t)
+        for t in ("You're holding a remote control, sir.",
+                  "You're holding a pair of scissors.",
+                  "You appear to be holding what appears to be a coffee mug.",
+                  "You're wearing a pair of glasses."):
+            self.assertTrue(self._find(t), t)
+
+    def test_any_thing_counts_when_his_line_was_about_it(self):
+        about = "what do you think of what I'm holding?"
+        self.assertTrue(self._find("You're holding a lemon, sir.", about))
+        self.assertTrue(self._find("You're holding a lemon, sir.", self.ASK))
+        self.assertIsNone(self._find("You're holding a total of 14 tabs, sir.", about))
+        self.assertIsNone(self._find("You're holding up well, sir.", about))
+
+    def test_function_words_back_nothing(self):
+        for line, claim in (
+                ("Jarvis, can you see me?", "You're holding a can of Coke, sir."),
+                ("I can see it from here", "You're holding a can, sir."),
+                ("we can do that later", "You're holding a can, sir."),
+                ("give me a hand", "You have a phone in your hand."),
+                ("is that one right", "You're holding a phone, sir."),
+                ("I feel blue today", "You're wearing a blue shirt, sir."),
+                ("phone him for me", "You're holding a phone, sir."),
+                ("I need to phone the office", "You're holding a phone, sir.")):
+            self.assertTrue(self._find(claim, "are you sure", grounding=[line]),
+                            line)
+
+    def test_a_noun_in_his_words_still_backs_it(self):
+        for line, claim in (
+                ("this is a coke can, dude", "You're holding a can, sir."),
+                ("this can is empty", "You're holding a can, sir."),
+                ("that can of coke", "You're holding a can, sir."),
+                ("I love coke, you know", "You're drinking some coke."),
+                ("Cans are great", "You're holding a can, sir."),
+                ("I'm wearing my new hat", "You're wearing a hat, sir.")):
+            self.assertIsNone(self._find(claim, "are you sure", grounding=[line]),
+                              line)
+
+    def test_flat_description_is_not_backed_by_its_own_small_words(self):
+        for t in ("It's a can, sir.", "You're a can, sir."):
+            self.assertTrue(self._find(t, self.ASK, grounding=[
+                "Jarvis, can you see me?", "it's fine, you're right"]), t)
+        self.assertIsNone(self._find("It's a can, sir.", self.ASK, grounding=[
+            "You are holding a can of Coke."]))
+
     def test_a_look_backs_it(self):
         for name in ("see_user", "look_around", "where_am_i"):
             self.assertIsNone(self._find("You're holding a can.", self.ASK, ran=[name]))

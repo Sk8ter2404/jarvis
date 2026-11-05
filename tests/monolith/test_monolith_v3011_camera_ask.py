@@ -123,6 +123,58 @@ class CameraClaimTurnTests(_CameraBase):
         self.assertNotIn("You're holding a box of Tic Tacs, sir.", self._spoken())
         self.assertIn("You are holding a can of Coke, sir.", self._spoken())
 
+    def _about_it(self, *followups):
+        self._dispatch("what do you think of what I'm holding?",
+                       "You're holding a smartphone, sir.", followups=followups)
+
+    def test_a_look_that_raises_never_speaks_the_claim(self):
+        def boom(_arg=""):
+            raise RuntimeError("no camera lib")
+        self._actions["see_user"] = boom
+        self._p(self.bc, "record_action_error")
+        with mock.patch.dict("os.environ", {"JARVIS_BUG_AUTO_CAPTURE": "0"}):
+            self._about_it("You're holding a smartphone, sir.")
+        self.assertEqual(self._spoken(),
+                         [claim_validator.CAMERA_CLAIM_LOOK_FAILED_LINE])
+        self.gfr.assert_not_called()
+
+    def test_a_look_goes_through_the_normal_gates(self):
+        self._p(self.bc, "_action_fit_refusal", return_value="refused by a gate")
+        self._about_it("You're holding a smartphone, sir.")
+        self.assertEqual(self.calls["see_user"], [])
+        self.assertEqual(self._spoken(),
+                         [claim_validator.CAMERA_CLAIM_LOOK_FAILED_LINE])
+
+    def test_a_look_that_runs_keeps_its_bookkeeping(self):
+        rec = self._p(self.bc, "record_action_history")
+        self._about_it("You are holding a can of Coke, sir.")
+        self.assertEqual(self.calls["see_user"],
+                         ["what do you think of what I'm holding?"])
+        self.assertEqual(rec.call_args.args[:2],
+                         ("see_user", "what do you think of what I'm holding?"))
+
+    def test_a_failed_look_is_not_run_again_for_the_next_invention(self):
+        self._stub("see_user", "no webcam frames, the look failed")
+        self._about_it("You're holding a smartphone, sir.",
+                       "You're holding a smartphone, sir.")
+        self.assertEqual(len(self.calls["see_user"]), 1)
+        said = " ".join(self._spoken())
+        self.assertNotIn("smartphone", said)
+        self.assertIn(claim_validator.CAMERA_CLAIM_LOOK_FAILED_LINE, said)
+
+    def test_a_crash_after_the_claim_is_found_does_not_speak_it(self):
+        self._p(self.bc, "_camera_claim_look_tried", side_effect=RuntimeError)
+        self._about_it("x")
+        self.assertEqual(self._spoken(),
+                         [claim_validator.CAMERA_CLAIM_HONEST_LINE])
+
+    def test_an_unrelated_line_does_not_back_an_invention(self):
+        self._dispatch("Jarvis, can you see me?", "I can, sir.")
+        self.bc._speak.reset_mock()
+        self._p(self.bc, "CAMERA_ASK_ROUTE", False, create=True)
+        self._dispatch("how is it going", "You're holding a can of Coke, sir.")
+        self.assertEqual(self._spoken(), [claim_validator.CAMERA_CLAIM_HONEST_LINE])
+
     def test_no_ask_says_it_has_not_looked(self):
         self._dispatch("how is it going", "You're holding a box of Tic Tacs, sir.")
         self.assertEqual(self.calls["see_user"], [])
