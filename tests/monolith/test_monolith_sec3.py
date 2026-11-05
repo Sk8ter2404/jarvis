@@ -793,6 +793,11 @@ class TranscribeTests(MonolithGlobalsTestCase):
 
     def setUp(self):
         self._saved = (self.bc._stt, self.bc._stt_engine)
+        # These pin STT_HOTWORDS alone; the built-in "Teams" hotword (v3.0.11) is
+        # covered in test_monolith_teams_lane_3011.
+        _p = mock.patch.object(self.bc, "STT_TEAMS_HOTWORD", False, create=True)
+        _p.start()
+        self.addCleanup(_p.stop)
 
     def tearDown(self):
         self.bc._stt, self.bc._stt_engine = self._saved

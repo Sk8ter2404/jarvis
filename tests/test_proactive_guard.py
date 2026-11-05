@@ -255,5 +255,148 @@ class RateVerdictTests(unittest.TestCase):
         self.assertEqual(pg.unanswered([], 4.0), 0)
 
 
+class UngroundedRemarkTests(unittest.TestCase):
+    """v3.0.11 PROACTIVE_GROUNDED_ONLY: live 2026-11-05 idle remarks with nothing
+    behind them."""
+
+    def test_the_live_remarks(self):
+        for text in (
+            "[intent:observation] If I may observe, sir, it's a remarkably "
+            "productive morning so far.",
+            "[intent:observation] You've been quite still for some time, sir; "
+            "I trust you're contemplating something profoundly important.",
+            "[intent:observation] I couldn't help but notice the silence, sir; "
+            "it's rather uncharacteristic.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(pg.ungrounded_remark(text))
+                ok, why = pg.check_remark(text, hour=11, grounded_only=True)
+                self.assertFalse(ok)
+                self.assertIn("talks about", why)
+
+    def test_variants(self):
+        for text in (
+            "It's rather quiet in here, sir.",
+            "Awfully quiet today, sir.",
+            "You've been so quiet.",
+            "All this silence is unnerving.",
+            "You've been silent for a while, sir.",
+            "You haven't said a word in an hour, sir.",
+            "You haven't moved in a while, sir.",
+            "Such stillness, sir.",
+            "You seem rather busy, sir.",
+            "Busy day, sir?",
+            "Hard at work as ever, sir.",
+            "You're on a roll today, sir.",
+            "Getting a lot done, I see.",
+            "I've noticed you've been quite focused, sir.",
+            "I notice the room has settled, sir.",
+            "I can't help but notice the hour, sir.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(pg.ungrounded_remark(text))
+
+    def test_saying_nothing(self):
+        for text in ("SKIP", "skip.", "[intent:dry_wit] SKIP", "Nothing, sir.", "None"):
+            with self.subTest(text=text):
+                self.assertEqual(pg.ungrounded_remark(text), "said nothing")
+
+    def test_real_facts_pass(self):
+        for text in (
+            "Octopuses have three hearts, sir.",
+            "Honey is still edible after three thousand years, sir.",
+            "Fleming noticed the mould by accident, sir.",
+            "Titanium is still used in most jet engines, sir.",
+            "The first 3D printer was built in 1984, sir.",
+            "A Quiet Place was filmed in upstate New York, sir.",
+            "Quiet bearings use ceramic balls, sir.",
+            "Nothing beats a sharp end mill, sir.",
+            "The Rover landed in 1997, sir.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(pg.ungrounded_remark(text), "")
+                self.assertEqual(pg.check_remark(text, hour=11, pool=(),
+                                                 grounded_only=True), (True, ""))
+
+    def test_skip_with_trailing_words_says_nothing(self):
+        for text in (
+            "[intent:fact] SKIP: nothing worth saying, sir.",
+            "SKIP - nothing worth saying, sir.",
+            "SKIP, sir.",
+            "skip nothing today",
+            "Nothing to add, sir.",
+            "I have nothing to say, sir.",
+            "Nothing worth mentioning, sir.",
+            "I've nothing interesting to offer, sir.",
+            "Nothing comes to mind, sir.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(pg.ungrounded_remark(text), "said nothing")
+                self.assertFalse(pg.check_remark(text, hour=11, pool=(),
+                                                 grounded_only=True)[0])
+
+    def test_paraphrases_of_the_silence_and_of_attention(self):
+        for text in (
+            "Not a word in an hour, sir.",
+            "Not a peep out of you, sir.",
+            "Not so much as a peep, sir.",
+            "It has been a while since you last spoke, sir.",
+            "It's been an hour, sir.",
+            "Some time since you said anything, sir.",
+            "An hour without a word, sir.",
+            "Just checking in, sir.",
+            "Thought I'd check in on you, sir.",
+            "How's the project coming along, sir?",
+            "How is the build going, sir?",
+            "The room is very peaceful, sir.",
+            "So peaceful this morning, sir.",
+            "A rather tranquil afternoon, sir.",
+            "It's been silent, sir.",
+            "The silence of this room is striking.",
+            "Quite productive today, sir.",
+            "A productive afternoon, sir.",
+            "You're being productive, sir.",
+            "Your productivity is admirable.",
+            "So busy, sir.",
+            "You've kept busy, sir.",
+            "Keeping busy, sir?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(pg.ungrounded_remark(text))
+                self.assertFalse(pg.check_remark(text, hour=11, pool=(),
+                                                 grounded_only=True)[0])
+
+    def test_facts_that_share_the_words_pass(self):
+        for text in (
+            "Silent films often had live orchestras, sir.",
+            "The k in knight is silent, sir.",
+            "The Silence of the Lambs won five Oscars, sir.",
+            "Silent Spring was published in 1962, sir.",
+            "The guns fell silent in November 1918, sir.",
+            "Cicadas stay silent for seventeen years, sir.",
+            "Hush puppies are a fried cornmeal dish, sir.",
+            "Bees are famously busy in the spring, sir.",
+            "Heathrow is the busiest airport in Europe, sir.",
+            "Dwarf wheat made farms far more productive, sir.",
+            "Soil productivity doubled with crop rotation, sir.",
+            "Owls fly almost without a sound, sir.",
+            "Not a word of the Voynich manuscript has been read, sir.",
+            "All Quiet on the Western Front appeared in 1929, sir.",
+            "Magellan named the Pacific for its peaceful waters, sir.",
+            "The Peaceful Revolution ended in 1989, sir.",
+            "Skipping stones is a sport with world records, sir.",
+            "Checking in a bag was free until 2008, sir.",
+            "Ninety years since the first jet engine ran, sir.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(pg.ungrounded_remark(text), "")
+                self.assertEqual(pg.check_remark(text, hour=11, pool=(),
+                                                 grounded_only=True), (True, ""))
+
+    def test_off_by_default_for_other_callers(self):
+        self.assertEqual(pg.check_remark("Rather quiet in here, sir.", hour=11, pool=()),
+                         (True, ""))
+
+
 if __name__ == "__main__":
     unittest.main()

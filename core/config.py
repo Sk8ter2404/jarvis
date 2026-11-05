@@ -2070,6 +2070,68 @@ BANTER_REPEAT_RETRY_SUPPRESS = True
 # model to say plainly what ran and never deny it. Nothing changes on any
 # other turn. False: no such note (the old behaviour). Read live.
 RECALL_ACTION_GROUNDING = True
+# STT_TEAMS_FIX (bool, v3.0.11, core/stt_vocab.fix_teams_mishearing) - live
+# 2026-11-05 14:43:36 "Jarvis, any messages I missed on Teams while I was gone?"
+# came out of speech-to-text as "on TV". True (default): "on TV" / "in TV" (also
+# "teens", "team's") becomes "on Teams" when the same sentence asks about the
+# owner's messages, chats, pings, unread or replies and says nothing about a
+# programme; the log says "[stt] teams-fix". "what's on TV" and "I missed the game
+# on TV" stay. False: transcripts as before. Read live.
+STT_TEAMS_FIX = True
+# STT_TEAMS_HOTWORD (bool, v3.0.11) - same evidence. True (default): Whisper also
+# gets "Teams" as a hotword, added to whatever STT_HOTWORDS holds (the owner's
+# setting is empty, and a default here would not reach him). The hotword-echo
+# guard covers it. Parakeet, the primary engine, has no hotwords, so this helps
+# Whisper's rescues and ambient decodes only. False: STT_HOTWORDS alone, as before.
+# Read live.
+STT_TEAMS_HOTWORD = True
+# TEAMS_UNREAD_ACTION (bool, v3.0.11, core/teams_unread + skills/ms_graph) - live
+# 2026-11-05 14:43:39 "any messages I missed ..." got "I've no way to check that,
+# sir ... Incidentally, you have 24 unread messages waiting for you on Teams.": no
+# action could answer, and no code had read that number. True (default): the
+# read-only teams_unread action exists and the prompt lists it; whole-line asks
+# ("any messages I missed", "any Teams messages", "did anyone message me", "who
+# messaged me") go straight to it with no model call. It speaks the unread chat
+# count, the newest sender and what notification triage holds (counts, names, how
+# long ago), and says why when Graph cannot be read. "any email?" stays with the
+# email actions. False: no such action, no such route, the prompt as before.
+# Applies on the next start.
+TEAMS_UNREAD_ACTION = True
+# PROACTIVE_GROUNDED_ONLY (bool, v3.0.11; generate_proactive_comment and
+# core/proactive_guard.ungrounded_remark) - live 2026-11-05 11:35:27 "it's a
+# remarkably productive morning so far", 13:07:48 "You've been quite still for
+# some time, sir", 14:56:48 "I couldn't help but notice the silence, sir". He knows
+# nothing about the owner's productivity, and the silence is what triggered the
+# prompt. True (default): the idle prompt asks for one short interesting fact or
+# SKIP, never a check-in, and a remark about the silence, the quiet, stillness, how
+# productive or busy the owner is, or what JARVIS has "noticed" is dropped and
+# logged. False: the old prompt and no such drop. Read live.
+PROACTIVE_GROUNDED_ONLY = True
+# SCREEN_REMARK_TITLE_PRECHECK (bool, v3.0.11, core/screen_remarks.Remarker._remark)
+# - live 2026-11-05 12:06, 12:12 and 12:20: a hashtag-laden video title took a full
+# brain call and the remark was then dropped. True (default): a title carrying
+# #hashtags gets no remark and is dropped BEFORE the brain is asked, with its own log
+# line. False: the title is sent to the brain as before. Read live.
+SCREEN_REMARK_TITLE_PRECHECK = True
+# SCREEN_REMARK_STRIP_INTENT (bool, v3.0.11, core/screen_remarks.strip_intent_lead) -
+# every screen remark in the logs to 2026-11-05 (38 of 38) was dropped as "carries a
+# tag", none spoken: the persona leads every reply with [intent:xxx] and validate
+# refuses any bracket, whatever the title. True: that one leading tag is removed
+# before validate, so remarks start being SPOKEN, for the first time, at most one per
+# SCREEN_REMARKS_MIN_GAP_S. Any other bracket still drops. False (default, the one
+# flag here that ships off, since turning a voice on is the owner's decision): no
+# screen remark is spoken; see SCREEN_REMARK_SKIP_DOOMED_CALL for the brain call.
+# Read live.
+SCREEN_REMARK_STRIP_INTENT = False
+# SCREEN_REMARK_SKIP_DOOMED_CALL (bool, v3.0.11, core/screen_remarks.Remarker._remark)
+# - live 2026-11-05 12:18:34: a video title with no hashtag took a full brain call and
+# was still dropped as "carries a tag", because the persona's leading [intent:xxx] is
+# refused while SCREEN_REMARK_STRIP_INTENT is off. True (default): while that flag is
+# off nothing is sent to the brain for a screen remark and the title is dropped with
+# its own log line, so nothing changes aloud and the call is saved. False: the brain
+# is asked and the reply dropped as before. Turning SCREEN_REMARK_STRIP_INTENT on
+# brings the call back. Read live.
+SCREEN_REMARK_SKIP_DOOMED_CALL = True
 # VERBATIM_CONTENT_RESULTS (bool, v3.0.8, bobert_companion
 # _action_result_failed): live 2026-10-28 19:47 "what's new" - the changelog
 # summary said fixes as fixes ("no longer fails"), its words read as a failed

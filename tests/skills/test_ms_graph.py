@@ -1366,5 +1366,82 @@ class CalendarSubAgentSpecWiringTests(unittest.TestCase):
             )
 
 
+class TeamsUnreadActionTests(unittest.TestCase):
+    """v3.0.11 teams_unread: the real reading, honest when Graph gives nothing."""
+
+    def setUp(self):
+        import importlib
+        self.mod = importlib.import_module("skills.ms_graph")
+
+    def test_registered_with_the_flag_and_not_without(self):
+        import core.config as cfg
+        actions = {}
+        with mock.patch("builtins.print"), \
+                mock.patch.object(cfg, "TEAMS_UNREAD_ACTION", True, create=True):
+            self.mod.register(actions)
+        self.assertIs(actions["teams_unread"], self.mod.action_teams_unread)
+        actions = {}
+        with mock.patch("builtins.print"), \
+                mock.patch.object(cfg, "TEAMS_UNREAD_ACTION", False, create=True):
+            self.mod.register(actions)
+        self.assertNotIn("teams_unread", actions)
+
+    def _run(self, *, configured=True, graph=None, status=None, toasts=None):
+        def _count():
+            self.mod._graph_last_status[0] = status
+            return graph
+        with mock.patch.object(self.mod, "is_configured", return_value=configured), \
+                mock.patch.object(self.mod, "get_teams_unread_count", side_effect=_count), \
+                mock.patch.object(self.mod, "_teams_toast_records", return_value=toasts):
+            return self.mod.action_teams_unread("")
+
+    def test_count_and_sender(self):
+        self.assertEqual(self._run(graph={"count": 24, "top_sender": "Sam"}, status=200),
+                         "24 unread Teams chats, sir, the newest from Sam.")
+
+    def test_not_signed_in_never_calls_graph(self):
+        with mock.patch.object(self.mod, "is_configured", return_value=False), \
+                mock.patch.object(self.mod, "get_teams_unread_count",
+                                  side_effect=AssertionError("called")), \
+                mock.patch.object(self.mod, "_teams_toast_records", return_value=None):
+            out = self.mod.action_teams_unread("")
+        self.assertIn("isn't signed in", out)
+
+    def test_a_403_is_named(self):
+        out = self._run(status=403)
+        self.assertIn("isn't allowed to read chats", out)
+        self.assertNotRegex(out, r"\d")
+
+    def test_a_raising_read_is_honest(self):
+        with mock.patch.object(self.mod, "is_configured", return_value=True), \
+                mock.patch.object(self.mod, "get_teams_unread_count",
+                                  side_effect=RuntimeError("boom")), \
+                mock.patch.object(self.mod, "_teams_toast_records", return_value=None), \
+                mock.patch("builtins.print"):
+            self.assertIn("couldn't reach", self.mod.action_teams_unread(""))
+
+    def test_graph_get_records_why(self):
+        import urllib.error
+        with mock.patch.object(self.mod, "get_access_token", return_value=None):
+            self.assertIsNone(self.mod._graph_get("/me/chats"))
+        self.assertEqual(self.mod._graph_last_status[0], 0)
+        err = urllib.error.HTTPError("u", 403, "Forbidden", {}, None)
+        with mock.patch.object(self.mod, "get_access_token", return_value="t"), \
+                mock.patch("urllib.request.urlopen", side_effect=err), \
+                mock.patch("builtins.print"):
+            self.assertIsNone(self.mod._graph_get("/me/chats"))
+        self.assertEqual(self.mod._graph_last_status[0], 403)
+
+    def test_toasts_come_from_the_live_triage_copy(self):
+        import sys
+        import types
+        live = types.SimpleNamespace(recent_notifications=lambda n: [{"app": "Teams"}])
+        with mock.patch.dict(sys.modules, {"skill_notification_triage": live}):
+            self.assertEqual(self.mod._teams_toast_records(), [{"app": "Teams"}])
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop("skill_notification_triage", None)
+            self.assertIsNone(self.mod._teams_toast_records())
+
+
 if __name__ == "__main__":
     unittest.main()

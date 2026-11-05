@@ -690,5 +690,136 @@ class SwitchesTests(unittest.TestCase):
         self.assertFalse(SR.start())          # reads_blocked() is on in tests
 
 
+class TitlePrecheckTests(Harness):
+    """v3.0.11: a hashtag title reaches no brain. Live 2026-11-05 12:06, 12:12,
+    12:20: a full brain call each, then the drop."""
+    TAGGED = ("Grandpa was just trying to take her to school. #roadside #help "
+              "- YouTube - Google Chrome")
+
+    def _tagged_now(self):
+        self.start_with_old_video()
+        self.assertEqual(self.new_video(self.TAGGED)["action"], "wait")
+        return self.go(30.0)
+
+    def test_no_brain_call_and_no_remark(self):
+        out = self._tagged_now()
+        self.assertEqual(out, {"action": "dropped", "why": "title has hashtags"})
+        self.assertEqual(self.asked, [])
+        self.assertEqual(self.said, [])
+
+    def test_it_is_consumed_and_holds_up_nothing_else(self):
+        self._tagged_now()
+        self.assertEqual(self.go(10.0)["why"], "already handled")
+        self.assertEqual(self.r.last_attempt, 0.0)
+        self.assertEqual(self.new_video()["action"], "wait")
+        self.assertEqual(self.go(30.0)["action"], "remark")
+        self.assertEqual(len(self.asked), 1)
+
+    def test_flag_off_asks_the_brain(self):
+        with mock.patch.object(cfg, "SCREEN_REMARK_TITLE_PRECHECK", False, create=True):
+            self._tagged_now()
+        self.assertEqual(len(self.asked), 1)
+
+    def test_what_counts_as_a_hashtag(self):
+        for title in ("Clip #shorts", "#poker night", "a #b2b story", "hit (#fyp)"):
+            with self.subTest(title=title):
+                self.assertTrue(SR.title_has_hashtag(title))
+        for title in ("C# in an hour", "Episode #12", "Top 10 #1 hits", "F#", "",
+                      None, "Was the dealership being honest about this truck?"):
+            with self.subTest(title=title):
+                self.assertFalse(SR.title_has_hashtag(title))
+
+
+class IntentTagTests(Harness):
+    """38 of 38 logged remarks were dropped as "carries a tag": the persona leads
+    every reply with [intent:xxx]. SCREEN_REMARK_STRIP_INTENT ships off."""
+    LINE = "Ah, a gambling confession, sir. Bold of you to watch it live."
+
+    def test_off_by_default_the_drop_stands(self):
+        self.reply[0] = "[intent:dry_wit] " + self.LINE
+        out = self.remark_now()
+        self.assertEqual(out, {"action": "dropped", "why": "carries a tag"})
+        self.assertEqual(self.said, [])
+
+    def test_on_the_leading_tag_goes_and_the_remark_is_spoken(self):
+        self.reply[0] = "[intent:dry_wit] " + self.LINE
+        with mock.patch.object(cfg, "SCREEN_REMARK_STRIP_INTENT", True, create=True):
+            out = self.remark_now()
+        self.assertEqual(out["action"], "remark")
+        self.assertEqual(self.said, [self.LINE])
+
+    def test_on_any_other_bracket_still_drops(self):
+        self.reply[0] = "[intent:dry_wit] " + self.LINE + " [ACTION: see_screen]"
+        with mock.patch.object(cfg, "SCREEN_REMARK_STRIP_INTENT", True, create=True):
+            out = self.remark_now()
+        self.assertEqual(out["why"], "carries a tag")
+        self.assertEqual(self.said, [])
+
+    def test_strip_intent_lead(self):
+        self.assertEqual(SR.strip_intent_lead("[intent:dry_wit] Hello there"), "Hello there")
+        self.assertEqual(SR.strip_intent_lead("Hello [intent:dry_wit] there"),
+                         "Hello [intent:dry_wit] there")
+        self.assertEqual(SR.strip_intent_lead("[ACTION: x] Hello"), "[ACTION: x] Hello")
+        self.assertEqual(SR.strip_intent_lead(None), "")
+
+
+
+class DoomedCallTests(Harness):
+    """SCREEN_REMARK_SKIP_DOOMED_CALL: live 2026-11-05 12:18:34, a title with no
+    hashtag took a brain call and was dropped for the persona's leading tag."""
+    TITLE = "Was the dealership being honest about this truck?"
+
+    def setUp(self):
+        super().setUp()
+        self.r.llm_leads_with_tag = True
+        self.reply[0] = "[intent:dry_wit] A dealership, sir. Bold of you to watch it."
+
+    def _remark_with_title(self):
+        item = {"title": self.TITLE, "host": "www.youtube.com", "process": "chrome.exe",
+                "kind": "video", "since": self.now[0], "hwnd": 10, "key": "k"}
+        with mock.patch.object(self.r, "_consume") as consumed, \
+                mock.patch.object(self.r, "_facts", return_value={
+                    "title": self.TITLE, "host": "www.youtube.com",
+                    "process": "", "lines": []}):
+            out = self.r._remark(item, self.now[0], 12)
+        return out, consumed
+
+    def test_no_brain_call_while_the_strip_flag_is_off(self):
+        out, consumed = self._remark_with_title()
+        self.assertEqual(out, {"action": "dropped", "why": "reply would carry a tag"})
+        self.assertEqual(self.asked, [])
+        self.assertEqual(self.said, [])
+        self.assertEqual(self.r.last_attempt, 0.0)
+        consumed.assert_called_once()
+
+    def test_flag_off_asks_the_brain_and_the_drop_stands(self):
+        with mock.patch.object(cfg, "SCREEN_REMARK_SKIP_DOOMED_CALL", False, create=True):
+            out, _ = self._remark_with_title()
+        self.assertEqual(len(self.asked), 1)
+        self.assertEqual(out, {"action": "dropped", "why": "carries a tag"})
+
+    def test_strip_on_brings_the_call_back(self):
+        with mock.patch.object(cfg, "SCREEN_REMARK_STRIP_INTENT", True, create=True):
+            self._remark_with_title()
+        self.assertEqual(len(self.asked), 1)
+
+    def test_a_brain_without_the_persona_is_still_asked(self):
+        self.r.llm_leads_with_tag = False
+        self.reply[0] = "A dealership, sir. Bold of you to watch it."
+        self._remark_with_title()
+        self.assertEqual(len(self.asked), 1)
+
+    def test_start_records_what_the_adapter_does(self):
+        r = SR.Remarker(persist=False)
+        with mock.patch.object(SR, "get", return_value=r), \
+                mock.patch.object(r, "start", return_value=True), \
+                mock.patch("core.screen_privacy.reads_blocked", return_value=False), \
+                mock.patch.object(SR, "_publish"):
+            SR.start(llm=lambda a, u: "", llm_leads_with_tag=True)
+            self.assertTrue(r.llm_leads_with_tag)
+            SR.start(llm=lambda a, u: "")
+            self.assertFalse(r.llm_leads_with_tag)
+
+
 if __name__ == "__main__":
     unittest.main()

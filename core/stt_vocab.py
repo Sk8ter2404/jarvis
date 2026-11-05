@@ -53,6 +53,21 @@ def hotwords_arg(hotwords) -> "str | None":
     return ", ".join(words)[:400] or None
 
 
+def with_extra_hotwords(hotwords, extra) -> str:
+    """The STT_HOTWORDS setting (string or list) as a comma-separated string with
+    each of ``extra`` added unless already there, whatever the case. Never raises."""
+    try:
+        words = _hotword_list(hotwords)
+        have = {" ".join(w.lower().split()) for w in words}
+        for w in _hotword_list(extra):
+            if " ".join(w.lower().split()) not in have:
+                words.append(w)
+                have.add(" ".join(w.lower().split()))
+        return ", ".join(words)
+    except Exception:
+        return hotwords if isinstance(hotwords, str) else ""
+
+
 def is_hotword_echo(text, hotwords) -> bool:
     """True when `text` is Whisper reading the hotwords hint back instead of speech:
     at least three hotword mentions (wake words count here) making up most of it.
@@ -215,6 +230,55 @@ def fix_command_mishearings(text: str) -> str:
         return text
     except Exception:
         return text
+
+
+# "on TV" is how the STT writes "on Teams" (live 2026-11-05 14:43:36: "any messages I
+# missed on TV while I was gone?"). "on TV" is usually right, so a plain replacement
+# cannot do this: it is rewritten ONLY when the same sentence asks about messages
+# (a message word in the eight words before it, plus a sign the owner means his own:
+# any / unread / missed / anyone / "do I have" ...) and says nothing about a programme.
+# "what's on TV", "any good movies on TV", "I missed the game on TV", "there was a
+# message on TV" and "turn on TV" are never touched.
+_TEAMS_HEARD_RE = re.compile(
+    r"(?<![\w'])(on|in)\s+(?:t\.\s?v\.?|t\s?v|teens|team['’]s)(?![\w'])", re.IGNORECASE)
+_TEAMS_MESSAGE_RE = re.compile(
+    r"\b(?:messages?|messaged|chats?|pings?|pinged|dms?|dmed|dm'd|replies|replied|reply|"
+    r"unread)\b", re.IGNORECASE)
+_TEAMS_OWN_RE = re.compile(
+    r"\b(?:any|unread|missed|new|anyone|anybody|someone|somebody|check|i\s+got|"
+    r"i've\s+got|have\s+i|do\s+i\s+have|did\s+i\s+(?:get|miss|have)|"
+    r"who\b[^.?!;]*\bme)\b", re.IGNORECASE)
+_TEAMS_MEDIA_RE = re.compile(
+    r"\b(?:movies?|films?|shows?(?!\s+me\b)|games?|match(?:es)?|news|episodes?|channels?|"
+    r"watch(?:ing|ed)?|series|commercials?|ads?|adverts?|interview|sports?|playing|"
+    r"program(?:me)?s?|cartoons?|hockey|football|basketball|baseball|debate|president|"
+    r"what'?s\s+on|turn(?:ed|ing)?|switch(?:ed|ing)?|put(?:ting)?)\b", re.IGNORECASE)
+
+
+def fix_teams_mishearing(text: str) -> "tuple[str, int]":
+    """(text, number of rewrites): "on TV" / "in TV" (also "teens", "team's") read as
+    "on Teams" where the sentence asks about the owner's messages. Everything else is
+    unchanged. Never raises."""
+    try:
+        if not isinstance(text, str) or not text or not _TEAMS_HEARD_RE.search(text):
+            return text, 0
+        count = [0]
+
+        def _sub(m):
+            start = max(text.rfind(c, 0, m.start()) for c in ".?!;") + 1
+            ends = [i for i in (text.find(c, m.end()) for c in ".?!;") if i >= 0]
+            sentence = text[start:min(ends) if ends else len(text)]
+            before = text[start:m.start()]
+            near = " ".join(before.split()[-8:])
+            if (_TEAMS_MESSAGE_RE.search(near) and _TEAMS_OWN_RE.search(before)
+                    and not _TEAMS_MEDIA_RE.search(sentence)):
+                count[0] += 1
+                return m.group(1) + " Teams"
+            return m.group(0)
+
+        return _TEAMS_HEARD_RE.sub(_sub, text), count[0]
+    except Exception:
+        return text, 0
 
 
 _SHORTCUT_NOISE_RE = re.compile(r"^(?:the|my|our)\s+|\s+(?:site|website|page|tickets?|app)$")
