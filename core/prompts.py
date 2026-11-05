@@ -56,6 +56,15 @@ def _prompt_v3_on() -> bool:
         return False
 
 
+def _teams_unread_on() -> bool:
+    """TEAMS_UNREAD_ACTION (core/config.py, v3.0.11). Never raises."""
+    try:
+        import core.config as _cfg
+        return bool(getattr(_cfg, "TEAMS_UNREAD_ACTION", True))
+    except Exception:
+        return True
+
+
 def _apply_swaps(text: str, swaps) -> str:
     for old, new in swaps:
         text = text.replace(old, new, 1)
@@ -679,6 +688,17 @@ PC_CONTROL_SAFETY_RULES = (
     "subject is the only thing you must never send.\n\n"
 )
 
+# v3.0.11 (TEAMS_UNREAD_ACTION): live 2026-11-05 14:43:39 "I've no way to check
+# that, sir" about missed messages, with an unread count no action had given him
+# in the same reply. Exact text swap like the V3 ones; off, every byte as before.
+if _teams_unread_on():
+    PC_CONTROL_SAFETY_RULES = _apply_swaps(PC_CONTROL_SAFETY_RULES, (
+        ("That sentence means NO SUCH CAPABILITY EXISTS. ",
+         "Messages DO have a check: 'any messages I missed', 'any Teams "
+         "messages', 'who messaged me' are [ACTION: teams_unread]. Never answer "
+         "those with no way to check, never say you can only see this computer, "
+         "and never state a message count no action gave you this turn.\n"
+         "That sentence means NO SUCH CAPABILITY EXISTS. "),))
 PC_CONTROL_SAFETY_RULES_V2 = PC_CONTROL_SAFETY_RULES
 if _prompt_v3_on():
     PC_CONTROL_SAFETY_RULES = _apply_swaps(
@@ -3440,6 +3460,16 @@ _ROUTED_V3_SWAPS = (
      "    <that question>], never screenshot.\n\n"),
 )
 
+# v3.0.11 (TEAMS_UNREAD_ACTION): the read-only Teams reading.
+if _teams_unread_on():
+    PC_CONTROL_PROMPT = _apply_swaps(PC_CONTROL_PROMPT, (
+        ("    Example: 'what did I miss' → [ACTION: recent_notifications_summary, 10]\n\n",
+         "    Example: 'what did I miss' → [ACTION: recent_notifications_summary, 10]\n"
+         "  teams_unread                  — unread Teams chats and the newest sender,\n"
+         "                                  plus any Teams toasts caught. Says so\n"
+         "                                  when Microsoft Graph can't be read.\n"
+         "    Trigger phrases: 'any messages I missed', 'any Teams messages', 'did\n"
+         "    anyone message me', 'who messaged me'. 'Any email?' is NOT this.\n\n"),))
 # Pre-W07 text, kept whole: the off path (and tests) read this.
 PC_CONTROL_PROMPT_V2 = PC_CONTROL_PROMPT
 if _routed_v3_on():

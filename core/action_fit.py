@@ -109,6 +109,7 @@ RULE_ACK_REPEAT = 7
 _STATUS_NAME_RE = re.compile(r"^(?:list|which|check|get)_|_status$")
 STATUS_ACTIONS = frozenset({
     "system_pulse", "network_usage", "audio_check", "smart_home_status",
+    "teams_unread",
 })
 
 
@@ -693,8 +694,13 @@ _PRINT_TOPIC_RE = re.compile(
     # the job going?", "is the plate ready?", "how's the engraving going".
     r"longer|far\s+along|job|plate|laser|engrav\w*|ready|minutes?|hours?|"
     r"time)\b|%", re.I)
+# v3.0.11: teams_unread answers about messages; "any unread email?" is not it.
+_TEAMS_TOPIC_RE = re.compile(
+    r"\b(?:teams|messag\w*|chats?|pings?|pinged|dms?|missed|"
+    r"unread(?!\s+(?:e-?)?mails?))\b", re.I)
 # action name -> (subject label for the log, the words that name it)
 TOPIC_ACTIONS = {
+    "teams_unread": ("teams", _TEAMS_TOPIC_RE),
     "server_status": ("server", _SERVER_TOPIC_RE),
     "check_print": ("print", _PRINT_TOPIC_RE),
     "how_is_the_print": ("print", _PRINT_TOPIC_RE),

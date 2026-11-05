@@ -55,6 +55,13 @@ class _Base(MonolithGlobalsTestCase):
         self.addCleanup(patcher.stop)
         return m
 
+    def setUp(self):
+        super().setUp()
+        # These remarks pin the older rules (time of day, persona copies,
+        # repeats, pacing). PROACTIVE_GROUNDED_ONLY (v3.0.11) drops ORIGINAL by
+        # design; test_monolith_teams_lane_3011 covers that rule.
+        self._p(self.bc, "PROACTIVE_GROUNDED_ONLY", False)
+
     def _quiet(self, fn, *a, **k):
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):

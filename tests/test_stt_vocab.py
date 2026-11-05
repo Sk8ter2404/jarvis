@@ -225,5 +225,73 @@ class LiveHotwordsTests(unittest.TestCase):
         self.assertEqual(sv.live_hotwords("Zorblat"), "Zorblat")
 
 
+class TeamsMishearingTests(unittest.TestCase):
+    """v3.0.11, live 2026-11-05 14:43:36: "on Teams" came out as "on TV"."""
+
+    def test_message_questions_are_corrected(self):
+        for heard, meant in (
+            ("Jarvis, any messages I missed on TV while I was gone?",
+             "Jarvis, any messages I missed on Teams while I was gone?"),
+            ("any new messages on TV", "any new messages on Teams"),
+            ("any messages on tv?", "any messages on Teams?"),
+            ("do I have any unread chats in TV", "do I have any unread chats in Teams"),
+            ("did anyone message me on T.V.", "did anyone message me on Teams"),
+            ("who pinged me on TV", "who pinged me on Teams"),
+            ("did anyone reply on TV", "did anyone reply on Teams"),
+            ("any replies on TV yet", "any replies on Teams yet"),
+            ("any messages on teens", "any messages on Teams"),
+            ("any unread messages on team's", "any unread messages on Teams"),
+        ):
+            with self.subTest(heard=heard):
+                self.assertEqual(sv.fix_teams_mishearing(heard), (meant, 1))
+
+    def test_ordinary_tv_talk_stays(self):
+        for line in (
+            "what's on TV",
+            "what's on TV tonight",
+            "any good movies on TV",
+            "anything good on TV",
+            "anything on TV",
+            "what did I miss on TV",
+            "I missed the game on TV",
+            "I missed that show on TV",
+            "did I miss the news on TV",
+            "put it on TV",
+            "turn on TV",
+            "any new messages turn on TV",
+            "any messages about the game on TV",
+            "I got a message. What's on TV?",
+            "there was a message on TV",
+            "the president's message on TV",
+            "did you see that chat on TV",
+            "he's in teens",
+            "teens on TV",
+            "any messages from the team's lead",
+            "",
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(sv.fix_teams_mishearing(line), (line, 0))
+
+    def test_junk_never_raises(self):
+        self.assertEqual(sv.fix_teams_mishearing(None), (None, 0))
+
+
+class ExtraHotwordTests(unittest.TestCase):
+    def test_added_to_an_empty_setting(self):
+        for empty in ("", None, []):
+            with self.subTest(empty=empty):
+                self.assertEqual(sv.with_extra_hotwords(empty, "Teams"), "Teams")
+
+    def test_added_once_whatever_the_case(self):
+        self.assertEqual(sv.with_extra_hotwords("Accelo, teams", "Teams"), "Accelo, teams")
+        self.assertEqual(sv.with_extra_hotwords(["Accelo"], "Teams"), "Accelo, Teams")
+
+    def test_it_reaches_whisper_and_the_echo_guard_holds(self):
+        setting = sv.with_extra_hotwords("", "Teams")
+        self.assertEqual(sv.hotwords_arg(setting), "Teams")
+        self.assertTrue(sv.is_hotword_echo("Teams, Teams, Teams.", setting))
+        self.assertFalse(sv.is_hotword_echo("any messages on Teams", setting))
+
+
 if __name__ == "__main__":
     unittest.main()

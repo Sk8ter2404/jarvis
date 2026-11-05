@@ -290,9 +290,15 @@ def get_access_token() -> str | None:
 
 # ─── Graph HTTP ──────────────────────────────────────────────────────────
 
+# Why the last _graph_get gave nothing, for teams_unread's honest answer: 0 = no
+# token, an HTTP code, -1 = the call failed. 200 on success.
+_graph_last_status: list = [None]
+
+
 def _graph_get(path: str, params: dict | None = None) -> dict | None:
     access_token = get_access_token()
     if not access_token:
+        _graph_last_status[0] = 0
         return None
     url = f"{_GRAPH_BASE}{path}"
     if params:
@@ -304,8 +310,11 @@ def _graph_get(path: str, params: dict | None = None) -> dict | None:
     })
     try:
         with urllib.request.urlopen(req, timeout=_GRAPH_TIMEOUT) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            body = json.loads(resp.read().decode("utf-8"))
+            _graph_last_status[0] = 200
+            return body
     except urllib.error.HTTPError as e:
+        _graph_last_status[0] = e.code
         try:
             detail = e.read().decode("utf-8", errors="replace")[:200]
         except Exception:
@@ -313,6 +322,7 @@ def _graph_get(path: str, params: dict | None = None) -> dict | None:
         print(f"  [ms_graph] http {e.code} on {path}: {e.reason} {detail}")
         return None
     except Exception as e:
+        _graph_last_status[0] = -1
         print(f"  [ms_graph] {path} failed: {e}")
         return None
 
@@ -822,6 +832,43 @@ def action_calendar_today(arg: str = "") -> str:
     return header + " — " + "; ".join(lines) + "."
 
 
+def _teams_toast_records() -> "list | None":
+    """Recent toasts from the LIVE notification_triage (load_skills registers it
+    as skill_notification_triage; a plain import would be a second, empty
+    copy). None when it is not loaded. Never raises."""
+    try:
+        triage = sys.modules.get("skill_notification_triage")
+        fn = getattr(triage, "recent_notifications", None)
+        return list(fn(100)) if callable(fn) else None
+    except Exception:
+        return None
+
+
+def action_teams_unread(_arg: str = "") -> str:
+    """Read-only: unread Teams chats and the newest sender from Graph, plus what
+    notification triage caught. Says why when Graph gives nothing. Speaks counts,
+    names and how long ago only (core/teams_unread.py), never a message body."""
+    from core import teams_unread as _tu
+    graph, status = None, "unconfigured"
+    try:
+        if is_configured():
+            _graph_last_status[0] = None
+            graph = get_teams_unread_count()
+            status = _graph_last_status[0]
+    except Exception as e:
+        print(f"  [ms_graph] teams_unread failed: {type(e).__name__}")
+        graph, status = None, -1
+    return _tu.compose(graph, status, _teams_toast_records(), time.time())
+
+
+def _teams_unread_on() -> bool:
+    try:
+        import core.config as _cfg
+        return bool(getattr(_cfg, "TEAMS_UNREAD_ACTION", True))
+    except Exception:
+        return True
+
+
 def register(actions):
     """Expose the calendar summary under every name the calendar_scanner
     sub-agent spec references, so the orchestrator can dispatch a real,
@@ -832,6 +879,8 @@ def register(actions):
     actions["calendar_next"]     = action_calendar_today
     print("  [ms_graph] ready — calendar actions: ms_graph_calendar, "
           "calendar_today, calendar_next.")
+    if _teams_unread_on():      # v3.0.11, core/config.py TEAMS_UNREAD_ACTION
+        actions["teams_unread"] = action_teams_unread
 
 
 # ─── manual smoke test / CLI ─────────────────────────────────────────────

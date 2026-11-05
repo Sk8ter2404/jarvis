@@ -437,6 +437,32 @@ def validate(line, facts_text, *, hour: int = 12, recent=()) -> tuple:
         return (False, f"check failed: {type(e).__name__}")
 
 
+# A hashtag in a video title (v3.0.11, SCREEN_REMARK_TITLE_PRECHECK): no remark
+# on that item and, above all, no brain call. "C# tutorial" and "Episode #12"
+# are not hashtags.
+_TITLE_HASHTAG_RE = re.compile(r"(?<![\w#])#[A-Za-z]\w*")
+# The tag the persona leads every reply with (core/prompts.py). This one tag
+# only, at the very start (SCREEN_REMARK_STRIP_INTENT): any other bracket still
+# fails validate as "carries a tag".
+_INTENT_LEAD_RE = re.compile(r"^\s*\[intent:\s*[a-z_ ]+\]\s*", re.IGNORECASE)
+
+
+def title_has_hashtag(title) -> bool:
+    """True when a title carries a #hashtag. Never raises."""
+    try:
+        return bool(_TITLE_HASHTAG_RE.search(str(title or "")))
+    except Exception:
+        return False
+
+
+def strip_intent_lead(line) -> str:
+    """``line`` without the one leading [intent:xxx] tag. Never raises."""
+    try:
+        return _INTENT_LEAD_RE.sub("", str(line or ""), count=1)
+    except Exception:
+        return str(line or "")
+
+
 def _norm(title) -> str:
     return " ".join(re.sub(r"[^a-z0-9 ]+", " ", str(title or "").lower()).split())
 
@@ -827,6 +853,14 @@ class Remarker:
                 "lines": lines}
 
     def _remark(self, item, now, hour) -> dict:
+        # Nothing reaches the brain for a title that gets no remark anyway, and
+        # with no call made there is nothing to wait out (no last_attempt).
+        if (bool(_cfg("SCREEN_REMARK_TITLE_PRECHECK", True))
+                and title_has_hashtag(item.get("title"))):
+            self._consume(item)
+            _log(f"dropped before the brain (title has hashtags) for "
+                 f"'{item['title'][:60]}'")
+            return {"action": "dropped", "why": "title has hashtags"}
         self.last_attempt = now
         if not callable(self.llm) or not callable(self.announce):
             return {"action": "hold", "why": "no voice wired"}
@@ -839,6 +873,8 @@ class Remarker:
             _log(f"generation failed ({type(e).__name__}): {e}")
             return {"action": "dropped", "why": "generation failed"}
         line = str(raw or "").strip().split("\n")[0].strip()
+        if bool(_cfg("SCREEN_REMARK_STRIP_INTENT", False)):
+            line = strip_intent_lead(line).strip()
         ok, why = validate(line, facts_text(facts), hour=hour,
                            recent=self.recent)
         self._consume(item)           # one attempt per item, spoken or not

@@ -16985,7 +16985,25 @@ def generate_proactive_comment(now: float | None = None) -> str:
     base = _system_prompt
     if _llm_quick_goes_local():
         base = _local_stable_system_prompt(base) or base
+    # 2026-11-05 (PROACTIVE_GROUNDED_ONLY): the prompt told the model the owner
+    # was quiet and offered "a brief check-in", and it answered with exactly
+    # that: "a remarkably productive morning", "you've been quite still", "I
+    # couldn't help but notice the silence". A fact or nothing.
+    grounded = bool(globals().get("PROACTIVE_GROUNDED_ONLY", True))
     system = base + (
+        "\n\nYou are now generating a PROACTIVE comment, an optional aside. "
+        "You know nothing about what your owner is doing, how his day is going "
+        "or how he seems. Offer ONE short, interesting, true fact related to "
+        "his interests, and only one you are sure of. If you have none, reply "
+        "with exactly SKIP. Never mention the silence, the quiet, stillness, "
+        "how long it has been, how productive or busy he is, or anything you "
+        "have noticed or observed. Mention the time of day only if it matches "
+        "the local time given below. Never raise an "
+        "auto-learned topic or project from memory: those are unverified and "
+        "may be mis-heard. Say something NEW in your own words: never reuse "
+        "a line from the phrasebook or the example lines above. "
+        "Keep it to ONE sentence. Do not start with 'Hey' or any greeting."
+    ) if grounded else base + (
         "\n\nYou are now generating a PROACTIVE comment. Your owner has been "
         "quiet for a while but you can see them at their desk. "
         "Pick ONE of: a short interesting fact related to their interests, "
@@ -17003,7 +17021,8 @@ def generate_proactive_comment(now: float | None = None) -> str:
     clock = time.strftime("%I:%M %p", lt).lstrip("0")
     recent = list(_proactive_recent)
     user = (f"(Local time: {clock}, {_proactive_guard.day_part(lt.tm_hour)}. "
-            "There has been silence. Generate one short proactive comment.")
+            + ("Give one short interesting fact, or SKIP." if grounded else
+               "There has been silence. Generate one short proactive comment."))
     if recent:
         user += (" Do not repeat any of these recent remarks: "
                  + " / ".join(f"'{r}'" for r in recent[-4:]) + ".")
@@ -17018,7 +17037,8 @@ def generate_proactive_comment(now: float | None = None) -> str:
     if not line.strip():
         return ""
     ok, why = _proactive_guard.check_remark(line, hour=lt.tm_hour,
-                                            recent=recent)
+                                            recent=recent,
+                                            grounded_only=grounded)
     if not ok:
         print(f"  [proactive] dropped ({why})")
         return ""
@@ -18018,6 +18038,11 @@ _TURN_FLAG_KEYS = (
     "FINISH_LINE_KEEP", "PRINT_MILESTONE_SUPERSEDE",
     "PRINT_MILESTONE_ONE_LINE", "PENDING_REQUEUE_SUPERSEDE",
     "MEDIA_AEC_DELAY_BOUNDS", "TV_DETECT_ADAPTIVE_BASELINE",
+    # v3.0.11 lane T: Teams heard as TV, the teams_unread route, idle remarks
+    # with nothing behind them, screen remarks on hashtag titles.
+    "STT_TEAMS_FIX", "STT_TEAMS_HOTWORD", "TEAMS_UNREAD_ACTION",
+    "PROACTIVE_GROUNDED_ONLY", "SCREEN_REMARK_TITLE_PRECHECK",
+    "SCREEN_REMARK_STRIP_INTENT",
 )
 
 
@@ -18513,10 +18538,23 @@ def _parakeet_decode(audio, wait_for_load: bool = True):
         _parakeet_lock.release()
 
 
+def _stt_fix_mishearings(text: str) -> str:
+    """The context-aware transcript fixes, after the plain replacements, for
+    every engine: a misheard "YouTube" in a command, and (STT_TEAMS_FIX,
+    v3.0.11) "on TV" in a line that asks about his messages. Logs a short tag,
+    never the transcript. Never raises."""
+    text = _stt_vocab.fix_command_mishearings(text)
+    if globals().get("STT_TEAMS_FIX", True):
+        text, _n = _stt_vocab.fix_teams_mishearing(text)
+        if _n:
+            print("  [stt] teams-fix (a message question said 'on TV')")
+    return text
+
+
 def _parakeet_post_text(text: str) -> str:
     """STT_REPLACEMENTS (as for Whisper), then STT_REPLACEMENTS_PARAKEET."""
     text = _stt_vocab.apply_replacements(text, globals().get("STT_REPLACEMENTS"))
-    return _stt_vocab.fix_command_mishearings(_stt_vocab.apply_replacements(
+    return _stt_fix_mishearings(_stt_vocab.apply_replacements(
         text, globals().get("STT_REPLACEMENTS_PARAKEET")))
 
 
@@ -21798,6 +21836,8 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
             # Read LIVE (2026-10-01): an edit to data/user_settings.json after
             # start applies without a restart (core/stt_vocab.live_hotwords).
             _hot_setting = _stt_vocab.live_hotwords(globals().get("STT_HOTWORDS"))
+            if globals().get("STT_TEAMS_HOTWORD", True):   # v3.0.11
+                _hot_setting = _stt_vocab.with_extra_hotwords(_hot_setting, "Teams")
             _hot = _stt_vocab.hotwords_arg(_hot_setting)
             _vad_params = dict(threshold=0.3, min_speech_duration_ms=80)
             _knobs = _whisper_decode_kwargs()      # R11 (defaults: unchanged)
@@ -21853,7 +21893,7 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
                     print(f"  [stt] dropped a hotword echo ({len(text)} chars) — "
                           f"{_why}; noise, not speech")
                     return "", {"no_speech_prob": 1.0, "avg_logprob": -10.0}
-            text = _stt_vocab.fix_command_mishearings(_stt_vocab.apply_replacements(
+            text = _stt_fix_mishearings(_stt_vocab.apply_replacements(
                 text, globals().get("STT_REPLACEMENTS")))
             if not segments:
                 # info still carries some signal even on empty transcription
@@ -21883,7 +21923,7 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
         # Clean decode — reset the consecutive CUDA-failure counter (see the
         # faster-whisper branch above). 2026-07-08.
         _consecutive_whisper_cuda_failures = 0
-        text = _stt_vocab.fix_command_mishearings(_stt_vocab.apply_replacements(
+        text = _stt_fix_mishearings(_stt_vocab.apply_replacements(
             result["text"].strip(), globals().get("STT_REPLACEMENTS")))
         segments = result.get("segments", [])
         if not segments:
@@ -23131,6 +23171,19 @@ def _play_music_transport_hint() -> str:
             "next_song, never play_music\n")
 
 
+def _teams_unread_hint() -> str:
+    """The teams_unread line in the local cheat sheet (v3.0.11): only with the
+    action registered, and _local_cheatsheet's cache follows the action count.
+    Never raises."""
+    try:
+        if "teams_unread" not in ACTIONS:
+            return ""
+    except Exception:
+        return ""
+    return ("  [ACTION: teams_unread]   \"any messages I missed\" / \"any Teams "
+            "messages\" / \"who messaged me\"   (a real reading; NOT email)\n")
+
+
 def _local_cheatsheet() -> str:
     """A COMPACT action reference that REPLACES the ~18k-token PC_CONTROL_PROMPT
     for local-model calls.
@@ -23216,6 +23269,7 @@ def _local_cheatsheet() -> str:
         "  [ACTION: show_printer_camera]   'show me the printer camera' / 'pull up the H2D camera' / 'watch the print'   [ACTION: hide_printer_camera]   'close the printer camera'\n"
         "  [ACTION: weather_briefing]   [ACTION: news_briefing]   [ACTION: morning_briefing]\n"
         "  [ACTION: calendar_today]   \"what's on my calendar\" / \"what's on my schedule\" / \"do I have any meetings\"   (read the calendar; arg = today/tomorrow/this week; NOT morning_briefing)\n"
+        + _teams_unread_hint() +
         "  [ACTION: queue_task, <task for Claude Code>]   [ACTION: show_tasks]\n"
         "  [ACTION: smart_home_control, <plain request>]   [ACTION: make_picture, <prompt>]\n"
         "Choosing YOUR OWN local brain (which Ollama model runs you):\n"
@@ -41292,6 +41346,10 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     "version_info", "what_version", "when_updated",
     # Tray icon brought back (_act_show_tray) — one finished sentence.
     "show_tray",
+    # Teams unread (skills/ms_graph.py, v3.0.11): built only from what Graph and
+    # the toast listener hold. Spoken as written - an LLM restatement could put
+    # back the invented count it replaces.
+    "teams_unread",
     # Single-sentence health/status aggregator (skills/system_pulse.py) and its
     # natural-phrasing aliases. Each returns one finished status sentence.
     "system_pulse", "check_system", "status_report",
@@ -50954,6 +51012,8 @@ def _run_voice_shortcuts(text: str) -> bool:
         return True
     if _run_room_noise_shortcut(text):
         return True
+    if _run_teams_unread_shortcut(text):
+        return True
 
     # "Jarvis, turn it off" with nothing for "it" to mean (2026-10-01): ask,
     # never let the model guess. See _run_pronoun_switch_shortcut.
@@ -51197,6 +51257,22 @@ def _run_untimed_reminder_shortcut(text: str) -> bool:
         text, "untimed-reminder", lambda _t: True, (intent.action,),
         empty_reply="I couldn't update that list just now, sir.",
         arg=intent.arg)
+
+
+def _run_teams_unread_shortcut(text: str) -> bool:
+    """"any messages I missed" / "any Teams messages" / "did anyone message me"
+    / "who messaged me" -> teams_unread's reading, with no LLM (v3.0.11, live
+    2026-11-05 14:43:39: "I've no way to check that, sir" with an invented
+    count in the same reply). Recognition is whole-line only, and another
+    channel named keeps it away ("any email?" stays with the email actions).
+    TEAMS_UNREAD_ACTION False or no such action -> False, so the LLM answers.
+    Never raises."""
+    if not globals().get("TEAMS_UNREAD_ACTION", True):
+        return False
+    from core import teams_unread as _tu
+    return _run_action_shortcut(
+        text, "teams-unread", _tu.asks_teams_messages, ("teams_unread",),
+        empty_reply="I couldn't read Teams just now, sir.")
 
 
 def _run_room_noise_shortcut(text: str) -> bool:

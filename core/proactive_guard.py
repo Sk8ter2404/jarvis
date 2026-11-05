@@ -227,11 +227,70 @@ def repeats_recent(text, recent) -> str:
         return ""
 
 
-def check_remark(text, *, hour: int, recent=(), pool=None) -> tuple:
+# ── remarks with nothing behind them (v3.0.11, PROACTIVE_GROUNDED_ONLY) ─────
+# Live 2026-11-05: "it's a remarkably productive morning so far" (11:35:27),
+# "You've been quite still for some time, sir" (13:07:48), "I couldn't help but
+# notice the silence, sir" (14:56:48). JARVIS knows nothing about the owner's
+# productivity, and the silence is the very thing that triggered the prompt. A
+# fact that merely uses "still" or "noticed" is not caught ("Honey is still
+# edible", "Fleming noticed the mould"); a remark is optional, so a fact that
+# says "busy" or "productive" may be lost, and that is fine.
+_NOTHING_REPLY_RE = re.compile(
+    r"^\W*(?:skip|nothing|none|n/?a|no comment)\W*(?:sir\W*)?$")
+_UNGROUNDED_RES: tuple = (
+    ("the silence", re.compile(r"\bsilen(?:ce|t)\b|\bhush\b")),
+    ("the quiet", re.compile(
+        r"\b(?:been|so|very|rather|quite|awfully|remarkably|unusually|"
+        r"uncharacteristically|it's|it is|all|too)\s+quiet\b|"
+        r"\bquiet\s+(?:in here|around here|today|for|lately|so far)\b|"
+        r"\bpeace and quiet\b")),
+    ("not speaking", re.compile(
+        r"\b(?:haven't|have not|hasn't|not)\s+(?:said|spoken|uttered)\b|"
+        r"\bsaid a word\b")),
+    ("stillness", re.compile(
+        r"\bstillness\b|\b(?:haven't|have not|not)\s+moved\b|"
+        r"\b(?:quite|very|rather|so|awfully|remarkably|unusually|sitting|sat|"
+        r"stayed|remained|been)\s+still\b(?!\s+\w+ing\b)")),
+    ("how productive he is", re.compile(
+        r"\bproductiv\w+\b|\bbusy\b|\bhard at (?:work|it)\b|"
+        r"\bworking (?:\w+ )?hard\b|\bon a roll\b|\bdiligent\w*\b|"
+        r"\bgetting (?:a lot|lots|much|plenty) done\b")),
+    # JARVIS as the one noticing, not "Fleming noticed the mould".
+    ("what JARVIS noticed", re.compile(
+        r"\bif i may observe\b|"
+        r"\b(?:i|i've|i have|i'd|couldn't help but|can't help but|"
+        r"cannot help but|could not help but|hard not to)\b[^.?!]{0,30}?"
+        r"\b(?:notic(?:e|ed|ing)|observ(?:e|ed|ing)|sens(?:e|ed|ing)|"
+        r"detect(?:ed|ing)?)\b")),
+    ("how he seems", re.compile(r"\byou(?:'ve| have) been\b|\byou seem\b")),
+)
+
+
+def ungrounded_remark(text) -> str:
+    """What makes ``text`` an empty remark, or "": it says nothing ("SKIP"), or
+    talks about the silence, the quiet, stillness, how productive or busy the
+    owner is, or what JARVIS has noticed. Never raises."""
+    try:
+        s = _plain(text).strip()
+        if _NOTHING_REPLY_RE.match(s):
+            return "said nothing"
+        for name, rx in _UNGROUNDED_RES:
+            if rx.search(s):
+                return f"talks about {name}"
+        return ""
+    except Exception:
+        return ""
+
+
+def check_remark(text, *, hour: int, recent=(), pool=None,
+                 grounded_only: bool = False) -> tuple:
     """(ok, reason) for one generated proactive remark at local ``hour``.
 
     Dropped (ok False) when it states a time of day the clock contradicts,
-    copies a persona example, or repeats one of ``recent``. The reason names
+    copies a persona example, or repeats one of ``recent``; with
+    ``grounded_only`` also when it has nothing behind it (ungrounded_remark:
+    the idle remark asks for this, a screen remark built from what is on
+    screen does not). The reason names
     the rule (and the phrase/example it matched); it is for the log. An
     internal error drops the remark (a remark is optional, silence is safe)."""
     try:
@@ -247,6 +306,10 @@ def check_remark(text, *, hour: int, recent=(), pool=None) -> tuple:
         prior = repeats_recent(text, recent)
         if prior:
             return (False, "repeats a recent remark")
+        if grounded_only:
+            empty = ungrounded_remark(text)
+            if empty:
+                return (False, empty)
         return (True, "")
     except Exception as e:
         return (False, f"check failed: {type(e).__name__}")
