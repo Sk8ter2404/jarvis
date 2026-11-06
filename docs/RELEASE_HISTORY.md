@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.12 (2026-11-05)
+
+Test tooling only, nothing he says or does changes. GitHub's test run for v3.0.11 failed, and every local and server run passes, including a copy of GitHub's setup. GitHub's log needs a sign-in, so a failed run now names its failing tests in the public annotations.
+
 ## v3.0.11 (2026-11-05)
 
 From today's live log. Asked what you're holding, wearing or showing him, JARVIS now looks through the camera before he answers, and says so when he couldn't get a look or the picture isn't current, instead of inventing an object. 'Look again' looks again through the camera, and a plain 'try again' only does so right after a look. He no longer promises to update a visual database he doesn't have. 'What did you say?' repeats his last line word for word, 'Apologies, sir' isn't said three times in one turn, and a plain 'look again' no longer counts as stress. 'Messages on TV' is corrected to Teams when you're talking about messages. A new Teams check says what it can really read, and says plainly when it isn't signed in, so he no longer gives a count nothing read. Idle remarks about the silence or how productive you've been are gone, and screen remarks that could never be spoken no longer cost a brain call. Lines left in the queue from days ago no longer play at startup: that was the 'Good evening' briefing in the morning. The greeting now comes before the recap, a failed news check no longer becomes 'nothing of note overnight', and the news gets time while the brain warms up. Claps during video or TV are ignored, a late 'You rang?' is dropped, and old memory warnings and his own microphone choice stay out of the recap. The log now also counts how often the second speech check actually helps.

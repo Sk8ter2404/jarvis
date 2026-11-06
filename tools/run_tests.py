@@ -146,6 +146,33 @@ def _stop_lingering_daemons() -> None:
         pass
 
 
+# GitHub shows at most 10 error annotations per step.
+_MAX_ANNOTATIONS = 10
+
+
+def github_annotations(result, environ=None) -> list[str]:
+    """One ::error workflow command per failed test when running on GitHub
+    Actions, else nothing. A job's log needs a signed-in admin, but its annotations
+    are public, so this is how a red run names its tests. Test id and last
+    traceback line only. Never raises."""
+    try:
+        env = os.environ if environ is None else environ
+        if not env.get("GITHUB_ACTIONS"):
+            return []
+        bad = list(result.failures) + list(result.errors)
+        room = _MAX_ANNOTATIONS if len(bad) <= _MAX_ANNOTATIONS else _MAX_ANNOTATIONS - 1
+        lines = []
+        for test, trace in bad[:room]:
+            last = [ln for ln in str(trace).splitlines() if ln.strip()][-1:]
+            msg = f"{test.id()}: {last[0].strip() if last else ''}"[:300]
+            lines.append("::error title=Failed test::" + msg.replace("%", "%25"))
+        if len(bad) > room:
+            lines.append(f"::error title=Failed test::and {len(bad) - room} more")
+        return lines
+    except Exception:
+        return []
+
+
 def main(argv: list[str]) -> int:
     # HARD MEMORY CEILING FIRST — before any test is imported, before anything
     # allocates. Same family as the two redirect guards below (a test run must
@@ -233,6 +260,8 @@ def main(argv: list[str]) -> int:
     skipped = len(result.skipped)
     print(f"\n=== JARVIS TESTS: {total} run, {fails} failed, "
           f"{errs} errored, {skipped} skipped ===")
+    for line in github_annotations(result):
+        print(line)
     return 0 if result.wasSuccessful() else 1
 
 

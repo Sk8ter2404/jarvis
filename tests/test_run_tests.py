@@ -423,5 +423,45 @@ class EveryRunnerOwnsItsStreamTests(unittest.TestCase):
                                 f"{name} takes its stream after discovery")
 
 
+class GithubAnnotationTests(unittest.TestCase):
+    class _Test:
+        def __init__(self, name):
+            self.name = name
+
+        def id(self):
+            return self.name
+
+    def _result(self, failures=(), errors=()):
+        return types.SimpleNamespace(failures=list(failures), errors=list(errors))
+
+    def test_nothing_off_github(self):
+        res = self._result([(self._Test("a.b"), "Traceback\nAssertionError: x")])
+        self.assertEqual(RT.github_annotations(res, {}), [])
+
+    def test_names_each_failed_test_with_its_last_line(self):
+        res = self._result([(self._Test("a.b"), "Traceback\n  line\nAssertionError: x\n")],
+                           [(self._Test("c.d"), "Traceback\nValueError: 5% off")])
+        self.assertEqual(
+            RT.github_annotations(res, {"GITHUB_ACTIONS": "true"}),
+            ["::error title=Failed test::a.b: AssertionError: x",
+             "::error title=Failed test::c.d: ValueError: 5%25 off"])
+
+    def test_stays_within_githubs_ten_and_says_how_many_are_left(self):
+        res = self._result([(self._Test(f"t{i}"), "E") for i in range(13)])
+        got = RT.github_annotations(res, {"GITHUB_ACTIONS": "1"})
+        self.assertEqual(len(got), 10)
+        self.assertEqual(got[-1], "::error title=Failed test::and 4 more")
+
+    def test_exactly_ten_are_all_named(self):
+        res = self._result([(self._Test(f"t{i}"), "E") for i in range(10)])
+        got = RT.github_annotations(res, {"GITHUB_ACTIONS": "1"})
+        self.assertEqual(len(got), 10)
+        self.assertIn("t9", got[-1])
+
+    def test_never_raises(self):
+        self.assertEqual(
+            RT.github_annotations(object(), {"GITHUB_ACTIONS": "1"}), [])
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main(verbosity=2)
