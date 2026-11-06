@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.13 (2026-11-06)
+
+The webcam two-hand window grab stops dropping the window. From a recording of the real tracker on the Dell: a held fist often reads as a pinch, which ended the grab, and a tiny phantom second hand kept replacing the real one. A grab now holds through both, and opening a hand or losing one still lets go. The hand mouse ignores the phantom too.
+
 ## v3.0.12 (2026-11-05)
 
 Test tooling only, nothing he says or does changes. GitHub's test run for v3.0.11 failed, and every local and server run passes, including a copy of GitHub's setup. GitHub's log needs a sign-in, so a failed run now names its failing tests in the public annotations.

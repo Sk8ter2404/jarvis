@@ -412,6 +412,58 @@ class _Confirm:
         return self.stable
 
 
+def _hand_x(h: dict) -> Optional[float]:
+    """The hand's x in the mirrored frame, or None when it has no position."""
+    palm = h.get("palm")
+    try:
+        return float(palm[0])
+    except Exception:
+        pt = pinch_point(h.get("lm"))
+        return pt[0] if pt is not None else None
+
+
+def hands_by_side(raw, fw: float, fh: float, p: "Params") -> dict:
+    """{side: hand}, at most one hand per side, from a tracker message's list.
+
+    MediaPipe's score cannot be the deciding vote. Live on the Dell 2026-11-06
+    it reported a phantom second "Left" hand (size 0.03 of the frame against
+    0.17 for the real one) at score 0.99 for 10 s; picking the higher score
+    swapped between the two 28 times, and every swap rebuilt the track and its
+    settle time. So a hand big enough to be real beats a smaller one first, and
+    the score only decides between equals. A side holding only too-small hands
+    still returns one: the usable rule refuses it downstream, as before.
+
+    It also labelled two real hands "Left" at once. With two real hands on one
+    label and none on the other, position decides: the frame is mirrored, so
+    the lower x is the owner's left.
+    """
+    groups: dict = {}
+    for h in (raw or []):
+        if isinstance(h, dict):
+            groups.setdefault(str(h.get("side", "")), []).append(h)
+
+    def real(h) -> bool:
+        return hand_size(h, fw, fh) >= p.min_size_off
+
+    def rank(h):
+        try:
+            score = float(h.get("score", 0) or 0)
+        except Exception:
+            score = 0.0
+        return (real(h), score)
+
+    for side, other in (("Left", "Right"), ("Right", "Left")):
+        mine = [h for h in groups.get(side, []) if real(h)]
+        if len(mine) < 2 or any(real(h) for h in groups.get(other, [])):
+            continue
+        placed = [(x, h) for x, h in ((_hand_x(h), h) for h in mine) if x is not None]
+        if len(placed) >= 2:
+            placed.sort(key=lambda item: item[0])
+            return {"Left": dict(placed[0][1], side="Left"),
+                    "Right": dict(placed[-1][1], side="Right")}
+    return {side: max(hs, key=rank) for side, hs in groups.items()}
+
+
 class _SideTrack:
     """What the hand mouse knows about the hand on one side of the frame."""
 
@@ -654,13 +706,8 @@ class HandMouse:
                 if not self.enabled:
                     return
                 now = time.monotonic() if now is None else now
-                hands = {}
-                for h in (msg.get("hands") or []):
-                    if isinstance(h, dict):
-                        side = str(h.get("side", ""))
-                        if side not in hands or float(h.get("score", 0) or 0) > float(
-                                hands[side].get("score", 0) or 0):
-                            hands[side] = h
+                hands = hands_by_side(msg.get("hands"), msg.get("w") or 640,
+                                      msg.get("h") or 480, self.p)
                 self._note_tracks(hands, msg, now)
                 self._hands = hands
                 self._frame_at = now

@@ -333,5 +333,140 @@ class KinectHelperTests(unittest.TestCase):
         self.assertIsNone(sig.parameters["edge"].default)
 
 
+class WebcamMisreadTests(unittest.TestCase):
+    """Live on the Dell 2026-11-06: the tracker's misreads dropped held grabs."""
+
+    def feed(self, r, *hands):
+        r.t += 1.0 / r.fps
+        return r.g.on_hands(msg(*hands), now=r.t)
+
+    def fists(self, lid=1, rid=2, lx=0.40, rx=0.60):
+        return (hand(side="Left", state="fist", pt=(lx, 0.45), palm=(lx, 0.45), hid=lid),
+                hand(side="Right", state="fist", pt=(rx, 0.45), palm=(rx, 0.45), hid=rid))
+
+    def grabbed_rig(self):
+        r = Rig()
+        for _ in range(30):
+            self.feed(r, *self.fists())
+        self.assertEqual(r.g.grabs, 1)
+        self.assertTrue(r.g.last.resizing)
+        return r
+
+    def test_a_phantom_hand_on_one_side_does_not_stop_the_grab(self):
+        r = Rig()
+        phantom = hand(side="Left", state="pinch", pt=(0.8, 0.2), palm=(0.8, 0.2),
+                       score=1.0, size=0.03, hid=7)
+        for _ in range(90):
+            left, right = self.fists()
+            self.feed(r, left, right, phantom)
+        self.assertEqual(r.g.grabs, 1)
+        self.assertTrue(r.g.last.resizing)
+
+    def test_a_fist_read_as_a_pinch_keeps_the_grab(self):
+        r = self.grabbed_rig()
+        for _ in range(45):
+            left, _right = self.fists()
+            self.feed(r, left, hand(side="Right", state="pinch", pt=(0.6, 0.45),
+                                    palm=(0.6, 0.45), hid=2))
+        self.assertTrue(r.g.last.resizing)
+        self.assertEqual(r.g.grabs, 1)
+
+    def test_a_hand_on_its_way_to_open_lets_go_before_it_gets_there(self):
+        for state in ("point", "unknown"):
+            with self.subTest(state=state):
+                r = self.grabbed_rig()
+                for _ in range(15):      # 1 s, well past the 0.30 s dead-man
+                    left, _right = self.fists()
+                    self.feed(r, left, hand(side="Right", state=state, pt=(0.6, 0.45),
+                                            palm=(0.6, 0.45), hid=2))
+                self.assertFalse(r.g.last.resizing)
+
+    def test_one_misread_frame_is_not_a_release(self):
+        r = self.grabbed_rig()
+        for i in range(45):
+            left, _right = self.fists()
+            state = "unknown" if i % 15 == 0 else "fist"
+            self.feed(r, left, hand(side="Right", state=state, pt=(0.6, 0.45),
+                                    palm=(0.6, 0.45), hid=2))
+        self.assertTrue(r.g.last.resizing)
+        self.assertEqual(r.g.grabs, 1)
+
+    def test_an_open_hand_still_lets_go_after_a_misread(self):
+        r = self.grabbed_rig()
+        for state in ("pinch", "open"):
+            for _ in range(15):
+                left, _right = self.fists()
+                self.feed(r, left, hand(side="Right", state=state, pt=(0.6, 0.45),
+                                        palm=(0.6, 0.45), hid=2))
+        self.assertFalse(r.g.last.resizing)
+
+    def test_losing_a_hand_still_lets_go_after_a_misread(self):
+        r = self.grabbed_rig()
+        for _ in range(15):
+            left, _right = self.fists()
+            self.feed(r, left)
+        self.assertFalse(r.g.last.resizing)
+
+    def test_a_track_id_change_keeps_the_grab(self):
+        r = self.grabbed_rig()
+        for _ in range(45):
+            self.feed(r, *self.fists(lid=2, rid=1))
+        self.assertTrue(r.g.last.resizing)
+        self.assertEqual(r.g.grabs, 1)
+
+    def test_a_fist_read_as_a_pinch_still_cannot_start_a_grab(self):
+        r = Rig()
+        for _ in range(45):
+            left, _right = self.fists()
+            self.feed(r, left, hand(side="Right", state="pinch", pt=(0.6, 0.45),
+                                    palm=(0.6, 0.45), hid=2))
+        self.assertEqual(r.g.grabs, 0)
+
+    def test_two_real_hands_with_one_label_are_placed_by_position(self):
+        r = Rig()
+        for _ in range(30):
+            self.feed(r,
+                      hand(side="Left", state="fist", pt=(0.7, 0.45), palm=(0.7, 0.45), hid=1),
+                      hand(side="Left", state="fist", pt=(0.3, 0.45), palm=(0.3, 0.45), hid=2))
+        self.assertEqual(r.g.grabs, 1)
+        self.assertTrue(r.g.last.resizing)
+
+
+class HandsBySideTests(unittest.TestCase):
+    P = h2.hm.Params()
+
+    def pick(self, *hands):
+        return h2.hm.hands_by_side(list(hands), 640, 480, self.P)
+
+    def test_a_real_hand_beats_a_higher_scoring_phantom(self):
+        real = hand(side="Left", score=0.8, hid=1)
+        phantom = hand(side="Left", score=1.0, size=0.03, hid=2)
+        self.assertIs(self.pick(phantom, real)["Left"], real)
+        self.assertIs(self.pick(real, phantom)["Left"], real)
+
+    def test_the_score_decides_between_real_hands_when_both_sides_are_taken(self):
+        low, high = hand(side="Left", score=0.8, hid=1), hand(side="Left", score=0.9, hid=2)
+        right = hand(side="Right", hid=3)
+        got = self.pick(low, high, right)
+        self.assertIs(got["Left"], high)
+        self.assertIs(got["Right"], right)
+
+    def test_position_places_two_real_hands_on_one_label(self):
+        a = hand(side="Right", palm=(0.8, 0.4), hid=1)
+        b = hand(side="Right", palm=(0.2, 0.4), hid=2)
+        got = self.pick(a, b)
+        self.assertEqual((got["Left"]["id"], got["Right"]["id"]), (2, 1))
+        self.assertEqual((got["Left"]["side"], got["Right"]["side"]), ("Left", "Right"))
+        self.assertEqual(a["side"], "Right")     # the tracker's own dict is untouched
+
+    def test_only_a_small_hand_is_still_returned_for_the_usable_rule(self):
+        small = hand(side="Left", size=0.03, hid=1)
+        self.assertIs(self.pick(small)["Left"], small)
+
+    def test_garbage_is_ignored(self):
+        self.assertEqual(h2.hm.hands_by_side(None, 640, 480, self.P), {})
+        self.assertEqual(h2.hm.hands_by_side(["x", 3, None], 640, 480, self.P), {})
+
+
 if __name__ == "__main__":
     unittest.main()

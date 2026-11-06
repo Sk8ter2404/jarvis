@@ -19,6 +19,12 @@ THE GESTURE
           its centre, proportional to the hand distance).
   RELEASE open EITHER hand, or lose either hand -> it ends (after the
           controller's short dead-man grace), the window stays where it is.
+          Latching needs two clean fists, but a grab keeps holding on "pinch"
+          too: the tracker reads a held fist that way for seconds at a time (live
+          2026-11-06: a 5 s hold dropped after 0.7 s). "point" and "unknown" do
+          not hold, because that is what an opening hand reads on its way to
+          "open" (same recording), so they end it after the dead-man. A change
+          of the track id is not a new hand here.
 
 WHAT IS REUSED, NOT COPIED (skills/kinect_two_hand.py): the TwoHandController
 state machine (hold timer, distance / rect smoothing, dead-band, step limit,
@@ -47,6 +53,7 @@ from core import hand_mouse as hm
 LOG = "  [two-hand]"
 ACTIVE_TTL_S = 0.5          # no hands message for this long = not active
 GRIPS = {"fist": "closed", "open": "open"}   # tracker state -> controller grip
+HOLDING_STATES = ("fist", "pinch")           # keep a grab that already latched
 
 
 def _kinect_two_hand():
@@ -180,18 +187,19 @@ class TwoHandGrab:
 
     def _step(self, msg: dict, now: float):
         fw, fh = msg.get("w") or 640, msg.get("h") or 480
-        hands = {}
-        for h in (msg.get("hands") or []):
-            if isinstance(h, dict):
-                side = str(h.get("side", ""))
-                if side in ("Left", "Right") and (side not in hands or float(
-                        h.get("score", 0) or 0) > float(hands[side].get("score", 0) or 0)):
-                    hands[side] = h
+        hands = {side: h for side, h in
+                 hm.hands_by_side(msg.get("hands"), fw, fh, self.p).items()
+                 if side in ("Left", "Right")}
+        grabbed = self.ctrl.is_grabbed
         for side, h in hands.items():
             st = self._tracks.get(side)
             hid = h.get("id")
+            # While grabbed an id change keeps the track: rebuilding it restarts
+            # the settle time (0.40 s), longer than the dead-man (0.30 s), so
+            # every id change used to drop the window.
             if (st is None or now - st.last > self.p.track_gap_s
-                    or (hid is not None and st.id is not None and hid != st.id)):
+                    or (not grabbed and hid is not None and st.id is not None
+                        and hid != st.id)):
                 st = hm._SideTrack(now, hid)
                 self._tracks[side] = st
             st.note(h, now, hm.hand_size(h, fw, fh), self.p)
@@ -200,7 +208,9 @@ class TwoHandGrab:
                    and rt is not None and lt.pos is not None and rt.pos is not None)
         ready = present and lt.ready(now, self.p) and rt.ready(now, self.p)
         both_fists = ready and lt.state == "fist" and rt.state == "fist"
-        grabbed = self.ctrl.is_grabbed
+        # See RELEASE in the module docstring.
+        held = (grabbed and present and lt.state in HOLDING_STATES
+                and rt.state in HOLDING_STATES)
         hand_dist = mid = pts = None
         if present and (both_fists or grabbed):
             rect = self.p.screen_rect
@@ -229,7 +239,8 @@ class TwoHandGrab:
             bounds = self.win.bounds()
         except Exception:
             bounds = (0, 0, 1920, 1080)
-        decision = self.ctrl.update(both_engaged=both_fists, hand_dist=hand_dist,
+        decision = self.ctrl.update(both_engaged=both_fists or held,
+                                    hand_dist=hand_dist,
                                     midpoint=mid, focused_rect=focused,
                                     bounds=bounds, hands=pts,
                                     left_grip=grips[0], right_grip=grips[1],
