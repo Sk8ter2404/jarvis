@@ -21856,7 +21856,7 @@ def _transcribe_impl(audio: np.ndarray) -> tuple[str, dict]:
             # Read LIVE (2026-10-01): an edit to data/user_settings.json after
             # start applies without a restart (core/stt_vocab.live_hotwords).
             _hot_setting = _stt_vocab.live_hotwords(globals().get("STT_HOTWORDS"))
-            if globals().get("STT_TEAMS_HOTWORD", True):   # v3.0.11
+            if globals().get("STT_TEAMS_HOTWORD", False):   # v3.0.11
                 _hot_setting = _stt_vocab.with_extra_hotwords(_hot_setting, "Teams")
             _hot = _stt_vocab.hotwords_arg(_hot_setting)
             _vad_params = dict(threshold=0.3, min_speech_duration_ms=80)

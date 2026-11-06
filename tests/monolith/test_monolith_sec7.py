@@ -722,6 +722,9 @@ class RunLlmDispatchTests(SectionSevenBase):
 
     def test_glance_fast_path_used_when_available(self):
         self._p(self.bc, "maybe_glance_response", return_value="That's your editor, sir.")
+        # The window in front just changed: the only time the real glance answers,
+        # and when core.camera_ask gives "what is this" up to it.
+        self._p(self.bc, "_focus_changed_recently", return_value=True)
         gra = self._p(self.bc, "get_response_with_animation")
         # No actions, no follow-up.
         self._p(self.bc, "parse_and_run_actions",
@@ -730,6 +733,14 @@ class RunLlmDispatchTests(SectionSevenBase):
         self.assertEqual(out, "That's your editor, sir.")
         gra.assert_not_called()      # glance short-circuited the LLM call
         self._speak.assert_called_once_with("That's your editor, sir.")
+
+    def test_what_is_this_goes_to_the_camera_only_without_a_window_change(self):
+        self._p(self.bc, "_action_history", [])
+        focus = self._p(self.bc, "_focus_changed_recently", return_value=False)
+        self.assertEqual(self.bc._camera_ask_route_reply("what is this"),
+                         "[ACTION: see_user, what is this]")
+        focus.return_value = True
+        self.assertIsNone(self.bc._camera_ask_route_reply("what is this"))
 
     def test_full_llm_path_when_no_glance(self):
         self._p(self.bc, "maybe_glance_response", return_value=None)

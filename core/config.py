@@ -2125,13 +2125,14 @@ RECALL_ACTION_GROUNDING = True
 # programme; the log says "[stt] teams-fix". "what's on TV" and "I missed the game
 # on TV" stay. False: transcripts as before. Read live.
 STT_TEAMS_FIX = True
-# STT_TEAMS_HOTWORD (bool, v3.0.11) - same evidence. True (default): Whisper also
-# gets "Teams" as a hotword, added to whatever STT_HOTWORDS holds (the owner's
-# setting is empty, and a default here would not reach him). The hotword-echo
-# guard covers it. Parakeet, the primary engine, has no hotwords, so this helps
-# Whisper's rescues and ambient decodes only. False: STT_HOTWORDS alone, as before.
-# Read live.
-STT_TEAMS_HOTWORD = True
+# STT_TEAMS_HOTWORD (bool, v3.0.11) - same evidence. False (default): STT_HOTWORDS
+# alone, which the owner keeps empty: measured 2026-10-01, five hotwords were read
+# back from room noise 21 times in 18 minutes. The hotword-echo guard needs three
+# mentions (core.stt_vocab._ECHO_MIN_HITS), so a lone "Teams." read from noise would
+# pass as a turn. STT_TEAMS_FIX does the correcting, and Parakeet, the primary
+# engine, has no hotwords anyway. True: Whisper also gets "Teams" as a hotword,
+# added to whatever STT_HOTWORDS holds. Read live.
+STT_TEAMS_HOTWORD = False
 # TEAMS_UNREAD_ACTION (bool, v3.0.11, core/teams_unread + skills/ms_graph) - live
 # 2026-11-05 14:43:39 "any messages I missed ..." got "I've no way to check that,
 # sir ... Incidentally, you have 24 unread messages waiting for you on Teams.": no
