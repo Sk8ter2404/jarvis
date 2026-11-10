@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.14 (2026-11-10)
+
+From today's live log. A sworn "what did you just say?" now gets his last line back word for word (it started a robot banter action instead). "Shut up, stop listening to me" now puts him to sleep: insults and courtesy no longer count toward the six-word limit that keeps casual mentions from triggering it.
+
 ## v3.0.13 (2026-11-06)
 
 The webcam two-hand window grab stops dropping the window. From a recording of the real tracker on the Dell: a held fist often reads as a pinch, which ended the grab, and a tiny phantom second hand kept replacing the real one. A grab now holds through both, and opening a hand or losing one still lets go. The hand mouse ignores the phantom too.

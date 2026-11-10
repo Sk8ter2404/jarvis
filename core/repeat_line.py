@@ -14,6 +14,10 @@ check does not need:
   * "what was that" may be about a noise, so it only counts straight after a
     line (SHORT_ASK_WINDOW_S). The others count for ASK_WINDOW_S; after that
     there is nothing fresh to repeat and the old path answers.
+And one widening: a swear in the ask ("the fuck did you just say?", "what the
+hell was that") still asks for the line. Live 2026-11-10 16:09:10 that line
+reached the brain, which ran butterbot_banter. The mood check keeps counting
+the swear: only this module reads the calmed text.
 
 Stdlib only, no I/O, nothing here raises.
 """
@@ -34,6 +38,17 @@ JOIN_WINDOW_S = 30.0
 
 _WHAT_IS_THAT_RE = re.compile(r"\bwhat(?:'s| is|s) that\b")
 _WHAT_WAS_THAT_RE = re.compile(r"\bwhat was that\b")
+# "what the fuck" / "the hell" / "wtf" -> "what"; a bare swear word is dropped.
+_SWEAR_ASK_RE = re.compile(
+    r"\b(?:(?:what|wha)\s+)?the\s+(?:fuck|fucking|hell|heck)\b|\bwtf\b|\bwth\b")
+_SWEAR_WORD_RE = re.compile(r"\b(?:fucking|fuckin|freaking|bloody|damn)\b")
+
+
+def _calm(text) -> str:
+    """The line with its swearing taken out, for the checks below only."""
+    t = _SWEAR_ASK_RE.sub("what", str(text or "").lower())
+    t = _SWEAR_WORD_RE.sub(" ", t)
+    return " ".join(t.split())
 
 
 def repeat_line_on() -> bool:
@@ -49,9 +64,10 @@ def is_repeat_ask(text) -> bool:
     """True when the whole line asks to hear JARVIS's last line again. Never
     raises."""
     try:
-        if not is_repeat_request(text):
+        calm = _calm(text)
+        if not (is_repeat_request(text) or is_repeat_request(calm)):
             return False
-        return _WHAT_IS_THAT_RE.search(str(text).lower()) is None
+        return _WHAT_IS_THAT_RE.search(calm) is None
     except Exception:
         return False
 
@@ -95,7 +111,7 @@ class LastLine:
                 parts, at = list(self._parts), self._at
             if not parts:
                 return None
-            short = _WHAT_WAS_THAT_RE.search(str(text).lower()) is not None
+            short = _WHAT_WAS_THAT_RE.search(_calm(text)) is not None
             if when - at > (SHORT_ASK_WINDOW_S if short else ASK_WINDOW_S):
                 return None
             return " ".join(parts)

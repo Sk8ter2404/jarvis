@@ -535,6 +535,35 @@ class RepeatLineTests(unittest.TestCase):
             self.assertTrue(recall_actions.is_recall_question("Jarvis, what did you say?"))
 
 
+
+class SwornRepeatAskTests(unittest.TestCase):
+    """Live 2026-11-10 16:09:10 "The fuck did you just say?" ran butterbot_banter."""
+
+    def test_a_sworn_ask_wants_the_line(self):
+        for t in ("The fuck did you just say?", "what the fuck did you just say",
+                  "what the hell did you say", "wtf did you just say",
+                  "what the fuck was that", "what did you fucking say"):
+            with self.subTest(t=t):
+                self.assertTrue(repeat_line.is_repeat_ask(t), t)
+
+    def test_a_sworn_question_about_something_is_not_a_repeat(self):
+        for t in ("what the fuck is that", "what the hell is that thing",
+                  "the fuck are you doing", "what the hell"):
+            with self.subTest(t=t):
+                self.assertFalse(repeat_line.is_repeat_ask(t), t)
+
+    def test_the_line_comes_back_and_what_was_that_keeps_its_short_window(self):
+        ll = repeat_line.LastLine()
+        ll.note("One does admire the genetic consistency, sir.", turn=1, now=100.0)
+        self.assertEqual(ll.line_for("The fuck did you just say?", now=110.0),
+                         "One does admire the genetic consistency, sir.")
+        self.assertIsNone(ll.line_for("what the hell was that",
+                                      now=100.0 + repeat_line.SHORT_ASK_WINDOW_S + 5))
+
+    def test_the_mood_check_still_hears_the_swear(self):
+        from core.tone_detector import is_repeat_request
+        self.assertFalse(is_repeat_request("The fuck did you just say?"))
+
 class PlainRetryMoodTests(unittest.TestCase):
     def setUp(self):
         p = mock.patch.object(cfg, "TONE_PLAIN_RETRY_EXEMPT", True, create=True)

@@ -1159,6 +1159,26 @@ SLEEP_PHRASES = {
     "go on standby", "be quiet", "mute yourself", "take a break",
     "go idle", "pause listening",
 }
+# Words that do not count toward the sleep gate's 6-word limit: courtesy,
+# insults, "shut up", and "to me" right after "listening". Live 2026-11-10
+# 16:09:40 "Shut up, stop listening to me, asshole." was 7 words, went to the
+# brain and ran wake_listener_stop instead of sleeping. Structural words are
+# NOT here, so "if I say stop listening for a bit ..." still stays awake.
+SLEEP_GATE_FILLER = frozenset({
+    "please", "jarvis", "hey", "yo", "sir", "now", "just", "ok", "okay",
+    "already", "dude", "bro", "man", "buddy", "asshole", "idiot", "dumbass",
+    "fucking", "fuckin", "damn", "goddamn", "god",
+})
+
+
+def _sleep_gate_word_count(tl: str) -> int:
+    """How many words of the line count toward the sleep gate's limit."""
+    t = " ".join(re.findall(r"[a-z']+", tl))
+    t = re.sub(r"\bshut up\b", " ", t)
+    t = re.sub(r"\blistening to me\b", "listening", t)
+    return sum(1 for w in t.split() if w not in SLEEP_GATE_FILLER)
+
+
 WAKE_PHRASES = {
     "jarvis", "hey jarvis", "wake up", "start listening",
     "i need you", "come back", "resume listening", "wake",
@@ -52747,7 +52767,7 @@ def _handle_sleep_triggers(text: str) -> bool:
     tl = text.strip().lower()
     _triggered_sleep   = False
     _triggered_standby = False
-    if len(tl.split()) <= 6:
+    if _sleep_gate_word_count(tl) <= 6:
         for _sp in STANDBY_TRIGGER_PHRASES:
             if re.search(r'\b' + re.escape(_sp) + r'\b', tl):
                 _triggered_standby = True

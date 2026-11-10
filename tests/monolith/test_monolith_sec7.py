@@ -554,6 +554,25 @@ class HandleSleepTriggersTests(SectionSevenBase):
         out = self.bc._handle_sleep_triggers("what time is it")
         self.assertFalse(out)
 
+    def test_insults_and_courtesy_do_not_count_toward_the_limit(self):
+        # Live 2026-11-10 16:09:40: 7 words, went to the brain.
+        for text in ("Shut up, stop listening to me, asshole.",
+                     "Jarvis, please just stop listening now, dude.",
+                     "okay go to sleep already, you idiot"):
+            with self.subTest(text=text):
+                self.bc._sleep_mode[0] = False
+                self.assertTrue(self.bc._handle_sleep_triggers(text))
+                self.assertTrue(self.bc._sleep_mode[0])
+
+    def test_a_casual_mention_still_does_not_trigger(self):
+        for text in ("if I say stop listening for a bit it should keep going",
+                     "if I say stop listening for a bit",
+                     "tell me what stop listening to me means in Spanish"):
+            with self.subTest(text=text):
+                self.bc._sleep_mode[0] = False
+                self.assertFalse(self.bc._handle_sleep_triggers(text))
+                self.assertFalse(self.bc._sleep_mode[0])
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  _handle_sleep_standby
