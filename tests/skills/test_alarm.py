@@ -143,6 +143,27 @@ class ParseTests(_AlarmCase):
             # One that has just passed is the next one, twelve hours on.
             self.assertEqual(p("4 20"), 12 * 3600 - 60)
 
+    def test_the_half_of_the_day_in_words(self):
+        # Live 2026-11-12 16:22:30: "5.30 in the morning".
+        now = datetime(2026, 11, 12, 16, 21).timestamp()        # 4:21 PM
+        p = self.mod._parse_when
+        H = 3600
+        with mock.patch.object(self.mod.time, "time", return_value=now):
+            self.assertEqual(p("5.30 in the morning"), int(13.15 * H))
+            self.assertEqual(p("530 tomorrow morning"), int(13.15 * H))
+            self.assertEqual(p("7 in the morning"), int(14.65 * H))
+            self.assertEqual(p("at 7 in the morning"), int(14.65 * H))
+            self.assertEqual(p("6 in the evening"), int(1.65 * H))
+            self.assertEqual(p("9 tonight"), int(4.65 * H))
+            self.assertEqual(p("9:15 tonight"), int(4.9 * H))
+            self.assertEqual(p("2 at night"), int(9.65 * H))
+            self.assertEqual(p("12 tonight"), int(7.65 * H))
+            self.assertEqual(p("midnight"), int(7.65 * H))
+            self.assertEqual(p("noon"), int(19.65 * H))
+            # Still durations.
+            self.assertEqual(p("in 20 minutes tonight"), 1200)
+            self.assertEqual(p("in 5 tonight"), 300)
+
     def test_a_number_with_a_unit_or_after_in_stays_a_duration(self):
         p = self.mod._parse_when
         self.assertEqual(p("100 seconds"), 100)

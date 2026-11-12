@@ -214,9 +214,34 @@ _CLOCK_NO_HALF_RE = re.compile(
     r"(?<![\d:])([1-9]|1[0-2]):([0-5]\d)\b(?!\s*[ap]\.?\s*m)")
 
 
+# The half of the day in words, for a time said with no am/pm: "5:30 in the
+# morning" (heard live 2026-11-12 16:22:30), "7 tonight".
+_MORNING_RE = re.compile(r"\b(?:in the|this|tomorrow) morning\b")
+_AFTERNOON_RE = re.compile(r"\b(?:in the|this|tomorrow) (?:afternoon|evening)\b")
+_NIGHT_RE = re.compile(r"\b(?:tonight|at night|tomorrow night)\b")
+_HINTED_HOUR_RE = re.compile(
+    r"(?<![\d:.])(\d{1,2})(?![\d:.])(?!\s*(?:sec|min|hour|hr|day)|\s*[smhd]\b)")
+
+
+def _half_hours(t: str, hour: int) -> tuple:
+    """The 24-hour hours a 12-hour ``hour`` may mean in ``t``: one when the
+    half of the day is said in words, else both (the sooner one is used)."""
+    h = hour % 12
+    if _MORNING_RE.search(t):
+        return (h,)
+    if _AFTERNOON_RE.search(t):
+        return (h + 12,)
+    if _NIGHT_RE.search(t):
+        # "12 at night", "2 at night" are after midnight; "9 tonight" is not.
+        return (h,) if hour in (12, 1, 2, 3, 4) else (h + 12,)
+    return (h, h + 12)
+
+
 def _spoken_clock(t: str) -> str:
     """``t`` with a spoken clock time rewritten as H:MM ("422" -> "4:22").
     Unchanged when the number follows "in" (a duration) or is no clock time."""
+    t = re.sub(r"\bmidnight\b", "12:00 am", t)
+    t = re.sub(r"\bnoon\b", "12:00 pm", t)
     m = _SPOKEN_CLOCK_RE.search(t)
     if not m or re.search(r"\bin\s+$", t[:m.start()]):
         return t
@@ -250,16 +275,20 @@ def _parse_when(text: str):
     # evening, the same rule as "at 7" below.
     m = _CLOCK_NO_HALF_RE.search(t)
     if m:
-        hour = int(m.group(1)) % 12
-        return _until_clock(int(m.group(2)), hour, hour + 12)
+        return _until_clock(int(m.group(2)), *_half_hours(t, int(m.group(1))))
     secs = _timer._parse_clock_time(t)
     if secs is not None:
         return secs
     # "at 7" / "for 7 o'clock" with no am/pm: the next time the clock reads it.
     m = re.search(r"\b(?:at|for)\s+(\d{1,2})(?:\s*o'?clock)?\b(?!\s*(?:sec|min|hour|hr|day))", t)
+    if not m and len(_half_hours(t, 1)) == 1:
+        # "7 in the morning", "9 tonight": the half of the day makes a bare
+        # number an hour, unless it follows "in" (a duration).
+        m = _HINTED_HOUR_RE.search(t)
+        if m and re.search(r"\bin\s+$", t[:m.start()]):
+            m = None
     if m and 1 <= int(m.group(1)) <= 12:
-        hour = int(m.group(1)) % 12
-        return _until_clock(0, hour, hour + 12)
+        return _until_clock(0, *_half_hours(t, int(m.group(1))))
     secs = _timer._parse_duration(t)
     if secs is not None and secs > 0:
         return int(secs)

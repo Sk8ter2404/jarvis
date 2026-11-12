@@ -148,7 +148,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `camera_hud` | `skills/holographic_overlay/__init__.py:1019` | neither | — | no |
 | `camera_status` | `skills/camera_system.py:444` | **VERBATIM** | — | yes |
 | `camera_unquarantine` | `skills/camera_system.py:602` | **VERBATIM** | yes | yes |
-| `cancel_alarm` | `skills/alarm.py:503` | **VERBATIM** | — | yes |
+| `cancel_alarm` | `skills/alarm.py:532` | **VERBATIM** | — | yes |
 | `cancel_promise` | `core/memory.py:632` | **VERBATIM** | yes | yes |
 | `cancel_schedule` | `skills/schedule_manager.py:527` | **VERBATIM** | — | yes |
 | `cancel_timer` | `skills/timer.py:763` | **VERBATIM** | yes | yes |
@@ -379,7 +379,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `learn_their_face` | `skills/face_id.py:280` | **VERBATIM** | — | yes |
 | `lifx_list` | `skills/sh_lifx.py:226` | *INFORMATIVE* | — | yes |
 | `lifx_list_devices` | `skills/sh_lifx.py:226` | *INFORMATIVE* | — | yes |
-| `list_alarms` | `skills/alarm.py:493` | **VERBATIM** | — | yes |
+| `list_alarms` | `skills/alarm.py:522` | **VERBATIM** | — | yes |
 | `list_emails` | `skills/email_triage.py:1076` | *INFORMATIVE* | — | no |
 | `list_enrolled_faces` | `skills/face_id.py:466` | **VERBATIM** | — | yes |
 | `list_enrolled_voices` | `skills/enroll_voice.py:359` | **VERBATIM** | — | yes |
@@ -596,7 +596,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `session_memory_recall` | `core/actions.py:6252` | **VERBATIM** | yes | yes |
 | `session_resume` | `core/actions.py:1133` | neither | — | yes |
 | `set_active_speaker` | `skills/enroll_voice.py:385` | **VERBATIM** | — | yes |
-| `set_alarm` | `skills/alarm.py:480` | **VERBATIM** | yes | yes |
+| `set_alarm` | `skills/alarm.py:509` | **VERBATIM** | yes | yes |
 | `set_brain` | `skills/model_picker.py:624` | **VERBATIM** | yes | yes |
 | `set_model` | `skills/model_picker.py:520` | **VERBATIM** | yes | yes |
 | `set_timer` | `skills/timer.py:698` | neither | yes | yes |
@@ -648,7 +648,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `smart_home_router_status` | `core/smart_home_router.py:1416` | **VERBATIM** | yes | yes |
 | `smart_home_setup` | `skills/smart_home_discover.py:2144` | *INFORMATIVE* | — | yes |
 | `smart_life_list` | `skills/sh_tuya.py:224` | *INFORMATIVE* | — | yes |
-| `snooze_alarm` | `skills/alarm.py:537` | **VERBATIM** | — | yes |
+| `snooze_alarm` | `skills/alarm.py:566` | **VERBATIM** | — | yes |
 | `spotify` | `core/actions.py:789` | neither | yes | yes |
 | `stability_gate_status` | `?` | **VERBATIM** | — | yes |
 | `stark_status_ring` | `skills/holographic_overlay/__init__.py:1820` | neither | — | yes |
@@ -669,7 +669,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `status_ring_v2` | `skills/holographic_overlay/__init__.py:1820` | neither | — | yes |
 | `status_ring_v2_off` | `skills/holographic_overlay/__init__.py:1815` | neither | — | yes |
 | `status_ring_v2_on` | `skills/holographic_overlay/__init__.py:1810` | neither | — | yes |
-| `stop_alarm` | `skills/alarm.py:531` | **VERBATIM** | — | yes |
+| `stop_alarm` | `skills/alarm.py:560` | **VERBATIM** | — | yes |
 | `stop_eavesdropping` | `core/actions.py:3694` | neither | — | yes |
 | `stop_greeting_people` | `core/actions.py:3792` | neither | — | yes |
 | `stop_keeping_music_open` | `skills/itunes_library.py:421` | **VERBATIM** | yes | yes |
