@@ -243,9 +243,45 @@ class RescueWhileLoadingTests(_Base):
         out = io.StringIO()
         with mock.patch.object(bc._stt_parakeet, "rescue_reason",
                                return_value="no-wake"), \
+                mock.patch.object(bc, "STT_RESCUE_NO_WAKE", "always",
+                                  create=True), \
                 contextlib.redirect_stdout(out):
             self.assertEqual(bc._parakeet_rescue("hello", None), "no-wake")
         self.assertEqual(out.getvalue(), "")
+
+    def test_a_no_wake_rescue_needs_something_like_the_name(self):
+        # 2026-11-12: 0 of 671 no-wake rescues were usable; each cost 2-3 s.
+        bc = self.bc
+        bc._whisper_bg["loading"] = False
+        with mock.patch.object(bc._stt_parakeet, "rescue_reason",
+                               return_value="no-wake"), \
+                mock.patch.object(bc, "STT_RESCUE_NO_WAKE", "hint",
+                                  create=True), \
+                contextlib.redirect_stdout(io.StringIO()):
+            for text in ("so my mom does that", "do you watch that show",
+                         "thank you", "the service is down"):
+                with self.subTest(text=text):
+                    self.assertEqual(bc._parakeet_rescue(text, None), "")
+            for text in ("Jervis open YouTube", "Travis, what time is it",
+                         "Jerry open chrome", "hey Gary stop",
+                         "Jersey, volume down"):
+                with self.subTest(text=text):
+                    self.assertEqual(bc._parakeet_rescue(text, None), "no-wake")
+
+    def test_an_empty_decode_is_still_rescued(self):
+        bc = self.bc
+        bc._whisper_bg["loading"] = False
+        with mock.patch.object(bc._stt_parakeet, "rescue_reason",
+                               return_value="empty"), \
+                mock.patch.object(bc, "STT_RESCUE_NO_WAKE", "off", create=True):
+            self.assertEqual(bc._parakeet_rescue("", None), "empty")
+
+    def test_off_and_always(self):
+        bc = self.bc
+        with mock.patch.object(bc, "STT_RESCUE_NO_WAKE", "off", create=True):
+            self.assertFalse(bc._no_wake_rescue_wanted("Jervis open YouTube"))
+        with mock.patch.object(bc, "STT_RESCUE_NO_WAKE", "always", create=True):
+            self.assertTrue(bc._no_wake_rescue_wanted("so my mom does that"))
 
     def test_no_reason_prints_nothing_while_loading(self):
         bc = self.bc

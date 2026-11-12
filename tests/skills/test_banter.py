@@ -40,6 +40,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -1199,6 +1200,58 @@ class BanterSchedulerLoopTests(_BanterTestBase):
         self.assertEqual(saved["last_line"], "47 tabs, sir.")
         self.assertIn("last_fire_at", saved)
         self.assertIn("tab_clutter:chrome", saved["last_per_tell_at"])
+
+    def _would_fire(self, enqueue):
+        tell = {"tell": "tab_clutter", "key": "tab_clutter:chrome", "n": 43}
+        with self._loop_env(), \
+             mock.patch.object(self.mod, "_detect_repeat_question", return_value=tell), \
+             mock.patch.object(self.mod.random, "random", return_value=0.0), \
+             mock.patch.object(self.mod, "_pick_zinger", return_value="43 tabs, sir."), \
+             mock.patch.object(self.mod, "_enqueue_speech", enqueue), \
+             mock.patch.object(self.mod, "_save_state", lambda s: None):
+            with self.assertRaises(_StopLoop):
+                self.mod._scheduler_loop()
+
+    def test_no_joke_while_he_is_marked_stressed(self):
+        # Live 2026-11-10 16:29:52 -> 16:30:26: marked stressed (15 quiet
+        # minutes), then a tab-count joke 34 s later, mid-correction.
+        bc = sys.modules["bobert_companion"]
+        bc._memory_lock = threading.Lock()
+        bc.load_memory = lambda: {"voice_mood_stressed_until": time.time() + 600}
+        bc._voice_mood_response = types.SimpleNamespace(
+            is_stress_suppression_active=lambda mem: (
+                float(mem.get("voice_mood_stressed_until", 0)) > time.time()))
+        self.assertEqual(self.mod._owner_wants_quiet(), "stressed")
+        enqueue = mock.MagicMock()
+        self._would_fire(enqueue)
+        enqueue.assert_not_called()
+        # The window passes: the same tell fires.
+        bc.load_memory = lambda: {"voice_mood_stressed_until": time.time() - 1}
+        self.assertEqual(self.mod._owner_wants_quiet(), "")
+        self._would_fire(enqueue)
+        enqueue.assert_called_once()
+
+    def test_no_joke_inside_a_conversation(self):
+        bc = sys.modules["bobert_companion"]
+        bc._last_owner_turn_at = [time.monotonic() - 20.0]
+        self.assertEqual(self.mod._owner_wants_quiet(), "mid-conversation")
+        enqueue = mock.MagicMock()
+        self._would_fire(enqueue)
+        enqueue.assert_not_called()
+        bc._last_owner_turn_at = [time.monotonic()
+                                  - self.mod.BANTER_AFTER_TURN_QUIET_S - 5.0]
+        self.assertEqual(self.mod._owner_wants_quiet(), "")
+        self._would_fire(enqueue)
+        enqueue.assert_called_once()
+
+    def test_a_failed_read_never_blocks_or_raises(self):
+        bc = sys.modules["bobert_companion"]
+        bc._voice_mood_response = types.SimpleNamespace(
+            is_stress_suppression_active=mock.Mock(side_effect=RuntimeError))
+        bc._memory_lock = threading.Lock()
+        bc.load_memory = lambda: {}
+        bc._last_owner_turn_at = ["not a number"]
+        self.assertEqual(self.mod._owner_wants_quiet(), "")
 
     def test_loop_probability_suppresses_fire(self):
         enqueue = mock.MagicMock()

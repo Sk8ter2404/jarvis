@@ -79,7 +79,8 @@ class LastLine:
         self._lock = threading.Lock()
         self._parts: list = []
         self._turn = None
-        self._at = 0.0
+        self._at = 0.0          # when the newest sentence was voiced
+        self._first_at = 0.0    # when the line's first sentence was voiced
 
     def note(self, text, turn=None, now: Optional[float] = None) -> None:
         """Record a voiced line; a sentence of the same turn joins it. Never
@@ -90,11 +91,16 @@ class LastLine:
                 return
             when = time.time() if now is None else float(now)
             with self._lock:
+                # Measured from the FIRST sentence (2026-11-12): measured
+                # from the newest one the window slid, and live 11-10 16:31
+                # "repeat yourself" replayed 40 s stitched from an answer,
+                # an apology, a joke and a browser result.
                 if (self._parts and turn == self._turn
-                        and when - self._at <= JOIN_WINDOW_S):
+                        and when - self._first_at <= JOIN_WINDOW_S):
                     self._parts.append(s)
                 else:
                     self._parts = [s]
+                    self._first_at = when
                 self._turn = turn
                 self._at = when
         except Exception:

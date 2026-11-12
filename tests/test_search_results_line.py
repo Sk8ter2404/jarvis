@@ -50,8 +50,28 @@ FOUND = (0x123, "AA battery to C battery converter - Google Search - Google Chro
 class SearchResultsLineTests(unittest.TestCase):
     def _line(self, elements):
         with mock.patch("core.screen_privacy.window_private", return_value=False), \
+                mock.patch.object(A, "_RESULTS_RETRY_GAP_S", 0.0), \
                 mock.patch.object(_st, "snapshot", return_value=_snap(elements)):
             return A._search_results_line(FOUND)
+
+    def test_a_page_that_has_not_loaded_offers_nothing(self):
+        # Live 2026-11-10 16:29:54: the "top results" were "Go to Google Home".
+        self.assertEqual(self._line([_el("Go to Google Home", 40)]), "")
+        self.assertEqual(self._line(HEADER + [_el("Go to Google Home", 40)]), "")
+        # One stray link on a page with no results heading is not a result.
+        self.assertEqual(self._line(HEADER + [
+            _el("A single link that is not a result at all", 300)]), "")
+
+    def test_it_waits_for_the_results_to_arrive(self):
+        loading = _snap([_el("Go to Google Home", 40)])
+        loaded = _snap(HEADER + RESULTS)
+        with mock.patch("core.screen_privacy.window_private", return_value=False), \
+                mock.patch.object(A, "_RESULTS_RETRY_GAP_S", 0.0), \
+                mock.patch.object(_st, "snapshot",
+                                  side_effect=[loading, None, loaded]) as snap:
+            out = A._search_results_line(FOUND)
+        self.assertEqual(snap.call_count, 3)
+        self.assertTrue(out.startswith('"Powerlion C Size Battery Adapters'), out)
 
     def test_only_results_below_the_search_results_heading(self):
         out = self._line(HEADER + RESULTS)

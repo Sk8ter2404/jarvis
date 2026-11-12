@@ -499,6 +499,11 @@ from core import repeat_line as _repeat_line  # noqa: E402
 # _repeat_last_line_shortcut says it back), and the owner turn it belongs to.
 _last_line = _repeat_line.LastLine()
 _last_line_turn = [0]
+# Set while _speak_pending voices one queued announcement (a reminder, a joke,
+# a background result): that line is its own "last line", not one more
+# sentence of the answer before it. ("queued", n), else None.
+_last_line_queued = [None]
+_last_line_queued_n = [0]
 _AUTOCORRECT_THRESHOLD = 0.75
 # When two candidates both clear the threshold and sit within this gap of
 # each other, the dispatcher asks 'did you mean X or Y' instead of silently
@@ -18682,6 +18687,31 @@ def _parakeet_head_speech(audio, preroll=_PREROLL_FROM_STASH
         return None
 
 
+# Parakeet's known mishearings of the name that core.music_gate.wake_hint's
+# spelling ratio misses (the owner's list, 2026-11-12).
+_NO_WAKE_RESCUE_NAMES = frozenset({"jerry", "gary", "jersey"})
+_no_wake_rescue_skipped = [0]
+
+
+def _no_wake_rescue_wanted(text: str) -> bool:
+    """STT_RESCUE_NO_WAKE: is a 'no-wake' Whisper rescue worth its decode for
+    Parakeet's ``text``? 'always' yes, 'off' no, 'hint' (default) only when
+    one of the first three words sounds like the name. Never raises (True:
+    a slower turn, never a lost one)."""
+    try:
+        mode = str(globals().get("STT_RESCUE_NO_WAKE", "hint") or "hint").lower()
+        if mode == "always":
+            return True
+        if mode == "off":
+            return False
+        if _music_gate.wake_hint(text):
+            return True
+        words = re.findall(r"[a-z']+", str(text or "").lower())[:3]
+        return any(w.strip("'") in _NO_WAKE_RESCUE_NAMES for w in words)
+    except Exception:
+        return True
+
+
 def _parakeet_rescue(text: str, audio) -> str:
     """core/stt_parakeet.rescue_reason with the live wake gates
     (_parakeet_wake_lost) and the Silero head check (_parakeet_head_speech,
@@ -18698,6 +18728,13 @@ def _parakeet_rescue(text: str, audio) -> str:
         head_speech=lambda: _parakeet_head_speech(audio))
     if why and _whisper_bg_loading():
         print(f"  [stt] rescue skipped (whisper loading): {why}")
+        return ""
+    if why == "no-wake" and not _no_wake_rescue_wanted(text):
+        _no_wake_rescue_skipped[0] += 1
+        n = _no_wake_rescue_skipped[0]
+        if n == 1 or n % 50 == 0:
+            print(f"  [stt] no-wake rescue skipped: nothing like the name in "
+                  f"Parakeet's text ({n} so far this session)")
         return ""
     return why
 
@@ -47814,7 +47851,8 @@ def _speak(text: str, volume_scale: float = 1.0, mood: str | None = None):
     if spoken_text:
         _write_hud_state(last_spoken=spoken_text, last_spoken_at=time.time())
         if globals().get("REPEAT_LAST_LINE", True):
-            _last_line.note(spoken_text, turn=_last_line_turn[0])
+            _last_line.note(spoken_text,
+                            turn=_last_line_queued[0] or _last_line_turn[0])
     # Blue/green: a staging instance must not open the audio device — that
     # device belongs to prod for the duration of the smoke test. Route the
     # spoken text to data_staging/replies.jsonl instead so the pipeline
@@ -50748,7 +50786,12 @@ def _speak_pending(only_sources=None):
         # ~70s stall, where a long CAPTURE starved the heartbeat the same way.
         _heartbeat()
         try:
-            _speak(msg, volume_scale=vol, mood=item_mood)
+            _last_line_queued_n[0] += 1
+            _last_line_queued[0] = ("queued", _last_line_queued_n[0])
+            try:
+                _speak(msg, volume_scale=vol, mood=item_mood)
+            finally:
+                _last_line_queued[0] = None
             _mark_speech_spoken(_dkey)
             spoke_any = True
             # A queued line that asks something (a pattern offer, the recap's

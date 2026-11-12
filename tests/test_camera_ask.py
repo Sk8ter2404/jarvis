@@ -510,6 +510,25 @@ class RepeatLineTests(unittest.TestCase):
         ll.note("New line.", turn=2, now=120.0)
         self.assertEqual(ll.line_for("what did you say?", now=121.0), "New line.")
 
+    def test_the_window_runs_from_the_first_sentence_and_does_not_slide(self):
+        # Live 2026-11-10 16:31: sentences 10-20 s apart, all in one turn,
+        # kept joining because each one moved the window: 40 s of speech.
+        ll = repeat_line.LastLine()
+        for i, when in enumerate((100.0, 115.0, 128.0, 140.0, 155.0)):
+            ll.note(f"Part {i}.", turn=1, now=when)
+        self.assertEqual(ll.line_for("repeat yourself", now=156.0),
+                         "Part 3. Part 4.")
+
+    def test_a_queued_announcement_is_its_own_line(self):
+        ll = repeat_line.LastLine()
+        ll.note("The answer, sir.", turn=4, now=100.0)
+        ll.note("Forty-three tabs, sir. Ambitious.", turn=("queued", 1), now=104.0)
+        self.assertEqual(ll.line_for("what did you say?", now=106.0),
+                         "Forty-three tabs, sir. Ambitious.")
+        ll.note("Back to the answer.", turn=4, now=108.0)
+        self.assertEqual(ll.line_for("what did you say?", now=109.0),
+                         "Back to the answer.")
+
     def test_same_turn_far_apart_is_a_new_line(self):
         ll = repeat_line.LastLine()
         ll.note("One.", turn=1, now=100.0)

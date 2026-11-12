@@ -329,11 +329,23 @@ _RESULTS_ANCHOR_RE = re.compile(r"^(?:search results|results)$", re.IGNORECASE)
 # AA batteries" or "News on ..." is never dropped.
 _SEARCH_CHROME_RE = re.compile(
     r"^(?:google account|google apps|search by (?:voice|image)|"
-    r"skip to main content|accessibility (?:help|feedback)|search labs)\b"
+    r"skip to main content|accessibility (?:help|feedback)|search labs|"
+    r"go to google home)\b"
     r"|^(?:sign in|ai mode|clear|share|all|images|videos|short videos|"
     r"shopping|news|maps|books|flights|finance|forums|web|more|tools|"
     r"all filters\.?|more filters|settings|privacy|terms|feedback)$"
     r"|filter\.\s*(?:not )?selected\.?$", re.IGNORECASE)
+
+
+# The page is read the moment it opens, often before its results exist. Live
+# 2026-11-10 16:29:54 the "top results" handed to the brain were one link,
+# "Go to Google Home": a wrong answer could not be checked and the right one
+# took 75 s. So the read waits for the "Search Results" heading (a few short
+# tries), and a page that never shows it must offer at least this many
+# result-like links before any of them count.
+_RESULTS_TRIES = 4
+_RESULTS_RETRY_GAP_S = 0.5
+_RESULTS_MIN_WITHOUT_HEADING = 3
 
 
 def _search_results_line(found) -> str:
@@ -351,14 +363,22 @@ def _search_results_line(found) -> str:
         if _sp.window_private({"hwnd": hwnd, "title": title,
                                "url": found[4] or ""}):
             return ""
-        snap = _st.snapshot(hwnd, title=title, process="chrome.exe",
-                            budget_ms=500, want_hrefs=False)
-        if snap is None or snap.has_password:
-            return ""
-        els = sorted(snap.elements, key=lambda e: (e.rect[1], e.rect[0]))
-        anchor_y = next((e.rect[1] for e in els
-                         if e.in_document and _RESULTS_ANCHOR_RE.match(
-                             (e.name or "").strip())), None)
+        els, anchor_y = [], None
+        for attempt in range(max(1, _RESULTS_TRIES)):
+            if attempt:
+                time.sleep(_RESULTS_RETRY_GAP_S)
+            snap = _st.snapshot(hwnd, title=title, process="chrome.exe",
+                                budget_ms=500, want_hrefs=False)
+            if snap is None:
+                continue
+            if snap.has_password:
+                return ""
+            els = sorted(snap.elements, key=lambda e: (e.rect[1], e.rect[0]))
+            anchor_y = next((e.rect[1] for e in els
+                             if e.in_document and _RESULTS_ANCHOR_RE.match(
+                                 (e.name or "").strip())), None)
+            if anchor_y is not None:
+                break
         heads = []
         for e in els:
             name = (e.name or "").strip()
@@ -371,6 +391,8 @@ def _search_results_line(found) -> str:
                 heads.append(name)
             if len(heads) >= 5:
                 break
+        if anchor_y is None and len(heads) < _RESULTS_MIN_WITHOUT_HEADING:
+            return ""
         out = ", ".join(f'"{h}"' for h in heads)
         return out[:600]
     except Exception:

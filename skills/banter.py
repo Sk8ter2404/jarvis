@@ -219,6 +219,42 @@ def _is_in_call() -> bool:
 
 from core.win_env import _is_sleep_or_standby  # noqa: E402
 
+# No joke lands inside a conversation: this long after the owner's last turn.
+BANTER_AFTER_TURN_QUIET_S = 90.0
+
+
+def _owner_wants_quiet() -> str:
+    """Why a joke must not fire now, or ''.
+
+    'stressed'          the voice-mood quiet window is open. Live 2026-11-10
+                        16:29:52 he was marked stressed (15 quiet minutes) and
+                        a tab-count joke fired 34 s later, mid-correction: the
+                        window was read only by should_fire_proactive, which
+                        this scheduler never goes through.
+    'mid-conversation'  he spoke within BANTER_AFTER_TURN_QUIET_S.
+
+    '' when the monolith is not loaded (unit tests of the detectors) or a
+    read fails: the cooldowns still apply. Never raises."""
+    bc = sys.modules.get("bobert_companion")
+    if bc is None:
+        return ""
+    try:
+        vm = getattr(bc, "_voice_mood_response", None)
+        if vm is not None:
+            with bc._memory_lock:
+                mem = bc.load_memory()
+            if vm.is_stress_suppression_active(mem):
+                return "stressed"
+    except Exception:
+        pass
+    try:
+        at = float(bc._last_owner_turn_at[0] or 0.0)
+        if at > 0.0 and time.monotonic() - at < BANTER_AFTER_TURN_QUIET_S:
+            return "mid-conversation"
+    except Exception:
+        pass
+    return ""
+
 
 def _chrome_process_count() -> int:
     """Approximate Chrome tab count via chrome.exe process count. Chrome
@@ -559,6 +595,9 @@ def _scheduler_loop() -> None:
             if _is_in_call():
                 time.sleep(POLL_INTERVAL_SECONDS)
                 continue
+            if _owner_wants_quiet():
+                time.sleep(POLL_INTERVAL_SECONDS)
+                continue
 
             state = _load_state()
             cooldown_s = max(60, int(cfg["cooldown"]) * 60)
@@ -657,6 +696,9 @@ def _format_status() -> str:
         parts.append("no zingers yet this session")
     if _is_in_call():
         parts.append("currently in a call (suppressed)")
+    quiet = _owner_wants_quiet()
+    if quiet:
+        parts.append(f"holding off: {quiet}")
     if _is_sleep_or_standby():
         parts.append("sleep/standby active (suppressed)")
     return "Banter engine — " + "; ".join(parts) + "."

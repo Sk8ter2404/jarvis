@@ -1327,6 +1327,15 @@ WHISPER_BEAM_SIZE    = 5
 #   STT_REPLACEMENTS ({"misheard": "meant"}), applied after it, to Parakeet's
 #   transcripts only. All OFF by default; changes apply on the next start.
 STT_ENGINE                 = "whisper"   # 'whisper' | 'parakeet'
+# STT_RESCUE_NO_WAKE (2026-11-12): when Parakeet's text has no wake word and
+# the wake gates would drop the line, Whisper used to decode the clip again in
+# case "Jarvis" was misheard. Measured since v3.0.11: 88 % of all decodes were
+# rescued this way, each costing 2-3 s before listening resumed, and 0 of 671
+# produced a line the gates would admit.
+#   'hint'   (default) only when one of Parakeet's first three words sounds
+#            like the name ("Jervis", "Travis", "Jerry", "Gary", "Jersey")
+#   'always' the old behaviour      'off' never
+STT_RESCUE_NO_WAKE         = "hint"
 STT_SHADOW                 = ""          # '' | 'parakeet'
 PARAKEET_MODEL_DIR         = r"C:\JARVIS-models\parakeet-tdt-0.6b-v2-onnx"
 PARAKEET_THREADS           = 8
