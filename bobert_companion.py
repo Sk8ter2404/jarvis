@@ -15635,7 +15635,8 @@ def _refresh_devices(force: bool = False):
             elif _default_adopted:
                 print("  [audio] the Windows default audio endpoint moved — "
                       "re-picking from the current enumeration so JARVIS "
-                      "follows it (no PortAudio teardown needed)")
+                      "follows it, and re-enumerating as soon as no stream "
+                      "is live (a move renumbers the device list)")
             elif _move_stale:
                 print("  [audio] the Windows default audio endpoint moved "
                       "while the endpoint list changed — PortAudio's indices "
@@ -15666,7 +15667,22 @@ def _refresh_devices(force: bool = False):
         # stale direction is simply not re-picked (_skip_in / _skip_out).
         _stale_reinit = bool((_in_stale or _out_stale)
                              and _since_reenum >= _OPEN_FAIL_REENUM_MIN_S)
-        _reinit_wanted = bool(force or _reenum_due
+        # A DEFAULT MOVE REORDERS THE MME LIST (2026-11-12). MME numbers the
+        # current default first, so after a move the frozen table's rows keep
+        # their names while their indices open other devices. Live 10:04:52:
+        # the default went headset -> desk mic, the frozen row [2] "desk mic"
+        # was adopted, the bus reopened on 2 with no error, and every listen
+        # read exact zeros until a restart, where the desk mic was [1]. So an
+        # adopted move also asks for a real re-enumeration: on this pass when
+        # nothing holds a stream, otherwise on the first pass that can run it
+        # (reenum_requested stays set until one does). The cheap adoption
+        # still happens meanwhile - it is the best guess, and a deferred pass
+        # must not forget the press.
+        _move_reorders = bool(_move_ready and _default_adopted
+                              and _follows_default)
+        if _move_reorders:
+            _device_cache["reenum_requested"] = True
+        _reinit_wanted = bool(force or _reenum_due or _move_reorders
                               or (_move_ready and _move_unenumerated
                                   and not _move_stale)
                               or _stale_reinit
@@ -20546,7 +20562,8 @@ def record_speech(timeout: float | None = None, *,
                     # _report_silent_mic owns the latch, the re-warn throttle
                     # and the spoken escalation.
                     _report_silent_mic(silent_age, now_ts)
-                elif raw_rms > 1e-5 and _silent_mic_warned[0]:
+                elif (raw_rms > _ap_for_vad._AUDIBLE_RMS_FLOOR
+                      and _silent_mic_warned[0]):
                     # Mic recovered — allow the warning to re-fire next
                     # time we drop silent for that long.
                     _silent_mic_warned[0] = False

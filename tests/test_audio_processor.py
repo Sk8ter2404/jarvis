@@ -1183,5 +1183,29 @@ class VadStateTests(_ResetSingletonMixin, unittest.TestCase):
         self.assertEqual(ap.seconds_since_audible_chunk(), float("inf"))
 
 
+class AudibleFloorTests(unittest.TestCase):
+    """2026-11-12: a muted headset mic measured rms 1e-5 (peaks 3e-5), right
+    on the old floor, so its dither counted as sound and the silent-mic
+    warning never fired."""
+
+    def test_a_muted_mics_dither_is_not_audible(self):
+        from core import audio_processor as ap
+        with ap._vad_state_lock:
+            saved = dict(ap._vad_state)
+            ap._vad_state["last_audible_chunk_ts"] = 0.0
+        try:
+            for rms in (0.0, 1.0e-5, 3.0e-5):
+                ap.note_raw_rms(rms, ts=5000.0)
+            with ap._vad_state_lock:
+                self.assertEqual(ap._vad_state["last_audible_chunk_ts"], 0.0)
+            ap.note_raw_rms(3.0e-4, ts=5001.0)   # the quietest working mic
+            with ap._vad_state_lock:
+                self.assertEqual(ap._vad_state["last_audible_chunk_ts"], 5001.0)
+        finally:
+            with ap._vad_state_lock:
+                ap._vad_state.clear()
+                ap._vad_state.update(saved)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.15 (2026-11-12)
+
+He went deaf after a microphone switch on 11-12: Windows moved the default mic, he announced the new one, and then heard nothing until a restart. A followed switch now also refreshes his device list, which is what the restart did. The dead-microphone warning also fires for a muted mic now; its threshold sat exactly on a muted mic's background level.
+
 ## v3.0.14 (2026-11-10)
 
 From today's live log. A sworn "what did you just say?" now gets his last line back word for word (it started a robot banter action instead). "Shut up, stop listening to me" now puts him to sleep: insults and courtesy no longer count toward the six-word limit that keeps casual mentions from triggering it.

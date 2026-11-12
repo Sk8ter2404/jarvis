@@ -734,7 +734,11 @@ _vad_state: dict = {
 # Anything above this RMS counts as "the mic is alive". The hardware noise
 # floor of a working capture device sits well above this even in a quiet
 # room; a chunk under 1e-5 means the driver is handing us null samples.
-_AUDIBLE_RMS_FLOOR = 1.0e-5
+# 5e-5, was 1e-5 (2026-11-12): a muted headset mic measured rms 1e-5 with
+# peaks of 3e-5 over MME, so its dither kept crossing the old floor and the
+# silent-mic warning never fired in minutes of exact-zero listens. The
+# quietest working mic measured here idles at 3e-4.
+_AUDIBLE_RMS_FLOOR = 5.0e-5
 
 
 def note_vad_active(ts: Optional[float] = None) -> None:

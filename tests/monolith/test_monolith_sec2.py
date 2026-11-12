@@ -4400,6 +4400,50 @@ class FollowTheDefaultWhileStreamsAreLiveTests(_FollowTheDefaultFixtures,
         self.assertEqual(len(hits), 1,
                          f"one move, one line — got {len(hits)}: {hits}")
 
+    # ── 2026-11-12: a followed move also re-enumerates ───────────────────
+    def test_an_adopted_move_re_enumerates_when_no_stream_is_live(self):
+        """Live 10:04:52: the default went headset -> desk mic, the frozen
+        row was adopted and the reopened stream read exact zeros until a
+        restart. MME numbers the default first, so a move needs a real
+        re-enumeration, not only the frozen row."""
+        sd = self._sd(self.NAMES, default_in=1, default_out=2)
+        self._settled(sd)
+        sd._terminate.reset_mock()
+        self._refresh(sd, endpoints=("{ep-phones}", "{ep-corsair}"),
+                      endpoint_names=self.EPS, signature=self.SIG,
+                      force=False)
+        sd._terminate.assert_called_once()
+        self.assertFalse(self.bc._device_cache.get("reenum_requested"),
+                         "a re-enumeration that ran clears the request")
+
+    def test_a_deferred_move_keeps_asking_until_it_can_re_enumerate(self):
+        sd = self._sd(self.NAMES, default_in=1, default_out=2)
+        self._settled(sd)
+        sd._terminate.reset_mock()
+        moved = ("{ep-phones}", "{ep-corsair}")
+        self._refresh(sd, endpoints=moved, endpoint_names=self.EPS,
+                      signature=self.SIG, force=False, mic_live=True)
+        sd._terminate.assert_not_called()
+        self.assertTrue(self.bc._device_cache.get("reenum_requested"),
+                        "the move must not be forgotten while a mic is live")
+        # The mic is free and the re-enumeration spacing has passed.
+        self.bc._device_cache["last_reenum_at"] = time.time() - 60.0
+        self.bc._device_cache["checked_at"] = 0.0
+        self._refresh(sd, endpoints=moved, endpoint_names=self.EPS,
+                      signature=self.SIG, force=False)
+        sd._terminate.assert_called_once()
+
+    def test_an_unmoved_default_never_asks_for_one(self):
+        sd = self._sd(self.NAMES, default_in=1, default_out=2)
+        self._settled(sd)
+        sd._terminate.reset_mock()
+        for _ in range(3):
+            self._refresh(sd, endpoints=("{ep-spk}", "{ep-snow}"),
+                          endpoint_names=self.EPS, signature=self.SIG,
+                          force=False)
+        sd._terminate.assert_not_called()
+        self.assertFalse(self.bc._device_cache.get("reenum_requested"))
+
     def test_move_to_an_unenumerated_device_still_escalates_to_a_reinit(self):
         # The teardown is still the right answer for TRUE hotplug: a default
         # that points at a device PortAudio has no row for cannot be opened
