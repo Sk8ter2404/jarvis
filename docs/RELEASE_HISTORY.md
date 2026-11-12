@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.18 (2026-11-12)
+
+Hand tracking and conversation fixes from the 11-12 checks. Hands: camera frames are no longer thrown away (22 a second becomes about 30), a closed fist is never read as a pinch, and a hand lost for a moment mid-grab freezes the window instead of dropping it. Talking: "repeat yourself" gives only his last line, no jokes while you are annoyed or mid-conversation, the wasted second transcription is gone (2-3 seconds saved on most sounds), and web search waits for real results. Hand changes are proven on recordings and simulated hands, not yet live.
+
 ## v3.0.17 (2026-11-12)
 
 A real alarm. "Wake me up at 7" or "alarm in 20 minutes" now rings a loud tone on the desk speakers at full volume and he talks over it ("Sir, you need to wake up.") until you say stop, say snooze, or touch the keyboard or mouse. It gives up after 10 minutes, puts the volume back, and saved alarms survive a restart. Before this, asking for an alarm set a timer that spoke one quiet line.
