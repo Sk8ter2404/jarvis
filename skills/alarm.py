@@ -51,6 +51,11 @@ if _PROJECT_DIR not in sys.path:  # pragma: no cover - import-time guard
 
 from core.atomic_io import _atomic_write_json  # noqa: E402
 
+# Every reply is a finished sentence about the alarm store: voiced as written.
+SPEAK_VERBATIM_ACTIONS = (
+    "set_alarm", "list_alarms", "cancel_alarm", "stop_alarm", "snooze_alarm",
+)
+
 ALARM_VOLUME = 1.0           # master volume while ringing: he is a heavy sleeper
 ALARM_MAX_RING_S = 600.0     # give up after ten minutes with no answer
 ALARM_SNOOZE_MIN = 9         # default snooze

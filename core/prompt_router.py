@@ -238,6 +238,7 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "BARGE-IN": ["interrupt", "barge", "stop talking", "cut you off"],
     "TIMERS / REMINDERS": [
         "timer", "remind", "reminder", "alarm", "wake me", "in a minute",
+        "wake up", "snooze",
         "minutes", "seconds", "hour", "countdown", "set a", "alert me",
         "shopping list", "grocery list", "groceries", "timesheet",
         "reminders list", "reminder list", "my reminders",
