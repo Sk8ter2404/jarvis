@@ -16465,6 +16465,27 @@ def _input_open_succeeded() -> None:
         pass
 
 
+def _let_a_requested_reenum_run() -> None:
+    """record_speech, just before it resolves and claims the mic: if a
+    re-enumeration is owed (reenum_requested) and its spacing has passed,
+    open the DEVICE_CHECK_INTERVAL gate for the pass that follows.
+
+    Live 2026-11-12 11:10:27 (v3.0.15): a followed default move asked for a
+    re-enumeration and it never ran. This is the one caller that reaches
+    _refresh_devices with no capture claimed, so the only one whose pass can
+    suspend the mic bus and re-enumerate - but the speaker side's passes ran
+    first, were deferred (the bus was live), and each re-armed the 4 s gate,
+    so this caller's pass returned at the gate. Never raises."""
+    try:
+        if (_device_cache.get("reenum_requested")
+                and (time.time()
+                     - float(_device_cache.get("last_reenum_at", 0.0) or 0.0)
+                     >= _OPEN_FAIL_REENUM_MIN_S)):
+            _device_cache["checked_at"] = 0.0
+    except Exception:
+        pass
+
+
 def get_input_device() -> int | None:
     # Hard-disabled mic (staging green candidate / MICROPHONE_INDEX < 0): no
     # device, no capture, and crucially DON'T fall through to the "using system
@@ -20215,6 +20236,7 @@ def record_speech(timeout: float | None = None, *,
     # is still False, exactly as before — once we flip it True the reinit
     # path correctly defers. Resolving here also keeps the reinit out of the
     # window in which our own stream is live.
+    _let_a_requested_reenum_run()
     _in_dev = get_input_device()
     # TOCTOU fix (0xc0000374): publish mic ownership BEFORE the InputStream is
     # opened+started, not after — and claim it through the _pa_gate TEARDOWN

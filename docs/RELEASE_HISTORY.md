@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.16 (2026-11-12)
+
+Finishes the v3.0.15 microphone-switch fix. Live at 11:10 he followed a switch but the device-list refresh it asked for kept being postponed, because his speaker-side checks ran first and used up the slot. His listening loop now makes room for an owed refresh before each listen.
+
 ## v3.0.15 (2026-11-12)
 
 He went deaf after a microphone switch on 11-12: Windows moved the default mic, he announced the new one, and then heard nothing until a restart. A followed switch now also refreshes his device list, which is what the restart did. The dead-microphone warning also fires for a muted mic now; its threshold sat exactly on a muted mic's background level.

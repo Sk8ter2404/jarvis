@@ -4433,6 +4433,38 @@ class FollowTheDefaultWhileStreamsAreLiveTests(_FollowTheDefaultFixtures,
                       signature=self.SIG, force=False)
         sd._terminate.assert_called_once()
 
+    def test_record_speech_opens_the_gate_for_an_owed_re_enumeration(self):
+        """Live 11:10:27 on v3.0.15: the owed re-enumeration never ran,
+        because deferred speaker-side passes kept re-arming the 4 s gate
+        ahead of record_speech's own pass."""
+        bc = self.bc
+        saved = dict(bc._device_cache)
+        try:
+            now = time.time()
+            bc._device_cache.update(reenum_requested=True, checked_at=now,
+                                    last_reenum_at=now - 60.0)
+            bc._let_a_requested_reenum_run()
+            self.assertEqual(bc._device_cache["checked_at"], 0.0)
+            # Spacing not passed yet: the gate stays shut (no teardown loop).
+            bc._device_cache.update(checked_at=now, last_reenum_at=now - 1.0)
+            bc._let_a_requested_reenum_run()
+            self.assertEqual(bc._device_cache["checked_at"], now)
+            # Nothing owed: untouched.
+            bc._device_cache.update(reenum_requested=False,
+                                    last_reenum_at=now - 60.0)
+            bc._let_a_requested_reenum_run()
+            self.assertEqual(bc._device_cache["checked_at"], now)
+        finally:
+            bc._device_cache.clear()
+            bc._device_cache.update(saved)
+
+    def test_record_speech_calls_it_before_resolving_the_mic(self):
+        import inspect
+        src = inspect.getsource(self.bc.record_speech)
+        a = src.index("_let_a_requested_reenum_run()")
+        b = src.index("_in_dev = get_input_device()")
+        self.assertLess(a, b)
+
     def test_an_unmoved_default_never_asks_for_one(self):
         sd = self._sd(self.NAMES, default_in=1, default_out=2)
         self._settled(sd)
