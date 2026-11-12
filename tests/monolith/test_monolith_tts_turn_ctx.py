@@ -66,7 +66,22 @@ class TurnContextTTLTests(MonolithGlobalsTestCase):
         return m
 
     def _turn_ago(self, seconds):
-        self.bc._last_turn_ctx_at[0] = time.monotonic() - seconds
+        # time.monotonic() counts from boot on Windows. On a PC up for less
+        # than `seconds`, "that long ago" was a negative stamp, which
+        # _turn_ctx_fresh reads as "no turn stamped" (fresh): the 11-hour
+        # test failed on 2026-11-12, 75 minutes after a reboot. The monolith
+        # sees a clock shifted a long way from boot; it still advances.
+        real = time
+
+        class _ShiftedClock:
+            def monotonic(self):
+                return real.monotonic() + 1.0e6
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+        self._p(self.bc, "time", _ShiftedClock())
+        self.bc._last_turn_ctx_at[0] = self.bc.time.monotonic() - seconds
 
     def _preset(self):
         bc = self.bc
