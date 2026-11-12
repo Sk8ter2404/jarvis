@@ -1332,8 +1332,8 @@ STT_ENGINE                 = "whisper"   # 'whisper' | 'parakeet'
 # case "Jarvis" was misheard. Measured since v3.0.11: 88 % of all decodes were
 # rescued this way, each costing 2-3 s before listening resumed, and 0 of 671
 # produced a line the gates would admit.
-#   'hint'   (default) only when one of Parakeet's first three words sounds
-#            like the name ("Jervis", "Travis", "Jerry", "Gary", "Jersey")
+#   'hint'   (default) only when a word of Parakeet's line sounds like the
+#            name ("Jervis", "Travis", "Jerry", "Gary", "Jersey")
 #   'always' the old behaviour      'off' never
 STT_RESCUE_NO_WAKE         = "hint"
 STT_SHADOW                 = ""          # '' | 'parakeet'

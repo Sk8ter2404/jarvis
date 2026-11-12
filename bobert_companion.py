@@ -18696,17 +18696,19 @@ _no_wake_rescue_skipped = [0]
 def _no_wake_rescue_wanted(text: str) -> bool:
     """STT_RESCUE_NO_WAKE: is a 'no-wake' Whisper rescue worth its decode for
     Parakeet's ``text``? 'always' yes, 'off' no, 'hint' (default) only when
-    one of the first three words sounds like the name. Never raises (True:
-    a slower turn, never a lost one)."""
+    a word of the line sounds like the name. ANY word, not the first three:
+    standby wakes on the name anywhere in a line, and over room music a
+    mid-line "Jarvis" is refused for want of a prefix, so both are rescued.
+    Never raises (True: a slower turn, never a lost one)."""
     try:
         mode = str(globals().get("STT_RESCUE_NO_WAKE", "hint") or "hint").lower()
         if mode == "always":
             return True
         if mode == "off":
             return False
-        if _music_gate.wake_hint(text):
+        if _music_gate.wake_hint(text, n_words=40):
             return True
-        words = re.findall(r"[a-z']+", str(text or "").lower())[:3]
+        words = re.findall(r"[a-z']+", str(text or "").lower())[:40]
         return any(w.strip("'") in _NO_WAKE_RESCUE_NAMES for w in words)
     except Exception:
         return True

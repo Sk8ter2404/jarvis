@@ -264,7 +264,8 @@ class RescueWhileLoadingTests(_Base):
                     self.assertEqual(bc._parakeet_rescue(text, None), "")
             for text in ("Jervis open YouTube", "Travis, what time is it",
                          "Jerry open chrome", "hey Gary stop",
-                         "Jersey, volume down"):
+                         "Jersey, volume down", "is that you there Travis",
+                         "is that you there Jarvis"):
                 with self.subTest(text=text):
                     self.assertEqual(bc._parakeet_rescue(text, None), "no-wake")
 
