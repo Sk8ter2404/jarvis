@@ -77,7 +77,12 @@ OFF_SEQ_BEGIN = 40
 
 ALIVE_MAX_AGE_S = 3.0          # tracker heartbeat older than this = inactive
 ALIVE_CHECK_EVERY_S = 0.5      # how often the heartbeat file is stat()ed
-MIN_PUBLISH_GAP_S = 1.0 / 32   # cap the hand-off at ~30 fps
+# 1/50, was 1/32 (2026-11-12): a 30 fps camera delivers every 33.3 ms, only
+# 2 ms over the old cap, so a frame arriving a little early after a late
+# one was dropped. The owner's recordings show 22 messages a second with
+# 38 % of gaps doubled; a simulation of that one rule gives the same. The
+# cap now only stops a camera that floods.
+MIN_PUBLISH_GAP_S = 1.0 / 50
 IDLE_CLOSE_S = 60.0            # close the segment this long after the tracker left
 
 ALIVE_FILE_NAME = ".handtrack_alive"            # touched by the tracker

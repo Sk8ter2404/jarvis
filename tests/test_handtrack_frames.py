@@ -115,6 +115,24 @@ class WriterTests(unittest.TestCase):
         self.assertEqual(seq, 2)
         self.assertEqual(int(frame[100, 100, 0]), 3)
 
+    def test_a_30_fps_camera_with_jitter_loses_no_frames_to_the_cap(self):
+        # 2026-11-12: at 1/32 this published about 72 % (22 fps, in a 33 / 66
+        # ms stutter, as the owner's recordings show).
+        import random
+        rnd = random.Random(11)
+        self.heartbeat()
+        self.wall[0] = self.clock.t
+        sent = 0
+        n = 600
+        t0 = self.clock.t
+        for i in range(n):
+            self.clock.t = t0 + i / 30.0 + rnd.uniform(-0.003, 0.003)
+            if i % 20 == 0:
+                self.wall[0] = self.clock.t
+                self.heartbeat()
+            sent += bool(self.w.publish(self.frame(i % 250)))
+        self.assertGreaterEqual(sent, int(n * 0.99), sent)
+
     def test_native_size_frame_is_copied_as_is(self):
         self.heartbeat()
         src = self.frame(9, 640, 480)

@@ -17,6 +17,8 @@ THE GESTURE
   MOVE    move both fists -> the window follows the midpoint.
   RESIZE  spread them -> it grows; bring them together -> it shrinks (about
           its centre, proportional to the hand distance).
+  LOSS    a hand the tracker drops mid-grab freezes the window for up to
+          LOSS_GRACE_S; if it does not come back the grab ends.
   RELEASE open EITHER hand, or lose either hand -> it ends (after the
           controller's short dead-man grace), the window stays where it is.
           Latching needs two clean fists, but a grab keeps holding on "pinch"
@@ -54,6 +56,13 @@ LOG = "  [two-hand]"
 ACTIVE_TTL_S = 0.5          # no hands message for this long = not active
 GRIPS = {"fist": "closed", "open": "open"}   # tracker state -> controller grip
 HOLDING_STATES = ("fist", "pinch")           # keep a grab that already latched
+# A hand the tracker loses mid-grab still counts for this long, with the
+# window frozen where it was (2026-11-12). The tracker drops a real hand for
+# single frames (twice in 64 s of his two-hand recording, once for 0.14 s),
+# and each loss used to end the grab on the spot. An OPEN hand does not wait
+# for this: it lets go at once (see _step), which is what makes a grace this
+# long affordable.
+LOSS_GRACE_S = 0.5
 
 
 def _kinect_two_hand():
@@ -80,7 +89,8 @@ class WindowsBackend:
         return self._kt
 
     def controller(self):
-        return self.kt.TwoHandController()
+        # The webcam's own dead-man: the Kinect's stays at its 0.30 s.
+        return self.kt.TwoHandController(deadman_sec=LOSS_GRACE_S)
 
     def window_at(self, x: float, y: float):
         return self.kt._target_rect_at(x, y)
@@ -187,32 +197,54 @@ class TwoHandGrab:
 
     def _step(self, msg: dict, now: float):
         fw, fh = msg.get("w") or 640, msg.get("h") or 480
-        hands = {side: h for side, h in
-                 hm.hands_by_side(msg.get("hands"), fw, fh, self.p).items()
-                 if side in ("Left", "Right")}
         grabbed = self.ctrl.is_grabbed
+        raw = msg.get("hands")
+        if grabbed:
+            # A tiny (phantom) hand never stands in for a real one mid-grab:
+            # it would yank the window to wherever the phantom is.
+            raw = [h for h in (raw or [])
+                   if hm.hand_size(h, fw, fh) >= self.p.min_size_off]
+        hands = {side: h for side, h in
+                 hm.hands_by_side(raw, fw, fh, self.p).items()
+                 if side in ("Left", "Right")}
+        gap = (max(LOSS_GRACE_S, self.p.track_gap_s) if grabbed
+               else self.p.track_gap_s)
         for side, h in hands.items():
             st = self._tracks.get(side)
             hid = h.get("id")
             # While grabbed an id change keeps the track: rebuilding it restarts
             # the settle time (0.40 s), longer than the dead-man (0.30 s), so
             # every id change used to drop the window.
-            if (st is None or now - st.last > self.p.track_gap_s
+            if (st is None or now - st.last > gap
                     or (not grabbed and hid is not None and st.id is not None
                         and hid != st.id)):
                 st = hm._SideTrack(now, hid)
                 self._tracks[side] = st
             st.note(h, now, hm.hand_size(h, fw, fh), self.p)
         lt, rt = self._tracks.get("Left"), self._tracks.get("Right")
-        present = ("Left" in hands and "Right" in hands and lt is not None
-                   and rt is not None and lt.pos is not None and rt.pos is not None)
-        ready = present and lt.ready(now, self.p) and rt.ready(now, self.p)
+        seen = "Left" in hands and "Right" in hands
+        have = (lt is not None and rt is not None and lt.pos is not None
+                and rt.pos is not None)
+        if grabbed:
+            # LOSS_GRACE_S: a hand missing from this message keeps its last
+            # point; `held` below is False, so the controller freezes the
+            # window on its dead-man instead of dropping it.
+            present = (have and now - lt.last <= LOSS_GRACE_S
+                       and now - rt.last <= LOSS_GRACE_S)
+        else:
+            present = seen and have
+        ready = (seen and have and lt.ready(now, self.p)
+                 and rt.ready(now, self.p))
         both_fists = ready and lt.state == "fist" and rt.state == "fist"
         # See RELEASE in the module docstring.
-        held = (grabbed and present and lt.state in HOLDING_STATES
+        held = (grabbed and seen and have and lt.state in HOLDING_STATES
                 and rt.state in HOLDING_STATES)
+        # A hand he can be SEEN opening lets go now, not after the grace.
+        opened = bool(grabbed and have
+                      and (("Left" in hands and lt.state == "open")
+                           or ("Right" in hands and rt.state == "open")))
         hand_dist = mid = pts = None
-        if present and (both_fists or grabbed):
+        if present and (both_fists or grabbed) and not opened:
             rect = self.p.screen_rect
             if rect is None:
                 try:

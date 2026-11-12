@@ -32,7 +32,9 @@ class FakeWin:
         self.lookups, self.moves, self.published = [], [], []
 
     def controller(self):
-        return kt.TwoHandController(clock=self.clock)
+        # The same dead-man as WindowsBackend.controller.
+        return kt.TwoHandController(clock=self.clock,
+                                    deadman_sec=h2.LOSS_GRACE_S)
 
     def window_at(self, x, y):
         self.lookups.append((x, y))
@@ -128,12 +130,50 @@ class GrabTests(unittest.TestCase):
             r.run(0.5, lx=0.2, rx=0.4, **kw)
             self.assertEqual(len(r.win.moves), n, which)
 
-    def test_losing_a_hand_lets_go_at_once(self):
+    def test_one_missing_frame_keeps_the_grab_and_freezes_the_window(self):
+        # 2026-11-12: the tracker drops a real hand for single frames; each
+        # one used to end the grab on the spot.
         r = Rig()
         r.grab()
+        r.frame(lx=0.42, rx=0.62)
+        frozen = r.win.moves[-1][1]
         r.frame(left=None)
+        self.assertTrue(r.g.ctrl.is_grabbed)
+        self.assertEqual(r.win.moves[-1][1], frozen)
+        r.frame(lx=0.45, rx=0.65)
+        self.assertTrue(r.g.ctrl.is_grabbed)
+        self.assertNotEqual(r.win.moves[-1][1], frozen, "it follows again")
+
+    def test_a_hand_that_stays_lost_lets_go_after_the_grace(self):
+        r = Rig()
+        r.grab()
+        r.run(h2.LOSS_GRACE_S - 0.2, left=None)
+        self.assertTrue(r.g.ctrl.is_grabbed, "still inside the grace")
+        r.run(0.5, left=None)
         self.assertFalse(r.g.ctrl.is_grabbed)
         self.assertFalse(r.g.active(r.t))
+
+    def test_a_seen_open_hand_lets_go_well_inside_the_grace(self):
+        for which in ("left", "right"):
+            r = Rig()
+            r.grab()
+            r.run(0.3, **{which: "open"})   # the state confirm, not the grace
+            self.assertFalse(r.g.ctrl.is_grabbed, which)
+
+    def test_a_phantom_hand_cannot_stand_in_mid_grab(self):
+        r = Rig()
+        r.grab()
+        r.frame(lx=0.42, rx=0.62)
+        before = r.win.moves[-1][1]
+        # The real left hand vanishes and a tiny "Left" shows up far away.
+        r.t += 1.0 / r.fps
+        phantom = hand(side="Left", state="fist", pt=(0.95, 0.9),
+                       palm=(0.95, 0.9), hid=9, size=0.02)
+        real = hand(side="Right", state="fist", pt=(0.62, 0.45),
+                    palm=(0.62, 0.45), hid=0)
+        r.g.on_hands(msg(phantom, real), r.t)
+        self.assertTrue(r.g.ctrl.is_grabbed)
+        self.assertEqual(r.win.moves[-1][1], before)
 
 
 class FalseTriggerTests(unittest.TestCase):

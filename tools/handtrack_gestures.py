@@ -110,7 +110,6 @@ EXT_ON, EXT_OFF = 1.25, 1.10
 CURL_ON, CURL_OFF = 0.98, 1.15
 PINCH_CLOSED_D, PINCH_OPEN_D = 0.18, 0.60
 PINCH_ON, PINCH_OFF = 0.75, 0.50
-FIST_PINCH_GUARD_D = 0.22
 SPREAD_ON_DEG, SPREAD_OFF_DEG = 20.0, 14.0
 FACING_MIN_CROSS = 0.20
 STATE_DEBOUNCE_S = 0.10
@@ -401,7 +400,14 @@ class GestureEngine:
             pinch_now = s >= PINCH_OFF
         else:
             pinch_now = s >= PINCH_ON
-        if fist_like and a["pd"] > FIST_PINCH_GUARD_D:
+        # A closed hand is never a pinch (2026-11-12). Middle, ring and pinky
+        # all curled is a fist or a point, wherever the thumb lies. The old
+        # guard let a fist whose thumb sat within 0.22 hand sizes of the
+        # index tip read "pinch" (thumb wrapped over the fingers), with no
+        # hysteresis on that edge: a held fist flickered pinch / fist, fired
+        # pinch_hold, engaged the pointer and could not start a two-hand grab.
+        # A pinch now needs the other three fingers loose.
+        if tr.curled[1] and tr.curled[2] and tr.curled[3]:
             pinch_now = False
         point_flags = bool(tr.ext[0] and tr.curled[1] and tr.curled[2]
                            and tr.curled[3])

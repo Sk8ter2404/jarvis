@@ -219,6 +219,35 @@ class PinchFistTests(unittest.TestCase):
         self.assertEqual(names(ev), ["pinch_start", "pinch_hold", "pinch_end"])
         self.assertAlmostEqual(ev[1]["value"], hg.PINCH_HOLD_S, delta=0.2)
 
+    def test_a_fist_is_a_fist_wherever_the_thumb_lies(self):
+        # 2026-11-12: with the thumb tip 0.05-0.20 hand sizes from the index
+        # tip this read "pinch" and fired pinch_start and pinch_hold.
+        for gap in (0.05, 0.10, 0.15, 0.20, 0.22, 0.30):
+            with self.subTest(gap=gap):
+                eng = hg.GestureEngine()
+                seq = frames(2.5, lambda i, t: [make_hand("fist", thumb_gap=gap)])
+                ev, infos = run(eng, seq)
+                self.assertEqual(infos[0]["state"], "fist")
+                self.assertEqual([n for n in names(ev) if n.startswith("pinch")], [])
+
+    def test_a_thumb_wobbling_on_a_fist_changes_nothing(self):
+        # The old 0.22 edge had no hysteresis: 0.19 <-> 0.25 gave 23 state
+        # changes in 4 s.
+        eng = hg.GestureEngine()
+        seq = frames(4.0, lambda i, t: [make_hand(
+            "fist", thumb_gap=0.19 if (i // 3) % 2 else 0.25)])
+        states = []
+        for t, hands in seq:
+            infos, _ev = eng.update(t, hands, W, H)
+            states.append(infos[0]["state"])
+        self.assertEqual(set(states), {"fist"})
+
+    def test_a_pinch_with_loose_fingers_is_still_a_pinch(self):
+        eng = hg.GestureEngine()
+        ev, infos = run(eng, frames(1.0, lambda i, t: [make_hand("pinch")]))
+        self.assertEqual(infos[0]["state"], "pinch")
+        self.assertIn("pinch_start", names(ev))
+
     def test_short_pinch_has_no_hold(self):
         eng = hg.GestureEngine()
         seq = frames(0.3, lambda i, t: [make_hand("open")])
