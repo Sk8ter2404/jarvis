@@ -202,13 +202,56 @@ def _tone_path() -> str:
 
 
 # ── parsing ──────────────────────────────────────────────────────────────
+# A clock time the way speech-to-text writes it: "422", "4 22", "4.22",
+# "1030". Live 2026-11-12 16:21:15: "an alarm for 4:22" arrived as "422", fell
+# through to the bare-number-is-minutes rule and was set 422 minutes ahead
+# (11:23 PM). Never a number that carries a unit ("100 seconds").
+_SPOKEN_CLOCK_RE = re.compile(
+    r"(?<![\d:.])(\d{1,2})[ .]?(\d{2})(?![\d:])"
+    r"(?!\s*(?:sec|min|hour|hr|day)|\s*[smhd]\b)")
+# "4:22" with no am/pm and no leading zero ("07:15" stays 24-hour).
+_CLOCK_NO_HALF_RE = re.compile(
+    r"(?<![\d:])([1-9]|1[0-2]):([0-5]\d)\b(?!\s*[ap]\.?\s*m)")
+
+
+def _spoken_clock(t: str) -> str:
+    """``t`` with a spoken clock time rewritten as H:MM ("422" -> "4:22").
+    Unchanged when the number follows "in" (a duration) or is no clock time."""
+    m = _SPOKEN_CLOCK_RE.search(t)
+    if not m or re.search(r"\bin\s+$", t[:m.start()]):
+        return t
+    hour, minute = int(m.group(1)), int(m.group(2))
+    if hour > 23 or minute > 59:
+        return t
+    return f"{t[:m.start()]}{m.group(1)}:{minute:02d}{t[m.end():]}"
+
+
+def _until_clock(minute: int, *hours: int) -> int:
+    """Seconds until the clock next reads any of ``hours``:``minute``."""
+    now = datetime.fromtimestamp(time.time())
+    best = None
+    for h in hours:
+        target = now.replace(hour=h, minute=minute, second=0, microsecond=0)
+        delta = (target - now).total_seconds()
+        if delta <= 0:
+            delta += 86400.0
+        best = delta if best is None else min(best, delta)
+    return int(best)
+
+
 def _parse_when(text: str):
-    """Seconds from now for 'at 7', '7:30 am', 'in 20 minutes', '6 tomorrow'.
-    None when no time is named."""
+    """Seconds from now for 'at 7', '7:30 am', '422', 'in 20 minutes',
+    '6 tomorrow'. None when no time is named."""
     from skills import timer as _timer
-    t = (text or "").strip().lower()
+    t = _spoken_clock((text or "").strip().lower())
     if not t:
         return None
+    # "4:22" with no am/pm: the next time the clock reads it, morning or
+    # evening, the same rule as "at 7" below.
+    m = _CLOCK_NO_HALF_RE.search(t)
+    if m:
+        hour = int(m.group(1)) % 12
+        return _until_clock(int(m.group(2)), hour, hour + 12)
     secs = _timer._parse_clock_time(t)
     if secs is not None:
         return secs
@@ -216,15 +259,7 @@ def _parse_when(text: str):
     m = re.search(r"\b(?:at|for)\s+(\d{1,2})(?:\s*o'?clock)?\b(?!\s*(?:sec|min|hour|hr|day))", t)
     if m and 1 <= int(m.group(1)) <= 12:
         hour = int(m.group(1)) % 12
-        now = datetime.fromtimestamp(time.time())
-        best = None
-        for h in (hour, hour + 12):
-            target = now.replace(hour=h, minute=0, second=0, microsecond=0)
-            delta = (target - now).total_seconds()
-            if delta <= 0:
-                delta += 86400.0
-            best = delta if best is None else min(best, delta)
-        return int(best)
+        return _until_clock(0, hour, hour + 12)
     secs = _timer._parse_duration(t)
     if secs is not None and secs > 0:
         return int(secs)

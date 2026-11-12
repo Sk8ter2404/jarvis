@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.19 (2026-11-12)
+
+Alarm fix from the first live try. "Set an alarm for 4:22" was heard as "422" and set 422 minutes ahead (11:23 PM). A spoken clock time ("422", "4 22", "1030") is now read as a time, and one with no AM or PM means the next time the clock reads it. A number with a unit ("100 seconds") or after "in" is still a length of time.
+
 ## v3.0.18 (2026-11-12)
 
 Hand tracking and conversation fixes from the 11-12 checks. Hands: camera frames are no longer thrown away (22 a second becomes about 30), a closed fist is never read as a pinch, and a hand lost for a moment mid-grab freezes the window instead of dropping it. Talking: "repeat yourself" gives only his last line, no jokes while you are annoyed or mid-conversation, the wasted second transcription is gone (2-3 seconds saved on most sounds), and web search waits for real results. Hand changes are proven on recordings and simulated hands, not yet live.

@@ -125,6 +125,33 @@ class ParseTests(_AlarmCase):
             self.assertEqual(self.mod._parse_when("at 7"), int(8.5 * 3600))
             self.assertEqual(self.mod._parse_when("at 11"), 1800)
 
+    def test_a_clock_time_as_speech_to_text_writes_it(self):
+        # Live 2026-11-12 16:21:15: "alarm for 4:22" arrived as "422" and was
+        # set 422 minutes ahead (11:23 PM) instead of one minute ahead.
+        now = datetime(2026, 11, 12, 16, 21).timestamp()        # 4:21 PM
+        p = self.mod._parse_when
+        with mock.patch.object(self.mod.time, "time", return_value=now):
+            for text in ("422", "for 422", "4 22", "4:22", "4.22", "at 4 22",
+                         "422 pm", "4 22 p.m."):
+                with self.subTest(text=text):
+                    self.assertEqual(p(text), 60)
+            self.assertEqual(p("1030"), int(6.15 * 3600))        # 10:30 PM
+            self.assertEqual(p("730"), int(3.15 * 3600))         # 7:30 PM
+            self.assertEqual(p("7:30 am"), int(15.15 * 3600))
+            self.assertEqual(p("0715"), int(14.9 * 3600))        # 24-hour
+            self.assertEqual(p("1630"), 9 * 60)
+            # One that has just passed is the next one, twelve hours on.
+            self.assertEqual(p("4 20"), 12 * 3600 - 60)
+
+    def test_a_number_with_a_unit_or_after_in_stays_a_duration(self):
+        p = self.mod._parse_when
+        self.assertEqual(p("100 seconds"), 100)
+        self.assertEqual(p("120 minutes"), 7200)
+        self.assertEqual(p("in 422"), 422 * 60)
+        self.assertEqual(p("1 hour 30 minutes"), 5400)
+        self.assertEqual(p("45"), 45 * 60)
+        self.assertEqual(p("90m"), 5400)
+
     def test_no_time_is_none_and_sets_nothing(self):
         self.assertIsNone(self.mod._parse_when("when I get tired"))
         out = self.actions["set_alarm"]("loud please")
