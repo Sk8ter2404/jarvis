@@ -14,9 +14,11 @@ volume, then silence. A timer tells; an alarm rings.
 When an alarm is due it:
   * moves the default output to the desk speakers when the audio autoswitch
     skill offers that (a headset on the desk wakes nobody),
-  * unmutes and raises the master volume to ALARM_VOLUME (never lowers it),
+  * unmutes and raises the master volume to ALARM_VOLUME (full; never lowers it),
   * loops a tone through Windows' own player (winsound), not PortAudio, so a
     device re-enumeration or a busy TTS stream cannot stop or crash it,
+  * says a wake-up line over the tone every ALARM_SAY_EVERY_S ("Sir, you
+    need to wake up."), naming what the alarm is for when he gave a label,
   * rings until "stop" / "I'm up" / "snooze" is heard, a key or the mouse is
     touched, or ALARM_MAX_RING_S passes, then puts the volume back.
 
@@ -49,11 +51,25 @@ if _PROJECT_DIR not in sys.path:  # pragma: no cover - import-time guard
 
 from core.atomic_io import _atomic_write_json  # noqa: E402
 
-ALARM_VOLUME = 0.85          # master volume while ringing (never lowered to it)
+ALARM_VOLUME = 1.0           # master volume while ringing: he is a heavy sleeper
 ALARM_MAX_RING_S = 600.0     # give up after ten minutes with no answer
 ALARM_SNOOZE_MIN = 9         # default snooze
 ALARM_INPUT_GRACE_S = 3.0    # input in the first seconds does not dismiss
 ALARM_LATE_RING_S = 2 * 3600.0
+ALARM_SAY_FIRST_S = 2.0      # first spoken line, seconds into the ring
+ALARM_SAY_EVERY_S = 18.0     # then one every this many seconds
+# What he says over the tone, in order, then round again from the second.
+# None of them may read as an answer to the alarm (ringing_command): the mic
+# hears the speakers, and a line with "stop" in it could end its own alarm.
+WAKE_LINES = (
+    "Sir, it is {clock}. Time to wake up.",
+    "Sir, you need to wake up.",
+    "I must insist, sir. You asked me to wake you.",
+    "Sir. Wake up.",
+    "On your feet, sir. The day is not going to wait.",
+    "Still asleep, sir? This has been ringing for {minutes}.",
+    "Sir, I can keep this up far longer than you can sleep through it.",
+)
 _ALARMS_FILE_NAME = "alarms.json"
 _TONE_FILE_NAME = "alarm_tone.wav"
 
@@ -325,11 +341,17 @@ def ring(aid: int, label: str = "") -> None:
         _sound_start(_tone_path())
         started = time.monotonic()
         tick0 = None
+        said = 0
+        say_at = ALARM_SAY_FIRST_S
         while not stop.wait(0.25):
             age = time.monotonic() - started
             if age >= ALARM_MAX_RING_S:
                 me["why"] = "timeout"
                 break
+            if age >= say_at:
+                _say(wake_line(said, age, label), key=f"alarm-wake#{aid}.{said}")
+                said += 1
+                say_at = age + ALARM_SAY_EVERY_S
             tick = _input_tick()
             if age < ALARM_INPUT_GRACE_S or tick0 is None:
                 tick0 = tick
@@ -358,6 +380,20 @@ def ring(aid: int, label: str = "") -> None:
     elif why.startswith("error"):
         _say("Sir, your alarm is due, and I could not ring it.",
              key=f"alarm-error#{aid}")
+
+
+def wake_line(n: int, age_s: float, label: str = "", now: float | None = None) -> str:
+    """The n-th line (0-based) spoken over the tone, ``age_s`` into the ring."""
+    if n < len(WAKE_LINES):
+        line = WAKE_LINES[n]
+    else:
+        line = WAKE_LINES[1 + (n - 1) % (len(WAKE_LINES) - 1)]
+    mins = max(1, int(round(age_s / 60.0)))
+    line = line.format(clock=_clock(time.time() if now is None else now),
+                       minutes="a minute" if mins == 1 else f"{mins} minutes")
+    if n == 0 and label:
+        line += f" You set this for {label}."
+    return line
 
 
 def _stop_ringing(why: str) -> bool:

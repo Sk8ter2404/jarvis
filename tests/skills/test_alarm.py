@@ -169,6 +169,9 @@ class RingTests(_AlarmCase):
 
     def test_a_louder_volume_is_never_lowered(self):
         self.rig.volume = (0.95, False)
+        p = mock.patch.object(self.mod, "ALARM_VOLUME", 0.5)
+        p.start()
+        self.addCleanup(p.stop)
         t = self._ring_in_thread()
         self.assertIn(("volume", 0.95, False), self.rig.events)
         self.mod._stop_ringing("voice")
@@ -191,6 +194,40 @@ class RingTests(_AlarmCase):
         self.assertFalse(self.mod.is_ringing())
         self.assertEqual(self.rig.events[-2:], [("stop",), ("volume", 0.3, True)])
         self.assertTrue(any("no answer" in s for s in self.rig.said), self.rig.said)
+
+    def test_he_talks_over_the_tone_and_keeps_at_it(self):
+        with mock.patch.object(self.mod, "ALARM_SAY_FIRST_S", 0.0),                 mock.patch.object(self.mod, "ALARM_SAY_EVERY_S", 0.3):
+            t = self._ring_in_thread("class")
+            deadline = time.monotonic() + 5.0
+            while len(self.rig.said) < 3 and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.mod._stop_ringing("voice")
+            t.join(5.0)
+        self.assertGreaterEqual(len(self.rig.said), 3, self.rig.said)
+        self.assertIn("Time to wake up.", self.rig.said[0])
+        self.assertIn("You set this for class.", self.rig.said[0])
+        self.assertEqual(self.rig.said[1], "Sir, you need to wake up.")
+
+    def test_no_wake_line_can_answer_its_own_alarm(self):
+        # The mic hears the speakers: a line that read as "stop" or "snooze"
+        # would end the alarm it belongs to.
+        t = self._ring_in_thread()
+        try:
+            for n in range(3 * len(self.mod.WAKE_LINES)):
+                line = self.mod.wake_line(n, 60.0 * n, "work")
+                with self.subTest(line=line):
+                    self.assertEqual(self.mod.ringing_command(line), "")
+                    self.assertNotIn("{", line)
+        finally:
+            self.mod._stop_ringing("voice")
+            t.join(5.0)
+
+    def test_the_lines_cycle_without_repeating_the_clock_line(self):
+        first = self.mod.wake_line(0, 2.0, now=datetime(2026, 11, 13, 7, 0).timestamp())
+        self.assertEqual(first, "Sir, it is 7:00 AM. Time to wake up.")
+        n = len(self.mod.WAKE_LINES)
+        self.assertEqual(self.mod.wake_line(n, 200.0), self.mod.wake_line(1, 20.0))
+        self.assertIn("4 minutes", self.mod.wake_line(5, 240.0))
 
     def test_snooze_stops_it_and_arms_another(self):
         t = self._ring_in_thread("work")

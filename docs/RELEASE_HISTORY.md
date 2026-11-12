@@ -4,7 +4,7 @@ Every tagged release, newest first. Generated; do not edit by hand.
 
 ## v3.0.17 (2026-11-12)
 
-A real alarm. "Wake me up at 7" or "alarm in 20 minutes" now rings a loud tone on the desk speakers, with the volume turned up, until you say stop, say snooze, or touch the keyboard or mouse. It gives up after 10 minutes, puts the volume back, and saved alarms survive a restart. Before this, asking for an alarm set a timer that spoke one quiet line.
+A real alarm. "Wake me up at 7" or "alarm in 20 minutes" now rings a loud tone on the desk speakers at full volume and he talks over it ("Sir, you need to wake up.") until you say stop, say snooze, or touch the keyboard or mouse. It gives up after 10 minutes, puts the volume back, and saved alarms survive a restart. Before this, asking for an alarm set a timer that spoke one quiet line.
 
 ## v3.0.16 (2026-11-12)
 
