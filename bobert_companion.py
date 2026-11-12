@@ -38432,6 +38432,10 @@ def _should_refuse_background_audio(text: str) -> "tuple[bool, str]":
     nothing for music played ON the PC (Apple Music / Spotify / Chrome are
     exactly what SMTC reports) - the most common case."""
     try:
+        if _alarm_ringing_command(text):
+            # "stop" / "snooze" / "I'm up" over a ringing alarm (skills/alarm):
+            # he is half asleep and will not say the name first.
+            return (False, "")
         # Taken by whichever mic turn comes first, wake-prefixed or not.
         _greet_reply = _standby_greet_admit_take()
         # A new decision: an earlier turn's window extension can no longer
@@ -51182,6 +51186,37 @@ def _repeat_last_line_shortcut(text: str) -> bool:
         return False
 
 
+def _alarm_ringing_command(text: str) -> str:
+    """'stop' / 'snooze' when an alarm is ringing and ``text`` answers it,
+    else ''. '' when the alarm skill is not loaded. Never raises."""
+    try:
+        mod = sys.modules.get("skill_alarm")
+        return mod.ringing_command(text) if mod is not None else ""
+    except Exception:
+        return ""
+
+
+def _alarm_ringing_shortcut(text: str) -> bool:
+    """A line that answers a ringing alarm stops or snoozes it at once, with
+    no brain call (skills/alarm, 2026-11-12). False when nothing rings or
+    the line is about something else. Never raises."""
+    try:
+        if not _alarm_ringing_command(text):
+            return False
+        reply = sys.modules["skill_alarm"].handle_ringing(text)
+        if not reply:
+            return False
+        print(f"  [alarm] answered by voice: {reply}")
+        print(f"  JARVIS: {reply}")
+        _append_turn(text, reply)
+        _speak(reply)
+        set_state("idle")
+        return True
+    except Exception as _e:
+        print(f"  [alarm] shortcut failed: {type(_e).__name__}")
+        return False
+
+
 def _run_voice_shortcuts(text: str) -> bool:
     """Normal-mode voice shortcuts that bypass the LLM round-trip: replay-
     last-action, the TTS-backend toggle, conversation-mode toggle /
@@ -51192,6 +51227,9 @@ def _run_voice_shortcuts(text: str) -> bool:
     Returns True when a shortcut handled the utterance (caller should
     ``continue``); False to fall through to the full LLM dispatch.
     """
+    # A ringing alarm is answered first: "stop" must not reach anything else.
+    if _alarm_ringing_shortcut(text):
+        return True
     # v3.0.8 F3: "stop" / "never mind" while a browser task runs in the
     # background cancels it (no-op when none is running).
     if _browser_bg_stop_shortcut(text):
