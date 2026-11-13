@@ -200,6 +200,15 @@ class RefusalStateTests(_Base):
 
 
 class RunTests(_Base):
+    def setUp(self):
+        super().setUp()
+        # run() reads the real clock. With the base date (2026-11-12) these
+        # tests passed until that day and failed from 2026-11-13 on: a date
+        # that never lapses keeps them about run(), not about today.
+        p = mock.patch.object(config, "CLAUDE_PRO_FIRST_UNTIL", "2099-12-31")
+        p.start()
+        self.addCleanup(p.stop)
+
     def runner(self, outputs):
         calls = []
 
