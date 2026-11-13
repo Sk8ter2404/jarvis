@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.22 (2026-11-13)
+
+"What are the results?" now gets a spoken answer. In the v3.0.21 live check he picked the right command and read the page, then said the results were "too long" because that path handed the brain an oversized prompt. The command now speaks its own finished answer: the top three results, numbered, straight from the page. The search also waits up to 4 seconds for results to appear instead of 2.
+
 ## v3.0.21 (2026-11-13)
 
 Web search can read its results again. Asked about the Outlook outage (11-13 11:12), he opened the search, read nothing off the page, offered "headlines" and read the news briefing instead. Google's result links had grown taller than the size his page reader accepted, so every real result was thrown out. Results are read again, with the web address trimmed off each title, and "what are the results" / "read the results" now has a real action behind it instead of a second search.

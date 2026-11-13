@@ -23489,7 +23489,7 @@ def _note_web_search_ran(name, result) -> None:
             _last_web_search_at[0] = time.time()
             _last_web_search_read[0] = "top results:" in str(result or "")
         elif (name == "read_search_results"
-                and str(result or "").startswith("top results for")):
+                and str(result or "").startswith("The top results for")):
             _last_web_search_read[0] = True
     except Exception:
         pass
@@ -41523,8 +41523,6 @@ INFORMATIVE_ACTIONS = {
     # Web actions: opening a URL or searching is preparatory — JARVIS should
     # follow up with see_screen to read what actually loaded rather than stopping.
     "open_url", "web_search",
-    # What the last search found (2026-11-13): the model words the titles.
-    "read_search_results",
     # Network roll-call returns a long device LIST — let the follow-up LLM
     # summarise it ("35 devices, including your phone and ...") rather than the
     # verbatim path reading out 35 raw client names.
@@ -41606,6 +41604,9 @@ INFORMATIVE_ACTIONS = {
 # follow-up). Skills register status-report aliases into ACTIONS after boot, so
 # they can extend this set the same way they extend INFORMATIVE_ACTIONS.
 SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
+    # What the last web search found (core.actions._act_read_search_results,
+    # 2026-11-13): a finished sentence built from the page's own titles.
+    "read_search_results",
     # Version / last-upgrade readout (core.actions._act_version_info + aliases).
     "version_info", "what_version", "when_updated",
     # Tray icon brought back (_act_show_tray) — one finished sentence.

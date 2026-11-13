@@ -164,7 +164,7 @@ class SearchGuardTests(_OfferBase):
         bc._note_web_search_ran("web_search", _SEARCH_OK)
         self.assertIn("you have not read its results", self._guard_text())
         bc._note_web_search_ran(
-            "read_search_results", "top results for 'x': \"A long result title\"")
+            "read_search_results", "The top results for 'x', sir. One: A title.")
         self.assertNotIn("IMPORTANT: a web search", self._guard_text())
 
 

@@ -158,18 +158,41 @@ class ReadSearchResultsTests(unittest.TestCase):
 
     def test_nothing_searched_says_so(self):
         A._last_search.update(query="", found=None, at=0.0)
-        self.assertIn("no web search is open", A._act_read_search_results(""))
+        self.assertIn("No web search is open", A._act_read_search_results(""))
         A._last_search.update(query="old", found=FOUND,
                               at=time.monotonic() - A._LAST_SEARCH_MAX_AGE_S - 5)
-        self.assertIn("no web search is open", A._act_read_search_results(""))
+        self.assertIn("No web search is open", A._act_read_search_results(""))
 
     def test_it_reads_the_page_the_search_opened(self):
         A._last_search.update(query="aa to c", found=FOUND, at=time.monotonic())
         with mock.patch.object(_st, "snapshot", return_value=_snap(HEADER + RESULTS)),                 mock.patch.object(A, "_search_window") as find:
             out = A._act_read_search_results("")
         find.assert_not_called()
-        self.assertTrue(out.startswith(
-            "top results for 'aa to c': \"Powerlion C Size Battery Adapters"), out)
+        # A finished sentence, spoken as written: numbered, three at most.
+        self.assertEqual(
+            out,
+            "The top results for 'aa to c', sir. "
+            "One: Powerlion C Size Battery Adapters, AA to C Size - 4 Pack. "
+            "Two: AA to C Size Battery Spacer Converter Case. "
+            "Three: How to use AA batteries in a C battery device.")
+        for word in ("couldn't", "could not", "failed", "unable", "error"):
+            self.assertNotIn(word, out.lower())
+
+    def test_titles_are_cleaned_for_speech(self):
+        # Live 2026-11-13 12:39:50: a "|" in a title and a card that was only
+        # "X \u00b7 ..." came back.
+        page = [_el("Search Results", 200, ctype="Text"),
+                _el("Outlook down? Current outages and problems | Downdetector US", 300, h=120),
+                _el("X \u00b7 Microsoft 365 Status", 420, h=118),
+                _el("Microsoft hit by global outages: What happened and why? "
+                    "8 hours ago Al Jazeera", 560, h=270)]
+        A._last_search.update(query="outlook outage", found=FOUND, at=time.monotonic())
+        with mock.patch.object(_st, "snapshot", return_value=_snap(page)):
+            out = A._act_read_search_results("")
+        self.assertIn("One: Outlook down? Current outages and problems, "
+                      "Downdetector US.", out)
+        self.assertNotIn("|", out)
+        self.assertNotIn("\u00b7", out)
 
     def test_a_search_that_was_still_loading_is_found_by_its_title(self):
         A._last_search.update(query="aa to c", found=None, at=time.monotonic())
@@ -182,7 +205,7 @@ class ReadSearchResultsTests(unittest.TestCase):
         A._last_search.update(query="aa to c", found=None, at=time.monotonic())
         with mock.patch.object(A, "_search_window", return_value=None),                 mock.patch.object(A, "_webbrowser_open") as opened:
             out = A._act_read_search_results("")
-        self.assertIn("could not read the results for 'aa to c'", out)
+        self.assertIn("The results page for 'aa to c' is not open", out)
         opened.assert_not_called()
 
     def test_web_search_remembers_what_it_searched(self):

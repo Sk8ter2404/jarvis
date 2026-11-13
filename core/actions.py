@@ -343,7 +343,9 @@ _SEARCH_CHROME_RE = re.compile(
 # took 75 s. So the read waits for the "Search Results" heading (a few short
 # tries), and a page that never shows it must offer at least this many
 # result-like links before any of them count.
-_RESULTS_TRIES = 4
+# Live 2026-11-13 12:39:32 four tries (2 s) were not enough: the page was open
+# and its results arrived a moment later.
+_RESULTS_TRIES = 8
 _RESULTS_RETRY_GAP_S = 0.5
 _RESULTS_MIN_WITHOUT_HEADING = 3
 # A result link's box. Live 2026-11-13 11:12 the limit was 60 px and every
@@ -607,28 +609,49 @@ def _search_window(query: str):
         return None
 
 
+_COUNT_WORDS = ("One", "Two", "Three", "Four", "Five")
+_SPOKEN_RESULTS = 3
+
+
+def _spoken_results(line: str) -> list:
+    """The titles in a _search_results_line string, cleaned to be read
+    aloud: no "|" or bullet marks, and nothing that is not a headline (a
+    card that is only a site's name, "X · ...")."""
+    out = []
+    for title in re.findall(r'"([^"]+)"', line or ""):
+        t = re.sub(r"\s*[|\u00b7\u2022\u203a]\s*", ", ", title)
+        t = re.sub(r"\s+", " ", t).strip(" ,.")
+        if len(re.findall(r"[A-Za-z]{3,}", t)) >= 3:
+            out.append(t)
+    return out
+
+
 def _act_read_search_results(_: str = "") -> str:
-    """What the last web_search found, read off its results page again.
+    """What the last web_search found, read off its results page again, as
+    a finished sentence to speak.
 
     Live 2026-11-13 11:13 "what are the results?" and "read the search
     results" had no action behind them: the brain said it had no way to
-    check, searched again, then read the news briefing. Reads the page;
-    opens nothing."""
+    check, searched again, then read the news briefing. Spoken as written
+    (SPEAK_RESULT_VERBATIM_ACTIONS): live 12:39:50 the model round that was
+    to word the titles could not fit its prompt and said "too long". Reads
+    the page; opens nothing."""
     query = str(_last_search.get("query") or "")
     age = time.monotonic() - float(_last_search.get("at") or 0.0)
     if not query or age > _LAST_SEARCH_MAX_AGE_S:
-        return ("no web search is open to read - nothing was searched in "
-                "the last half hour")
+        return "No web search is open for me to read, sir."
     found = _last_search.get("found")
     line = _search_results_line(found) if found else ""
     if not line:
         win = _search_window(query)
         if win is not None:
             line = _search_results_line((win[0], win[1], None, None, ""))
-    if not line:
-        return (f"could not read the results for '{query}': the results "
-                "page is not open, or has nothing on it yet")
-    return f"top results for '{query}': {line}"
+    titles = _spoken_results(line)[:_SPOKEN_RESULTS]
+    if not titles:
+        return (f"The results page for '{query}' is not open, or has nothing "
+                "on it yet, sir.")
+    said = " ".join(f"{_COUNT_WORDS[i]}: {t}." for i, t in enumerate(titles))
+    return f"The top results for '{query}', sir. {said}"
 
 
 def _act_youtube(query: str) -> str:
