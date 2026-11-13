@@ -23449,45 +23449,114 @@ _last_web_search_at: list = [0.0]       # time.time() of the last web_search
 # v3.0.6: live 2026-10-28 17:53 ("what's a good quick dinner idea?") the
 # spoken reply said "see_screen" aloud - this guard named the action in the
 # words it asked for. The offer is now in plain words.
+# 2026-11-13 11:12-11:14: the search page had loaded and its results could
+# have been read, yet this guard told the model to "offer to read the
+# results" - an offer nothing could carry out (yes ran the news briefing,
+# twice) - and on later turns that the results "were never read", so "read
+# the search results" was answered "I have no way". Now: a search whose
+# result lists its top results is simply reported; one that could not be
+# read says so; and a later ask is read_search_results (routed with no model,
+# see _search_results_route).
 _SEARCH_GUARD_OPEN = (
-    "IMPORTANT: a web search was just fired but the results have "
-    "not been read. Do NOT fabricate or claim source attributions. "
-    "Acknowledge the search was opened in the browser and offer to "
-    "read the results to him (never say an action name aloud).\n\n"
+    "IMPORTANT: a web search was just opened in the browser but its "
+    "results could not be read yet. Do NOT fabricate or claim what it "
+    "found. Say the page is open, and that you can read the results to "
+    "him once it has loaded (never say an action name aloud).\n\n"
+)
+_SEARCH_GUARD_READ = (
+    "IMPORTANT: the web search's result above lists the top results. Tell "
+    "him in one or two sentences what they say, naming the sources. Add "
+    "nothing that is not in them, and do NOT offer to read them or any "
+    "'headlines': you are reading them now.\n\n"
 )
 _SEARCH_GUARD_CLOSED = (
-    "IMPORTANT: a web search ran earlier but its results were never read. "
-    "Do NOT fabricate or claim what it found. That offer is closed: do not "
-    "bring the search up again unless sir asks about it.\n\n"
+    "IMPORTANT: a web search ran earlier and you have not read its results. "
+    "Do NOT fabricate or claim what it found. If he asks what it found, or "
+    "to read the results: [ACTION: read_search_results]. Never search "
+    "again for that. Otherwise do not bring the search up.\n\n"
 )
+# Did the last web search hand back its results (in its own result line, or
+# through read_search_results since)?
+_last_web_search_read: list = [False]
 
 
 def _note_web_search_ran(name, result) -> None:
-    """Stamp _last_web_search_at when a web_search (or an alias) succeeded.
-    Never raises."""
+    """Stamp _last_web_search_at when a web_search (or an alias) succeeded,
+    and whether its results have been read. Never raises."""
     try:
         if (_once_per_turn_kind(name) == "web_search"
                 and not _action_result_failed(result)):
             _last_web_search_at[0] = time.time()
+            _last_web_search_read[0] = "top results:" in str(result or "")
+        elif (name == "read_search_results"
+                and str(result or "").startswith("top results for")):
+            _last_web_search_read[0] = True
     except Exception:
         pass
 
 
 def _unread_search_guard() -> str:
-    """The guard text for a web_search in history that no see_screen read:
-    the open-chain text while this turn ran the search, the closed text for
-    an earlier turn's search younger than OFFER_TTL_S, else "". Never
-    raises."""
+    """The guard text for the last web_search: while this turn ran it, how
+    to report it (its results came back, or could not be read); for an
+    earlier turn's search younger than OFFER_TTL_S whose results nobody has
+    read, the closed text; else "". Never raises."""
     try:
-        if any(_once_per_turn_kind(n) == "web_search"
-               for n in _turn_actions_ran()):
-            return _SEARCH_GUARD_OPEN
+        ran = list(_turn_actions_ran())
+        if any(_once_per_turn_kind(n) == "web_search" for n in ran):
+            return (_SEARCH_GUARD_READ if _last_web_search_read[0]
+                    else _SEARCH_GUARD_OPEN)
+        if "read_search_results" in ran or _last_web_search_read[0]:
+            return ""
         at = float(_last_web_search_at[0] or 0.0)
         if at and time.time() - at < OFFER_TTL_S:
             return _SEARCH_GUARD_CLOSED
     except Exception:
         pass
     return ""
+
+
+# "read the search results" / "what are the results" / "what did you find",
+# whole line, and an offer of JARVIS's own to read them.
+_SEARCH_RESULTS_ASK_RE = re.compile(
+    r"^\W*(?:(?:hey|ok|okay)\W+)?(?:jarvis\W+)?(?:please\s+)?"
+    r"(?:(?:can|could|would) you\s+)?(?:just\s+)?"
+    r"(?:read (?:me )?(?:(?:the |those |these )?(?:search |top )?results?|them)"
+    r"(?: to me| out| aloud| out loud)?"
+    r"|what (?:are|were) the (?:search |top )?results"
+    r"|what did (?:you|it|the search|that search) (?:find|say|come up with)"
+    r"|what does (?:it|the search|google) say"
+    r"|tell me (?:the |what the )(?:search |top )?results(?: are| say)?)"
+    r"\W*(?:please|sir|jarvis)?\W*$", re.IGNORECASE)
+_SEARCH_OFFER_RE = re.compile(
+    r"\b(?:read|go through|go over|summari[sz]e|tell you)\b.*"
+    r"\b(?:results?|headlines?|them|findings?)\b", re.IGNORECASE)
+_SEARCH_RESULTS_ROUTE_S = 30 * 60.0
+
+
+def _search_results_route(text, offer_yes: str = ""):
+    """"[ACTION: read_search_results]" when this turn asks what the last web
+    search found - in so many words, or by saying yes to JARVIS's own offer
+    to read it - and a search ran in the last half hour. None otherwise.
+
+    The choice is not the model's to make: live 2026-11-13 it answered "no
+    way to check", searched again, and on "yes" read the news briefing. The
+    model still words the answer, from the action's result. Never raises."""
+    try:
+        at = float(_last_web_search_at[0] or 0.0)
+        if not at or time.time() - at > _SEARCH_RESULTS_ROUTE_S:
+            return None
+        if ACTIONS.get("read_search_results") is None:
+            return None
+        if offer_yes and _SEARCH_OFFER_RE.search(str(offer_yes)):
+            why = "yes to the offer"
+        elif _SEARCH_RESULTS_ASK_RE.match(str(text or "").strip()):
+            why = "asked for"
+        else:
+            return None
+        print(f"  [route] search results {why}: read_search_results")
+        return "[ACTION: read_search_results]"
+    except Exception:
+        return None
 
 
 def _local_chat_prompt(system: str, messages: list) -> tuple:
@@ -53744,6 +53813,10 @@ def _run_llm_dispatch_body(text: str) -> str:
     # A skill's utterance route (see _UTTERANCE_ROUTES) claims an exact request
     # before the glance check and the LLM: its action token IS the reply.
     _route_reply = _utterance_route_reply(text)
+    # "What are the results?" / yes to "shall I read them?" after a web
+    # search: the action is known, only its wording is the model's.
+    if _route_reply is None:
+        _route_reply = _search_results_route(text, _offer_yes)
     # Instant actions (2026-10-02): a basic volume / media / lights / print-
     # pause command (_instant_action_for). Mode "on" makes its token the reply
     # and it runs exactly like a route below; "shadow" only logs it, and the

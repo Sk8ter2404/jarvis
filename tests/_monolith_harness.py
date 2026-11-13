@@ -158,7 +158,7 @@ _MONOLITH_RESTORE_NAMES = (
     # 2026-10-01): a dispatch test leaves both behind, and either would drop
     # a LATER test's "Also, …" aside or put the unread-search guard into its
     # local prompt.
-    "_offer_ledger", "_last_web_search_at",
+    "_offer_ledger", "_last_web_search_at", "_last_web_search_read",
     # The offer a dispatch test's turn ended on is answered by a LATER test's
     # "yes" otherwise (2026-10-02, _note_open_offer); the accepted-offer cell
     # with it. The OpenOffer itself is cleared in _restore_monolith_pristine.

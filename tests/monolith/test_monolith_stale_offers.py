@@ -50,7 +50,13 @@ _HISTORY = [
 ]
 # v3.0.6: was "... via see_screen" - live 2026-10-28 17:53 the action name
 # was spoken aloud; the offer is now in plain words.
-_OPEN_OFFER = "offer to read the results to him"
+# 2026-11-13: the offer is made only for a search whose results could NOT be
+# read ("you can read the results to him once it has loaded"); yes to it is
+# carried out by read_search_results (_search_results_route).
+_OPEN_OFFER = "you can read the results to"
+_SEARCH_READ = (f"opened Google search for '{_QUERY}' on the left monitor "
+                '— top results: "First result title", "Second result '
+                'title", "Third result title"')
 
 # Verbatim from the 2026-10-01 session log.
 _R_205928 = (
@@ -75,6 +81,7 @@ class _OfferBase(_Base):
         # create=True: on a tree without the fix these tests then fail on
         # what is SAID, not on a missing attribute.
         self._p(bc, "_last_web_search_at", [0.0], create=True)
+        self._p(bc, "_last_web_search_read", [False], create=True)
         self._p(bc, "_offer_ledger", [], create=True)
         bc.ACTIONS["web_search"] = lambda q="": _SEARCH_OK
         bc.ACTIONS["see_screen"] = (
@@ -122,7 +129,7 @@ class SearchGuardTests(_OfferBase):
         bc._note_turn_action_ran("web_search", _SEARCH_OK)
         bc._last_web_search_at[0] = time.time()
         text = self._guard_text()
-        start = text.index("IMPORTANT: a web search was just fired")
+        start = text.index("IMPORTANT: a web search was just opened")
         guard = text[start:text.index("\n\n", start)]
         for name in ("see_screen", "web_search", "read_screen"):
             self.assertNotIn(name, guard)
@@ -132,7 +139,87 @@ class SearchGuardTests(_OfferBase):
         text = self._guard_text()
         self.assertIn("Do NOT fabricate", text)
         self.assertNotIn(_OPEN_OFFER, text)
+        # ... and says what to do when he asks (live 2026-11-13 11:13: "read
+        # the search results" was answered "I have no way").
+        self.assertIn("[ACTION: read_search_results]", text)
 
+    def test_a_search_that_came_back_with_results_is_reported_not_offered(self):
+        # Live 2026-11-13 11:12: the guard asked for an offer to read results
+        # that nothing could then read; "yes" ran the news briefing.
+        bc = self.bc
+        prev = bc._begin_turn_grounding("what is going on with the outage")
+        self.addCleanup(bc._end_turn_grounding, prev)
+        bc._note_turn_action_ran("web_search", _SEARCH_READ)
+        bc._note_web_search_ran("web_search", _SEARCH_READ)
+        text = self._guard_text()
+        self.assertIn("lists the top results", text)
+        self.assertIn("do NOT offer to read them", text)
+        self.assertNotIn(_OPEN_OFFER, text)
+
+    def test_results_already_read_leave_no_guard_on_later_turns(self):
+        bc = self.bc
+        bc._note_web_search_ran("web_search", _SEARCH_READ)
+        self.assertNotIn("IMPORTANT: a web search", self._guard_text())
+        # An unread search is closed by reading it.
+        bc._note_web_search_ran("web_search", _SEARCH_OK)
+        self.assertIn("you have not read its results", self._guard_text())
+        bc._note_web_search_ran(
+            "read_search_results", "top results for 'x': \"A long result title\"")
+        self.assertNotIn("IMPORTANT: a web search", self._guard_text())
+
+
+class SearchResultsRouteTests(_OfferBase):
+    """"What are the results?" and yes to "shall I read them?" after a web
+    search: the action is chosen with no model (2026-11-13 11:12-11:14 the
+    model said it had no way to check, searched again, then read the news)."""
+
+    def setUp(self):
+        super().setUp()
+        self.bc.ACTIONS["read_search_results"] = lambda _a="": "top results for 'x': \"A\""
+        self.bc._last_web_search_at[0] = time.time() - 60
+
+    def _route(self, text, offer=""):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return self.bc._search_results_route(text, offer)
+
+    def test_plain_asks_route(self):
+        for text in ("Jarvis, what are the results?", "Jarvis read the search results.",
+                     "read the results", "read them to me", "what did you find",
+                     "Jarvis, can you read me the top results please",
+                     "what did that search come up with", "what does it say"):
+            with self.subTest(text=text):
+                self.assertEqual(self._route(text), "[ACTION: read_search_results]")
+
+    def test_yes_to_his_own_offer_routes(self):
+        for offer in ("Shall I read the headlines to you?",
+                      "I've opened the search results in your browser; shall I "
+                      "read the headlines to you?",
+                      "Would you like me to go through the results, sir?",
+                      "Shall I summarize the findings?"):
+            with self.subTest(offer=offer):
+                self.assertEqual(self._route("Yes.", offer),
+                                 "[ACTION: read_search_results]")
+
+    def test_other_lines_and_other_offers_do_not(self):
+        for text in ("Jarvis, read my email", "what are the results of the game",
+                     "read it", "yes", "what did you find in my downloads folder",
+                     "search for the results of the election", "read the room"):
+            with self.subTest(text=text):
+                self.assertIsNone(self._route(text))
+        self.assertIsNone(self._route("Yes.", "Shall I open it in your browser instead?"))
+        self.assertIsNone(self._route("Yes.", "Shall I queue your usual mix, sir?"))
+
+    def test_no_recent_search_or_no_action_does_not(self):
+        self.bc._last_web_search_at[0] = time.time() - 45 * 60
+        self.assertIsNone(self._route("what are the results"))
+        self.bc._last_web_search_at[0] = 0.0
+        self.assertIsNone(self._route("what are the results"))
+        self.bc._last_web_search_at[0] = time.time()
+        del self.bc.ACTIONS["read_search_results"]
+        self.assertIsNone(self._route("what are the results"))
+
+
+class SearchGuardAgeTests(_OfferBase):
     def test_the_live_35_minute_old_search_gets_no_guard(self):
         self.bc._last_web_search_at[0] = time.time() - 35 * 60
         text = self._guard_text()
