@@ -239,6 +239,8 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "TIMERS / REMINDERS": [
         "timer", "remind", "reminder", "alarm", "wake me", "in a minute",
         "wake up", "snooze",
+        # 2026-11-12: wake-up asks that loaded no alarm instructions.
+        "get me up", "be up by", "be up at", "get up at", "wake-up",
         "minutes", "seconds", "hour", "countdown", "set a", "alert me",
         "shopping list", "grocery list", "groceries", "timesheet",
         "reminders list", "reminder list", "my reminders",
@@ -1195,7 +1197,30 @@ def _mask_release_title(part: str) -> str:
                   flags=re.IGNORECASE)
 
 
+# A bare time, alone: the answer to "what time should it ring?" ("7 am",
+# "422", "at 7", "5.30 in the morning"). Measured 2026-11-12: it routed no
+# section at all, so the turn that carried the answer had no alarm grammar.
+# Any lone 1-4 digit number loads the section too; that costs prompt size on
+# a rare turn, nothing else.
+_BARE_TIME_RE = re.compile(
+    r"^\W*(?:(?:hey|ok|okay)\W+)?(?:jarvis\W+)?"
+    r"(?:(?:i mean|i said|it is|it's|make it|at|for|about|around)\s+)*"
+    r"(?:\d{1,2}(?:[:. ]?\d{2})?|noon|midnight)"
+    r"(?:\s*(?:a\.?m\.?|p\.?m\.?|o'?clock))?"
+    r"(?:\s+(?:in the|this|tomorrow)\s+(?:morning|afternoon|evening|night)"
+    r"|\s+(?:tonight|tomorrow|today|at night))*"
+    r"\W*(?:please|sir)?\W*$", re.IGNORECASE)
+
+
+def _bare_time_request(text) -> bool:
+    try:
+        return bool(_BARE_TIME_RE.match(text or ""))
+    except Exception:
+        return False
+
+
 _PREDICATE_ROUTES = {
+    "TIMERS / REMINDERS": _bare_time_request,
     "PYTHON SANDBOX": is_arithmetic_request,
     "SELF-KNOWLEDGE": is_self_knowledge_request,
     # 2026-10-05 (live 00:28:23): "click that Mr. Beast video and then go

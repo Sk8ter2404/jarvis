@@ -42832,6 +42832,8 @@ def _detect_preemptive_hallucination(
 # "yes" that wake-word mode drops - so the song / search / reminder never ran
 # (2026-10-01).
 _CONFIRM_FREE_TEXT_ACTIONS = frozenset(MUSIC_ACTION_NAMES) | {"web_search", "set_timer"}
+# set_alarm's label is the same free text ("7 am | pay rent", 2026-11-12).
+_CONFIRM_FREE_TEXT_ACTIONS = _CONFIRM_FREE_TEXT_ACTIONS | {"set_alarm"}
 # A file move ALWAYS asks its own question naming the file and both folders
 # (_jarvis_pushback -> skills/file_move.py), and only that question's yes can
 # run it; the generic keyword prompt would get in front of it for a file name
@@ -46798,11 +46800,11 @@ _ANSWER_FIRST_WRY_TAG_RE = re.compile(r"^\s*\[\s*wry\s*\]\s*", re.IGNORECASE)
 # are compared after processing_filler.normalise_line ("sir" and punctuation
 # removed).
 _ANSWER_FIRST_ACK_WORDS = frozenset("""
-    a absolutely afraid allow at away bear certainly check checking course
+    a absolutely afraid allow as at away bear certainly check checking course
     fetching find for get getting give glad good have i i'd i'll i'm indeed
     into it just let look looking me moment now of on once one pleasure pull
     pulling quick quickly right second see shall sure that the thing this to
-    understood up very well will with you
+    understood up very well will wish with you
 """.split())
 _ANSWER_FIRST_CHECK_PREFIXES = (
     "let me check", "i'll check", "i will check", "checking", "let me look at",
@@ -51241,10 +51243,20 @@ def _alarm_ringing_command(text: str) -> str:
         return ""
 
 
-def _alarm_ringing_shortcut(text: str) -> bool:
+def _alarm_is_ringing() -> bool:
+    """True while the alarm skill is ringing an alarm. Never raises."""
+    try:
+        mod = sys.modules.get("skill_alarm")
+        return bool(mod is not None and mod.is_ringing())
+    except Exception:
+        return False
+
+
+def _alarm_ringing_shortcut(text: str, keep_state: bool = False) -> bool:
     """A line that answers a ringing alarm stops or snoozes it at once, with
     no brain call (skills/alarm, 2026-11-12). False when nothing rings or
-    the line is about something else. Never raises."""
+    the line is about something else. ``keep_state`` is for standby, which
+    stays in standby after answering. Never raises."""
     try:
         if not _alarm_ringing_command(text):
             return False
@@ -51255,11 +51267,161 @@ def _alarm_ringing_shortcut(text: str) -> bool:
         print(f"  JARVIS: {reply}")
         _append_turn(text, reply)
         _speak(reply)
-        set_state("idle")
+        if not keep_state:
+            set_state("idle")
         return True
     except Exception as _e:
         print(f"  [alarm] shortcut failed: {type(_e).__name__}")
         return False
+
+
+# The words a bare time is made of: an answer to "what time?" about an alarm
+# may hold nothing else (2026-11-12).
+_ALARM_ANSWER_WORD_RE = re.compile(
+    r"^(?:\d{1,4}|\d{1,2}[:.]\d{2}|\d{1,2}(?::\d{2})?[ap]\.?m\.?|[ap]\.?m\.?|a|p|m"
+    r"|o'?clock|noon|midnight|morning|afternoon|evening|night|tonight"
+    r"|tomorrow|today|in|the|at|for|about|around|this|an|half|quarter|past"
+    r"|to|and|oh|minutes?|mins?|hours?|hrs?|seconds?|secs?|please|sir"
+    r"|i|mean|said|make|it|it's|its|is|say"
+    r"|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve"
+    r"|fifteen|twenty|thirty|forty|fifty)$")
+_ALARM_ANSWER_MAX_WORDS = 8
+
+
+# A turn that asked for an alarm (and nothing about one already set), and a
+# reply that asks him when.
+_ALARM_ASK_RE = re.compile(r"\balarm\b|\bwake me\b|\bget me up\b", re.IGNORECASE)
+_ALARM_NOT_AN_ASK_RE = re.compile(
+    r"\b(?:cancel|snooze|stop|what|when|did|didn't|didnt|list|which|off"
+    r"|delete|remove|why|how|went|rang|was|is)\b", re.IGNORECASE)
+_ALARM_WHEN_REPLY_RE = re.compile(
+    r"\bwhat time\b|\bwhen\b|\bwhat hour\b|\bhow long\b|\bwhat\?\s*$",
+    re.IGNORECASE)
+_ALARM_ANSWER_FILLER_RE = re.compile(
+    r"^(?:(?:i mean|i said|make it|it's|its|it is|say|the|for|about|around"
+    r"|at|an|a)\s+)+")
+_ALARM_ANSWER_HOUR_RE = re.compile(
+    r"\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve")
+_ALARM_ANSWER_NUMBER_RE = re.compile(
+    r"\d|\b(?:noon|midnight|one|two|three|four|five|six|seven|eight|nine|ten"
+    r"|eleven|twelve|half|quarter)\b")
+_ALARM_ANSWER_WINDOW_S = 120.0
+
+
+def _alarm_question_open() -> bool:
+    """True when the last thing JARVIS did was ask WHEN an alarm should ring.
+
+    Either the alarm skill itself just asked ("What time should it ring" -
+    the brain path does not write that line into the history, so the skill
+    keeps the stamp), or the last turn was an ask to SET an alarm and the
+    reply was a when-question with no alarm set, inside two minutes. An ask
+    about an alarm that exists (cancel, snooze, "did it ring") never counts:
+    its answer ("the 7", "ten") is not a new alarm. Never raises."""
+    try:
+        mod = sys.modules.get("skill_alarm")
+        if mod is not None and mod.asked_when_recently():
+            return True
+        if time.monotonic() - _last_turn_ctx_at[0] > _ALARM_ANSWER_WINDOW_S:
+            return False
+        if len(conversation_history) < 2:
+            return False
+        asked, said = conversation_history[-2], conversation_history[-1]
+        if asked.get("role") != "user" or said.get("role") != "assistant":
+            return False
+        ask = str(asked.get("content") or "")
+        if not _ALARM_ASK_RE.search(ask) or _ALARM_NOT_AN_ASK_RE.search(ask):
+            return False
+        reply = str(said.get("content") or "")
+        return ("?" in reply and "ACTION:" not in reply
+                and "Alarm #" not in reply
+                and bool(_ALARM_WHEN_REPLY_RE.search(reply)))
+    except Exception:
+        return False
+
+
+def _alarm_when_answer(text: str) -> str:
+    """The set_alarm argument when ``text`` is nothing but a time and it
+    answers JARVIS's own question about when an alarm should ring, else "".
+
+    Live 2026-11-12 17:03:22 the brain answered "set an alarm for 422" with
+    a question; the owner's next line would have been a bare time, which
+    routes nowhere, which the brain may read as anything, and which the
+    speech filter drops as too short ("7 am" is four characters). A bare
+    hour answering "what time?" is an hour, said as a digit or a word
+    ("7", "seven", "about 7"). Never raises."""
+    try:
+        if not _alarm_question_open():
+            return ""
+        t = re.sub(r"^\W*(?:(?:hey|ok|okay)\W+)?(?:jarvis\W+)?", "",
+                   str(text or "").strip(), flags=re.IGNORECASE)
+        t = t.strip(" .!?,").lower()
+        words = re.findall(r"[a-z0-9:.']+", t)
+        if not words or len(words) > _ALARM_ANSWER_MAX_WORDS:
+            return ""
+        if not all(_ALARM_ANSWER_WORD_RE.match(w.strip(".")) for w in words):
+            return ""
+        if not _ALARM_ANSWER_NUMBER_RE.search(t):
+            return ""
+        bare = _ALARM_ANSWER_FILLER_RE.sub("", t)
+        if _ALARM_ANSWER_HOUR_RE.fullmatch(bare):
+            return f"at {bare}"
+        return t
+    except Exception:
+        return ""
+
+
+def _run_alarm_set_shortcut(text: str) -> bool:
+    """A plain ask for an alarm at a time ("set an alarm for 422", "wake me
+    up at 6 30", "alarm in 20 minutes") sets it with no brain call
+    (core/alarm_intent, 2026-11-12). Live 16:21:15 the brain passed "422"
+    through; 17:03:22 it asked what 422 meant. False - so the brain answers -
+    when the line is not such an ask, the alarm skill is not loaded, or the
+    skill's own parser reads no time in it. A bare time that answers
+    JARVIS's own question about an alarm counts too (_alarm_when_answer).
+    Never raises."""
+    if not (globals().get("FAST_PATHS_ENABLED", True)
+            and globals().get("ALARM_SET_FAST_PATH", True)):
+        return False
+    try:
+        from core import alarm_intent as _alarm_intent
+        arg = _alarm_intent.match(text) or _alarm_when_answer(text)
+        if not arg:
+            return False
+        mod = sys.modules.get("skill_alarm")
+        if mod is None or ACTIONS.get("set_alarm") is None:
+            return False
+        secs = mod._parse_when(arg)
+        if secs is None or not 0 < secs <= 2 * 86400:
+            print("  [fast-path] alarm-set: no time read; the brain decides")
+            return False
+    except Exception as _e:
+        print(f"  [fast-path] alarm-set check failed: {type(_e).__name__}")
+        return False
+    # The owner's words for this turn, as a routed turn records them.
+    _last_user_text[0] = text
+    _last_turn_ctx_at[0] = time.monotonic()   # TTS_TURN_CONTEXT_TTL_S
+    def _ledger(reply: str) -> None:
+        # What the brain path records for an action that ran: "do that
+        # again", "what did you just do" and pattern learning read these.
+        if reply.startswith("Alarm #"):
+            record_session_action("set_alarm", arg)
+            record_action_history("set_alarm", arg, reply)
+
+    return _run_action_shortcut(
+        text, "alarm-set", lambda _t: True, ("set_alarm",),
+        empty_reply="I could not set that alarm, sir. Nothing is set.",
+        arg=arg, after=_ledger)
+
+
+def _run_alarm_list_shortcut(text: str) -> bool:
+    """"what alarms do I have" / "is my alarm set" / "when is my alarm" ->
+    list_alarms' own line from the alarm store, with no LLM (2026-11-12):
+    the model must not state what is set from memory. Recognition is
+    core.fast_paths.is_alarm_list_request. No alarm skill loaded -> False.
+    Never raises."""
+    return _run_action_shortcut(
+        text, "alarms", _fast_paths.is_alarm_list_request, ("list_alarms",),
+        empty_reply="I could not read the alarm list just now, sir.")
 
 
 def _run_voice_shortcuts(text: str) -> bool:
@@ -51283,6 +51445,10 @@ def _run_voice_shortcuts(text: str) -> bool:
     # (REPEAT_LAST_LINE); asking for the old one reads it first.
     _last_line_turn[0] += 1
     if _repeat_last_line_shortcut(text):
+        return True
+    # A plain "set an alarm for <time>" / "wake me up at <time>": the alarm
+    # skill itself, never the brain's reading of the time.
+    if _run_alarm_set_shortcut(text):
         return True
     # Replay-last-action voice trigger: 'do that again' / 'replay that'
     # / 'do it again' / 'do that on monitor right' — re-fires the most
@@ -51415,6 +51581,8 @@ def _run_voice_shortcuts(text: str) -> bool:
         return True
     if _run_timer_list_shortcut(text):
         return True
+    if _run_alarm_list_shortcut(text):
+        return True
     # "is it hours week" and the shopping list / untimed reminders
     # (2026-10-12): answered by the real action, never a timer or a guess.
     if _run_hours_shortcut(text):
@@ -51527,7 +51695,7 @@ def _run_pronoun_switch_shortcut(text: str) -> bool:
 
 def _run_action_shortcut(text: str, kind: str, recognise, action_names,
                          ack: str = "", empty_reply: str = "",
-                         arg: str = "") -> bool:
+                         arg: str = "", after=None) -> bool:
     """Answer ``text`` with a registered READ-OUT action and no LLM, when
     ``recognise(text)`` says it is that question (2026-10-01; the shared body
     of _run_self_check_shortcut and _run_timer_list_shortcut).
@@ -51539,7 +51707,9 @@ def _run_action_shortcut(text: str, kind: str, recognise, action_names,
     returns False, so the LLM answers rather than this inventing one. ``ack``
     (optional) is spoken first, for an action that takes seconds. A raising
     or empty action speaks ``empty_reply``. ``arg`` is the action's argument
-    ("" unless the action reads the owner's words). Never raises."""
+    ("" unless the action reads the owner's words). ``after(reply)`` runs
+    once the action has answered, for a shortcut that changes something and
+    must leave the trace a routed action leaves. Never raises."""
     if not globals().get("FAST_PATHS_ENABLED", True):
         return False
     try:
@@ -51566,6 +51736,11 @@ def _run_action_shortcut(text: str, kind: str, recognise, action_names,
     except Exception as _e:
         print(f"  [fast-path] {kind} raised: {_e}")
         reply = ""
+    if reply and after is not None:
+        try:
+            after(reply)
+        except Exception as _e:
+            print(f"  [fast-path] {kind} bookkeeping failed: {type(_e).__name__}")
     if not reply:
         reply = empty_reply
     print(f"  JARVIS: {reply}")
@@ -52707,7 +52882,13 @@ def _handle_sleep_standby(injected_text: str | None):
         #           trade of the neural fast-path. On ANY detector error it
         #           returns None and we fall back to Whisper for this + every
         #           later standby tick (the selector latched the failure).
-        _wake_hit = _standby_wake_detected(audio)
+        # While an alarm rings the words matter ("stop", "I'm up"), and the
+        # wake detector gives none: transcribe (2026-11-12 - asleep is when
+        # standby is on, and "stop" could not end the ring there).
+        if _alarm_is_ringing():
+            _wake_hit = None
+        else:
+            _wake_hit = _standby_wake_detected(audio)
         if _wake_hit is None:
             # Keep Whisper's conf: a command carried out of the wake below is
             # judged by the normal turn's speech filter on it.
@@ -52736,6 +52917,10 @@ def _handle_sleep_standby(injected_text: str | None):
     # Self-echo (core/self_echo.py): JARVIS's own voice can never wake him
     # and is never fed to the ambient learner. Mic captures only.
     if _self_echo_ignored(text, injected_text is not None):
+        return
+    # A ringing alarm is answered here too, with no wake word, and standby
+    # stays on: he is in bed, not at the desk.
+    if _alarm_ringing_shortcut(text, keep_state=True):
         return
     tl = text.strip().lower()
     # Word-boundary wake match (2026-07-14 bug-hunt). Was `any(wp in tl ...)` —
@@ -55161,6 +55346,10 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 valid, reason = is_valid_speech(text, conf,
                                                 peak_rms=_last_recording_peak,
                                                 reply=(_nv == "reply"))
+                if not valid and _alarm_when_answer(text):
+                    # A bare time answering JARVIS's own "what time should
+                    # it ring?": short by nature ("7 am", "422").
+                    valid = True
                 if not valid:
                     # The reason carries the numbers needed to tune the
                     # thresholds; the words stay out of the log (2026-10-01:

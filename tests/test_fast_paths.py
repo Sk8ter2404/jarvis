@@ -740,6 +740,34 @@ class TimerListRequestTests(unittest.TestCase):
                 self.assertFalse(fp.is_timer_list_request(q))
 
 
+class AlarmListRequestTests(unittest.TestCase):
+    """2026-11-12: the alarm twin of the timer list. A whole-utterance alarm
+    question is answered from the alarm store by the monolith's
+    _run_alarm_list_shortcut, never by the model from memory."""
+
+    def test_alarm_list_questions(self):
+        for q in ("what alarms do I have", "Jarvis, is my alarm set?",
+                  "when is my alarm", "do I have any alarms set",
+                  "list my alarms", "show me my alarms", "any alarms",
+                  "what time is my alarm set for", "is the alarm still on",
+                  "when does my alarm go off", "do I have an alarm set"):
+            with self.subTest(q=q):
+                self.assertTrue(fp.is_alarm_list_request(q))
+
+    def test_not_alarm_list_questions(self):
+        for q in ("set an alarm for 7", "cancel my alarm", "wake me at 7",
+                  "do I have any timers or alarms", "what is an alarm",
+                  "what alarms should I set", "is the fire alarm going off",
+                  "stop the alarm", "what timers do I have", "", None):
+            with self.subTest(q=q):
+                self.assertFalse(fp.is_alarm_list_request(q))
+
+    def test_neither_list_takes_the_other(self):
+        self.assertFalse(fp.is_timer_list_request("what alarms do I have"))
+        self.assertFalse(fp.is_alarm_list_request("what timers do I have"))
+        self.assertIsNone(fp.match("what alarms do I have"))
+
+
 class CapabilityQuestionTests(unittest.TestCase):
     """Live 2026-10-28 18:02 "What can you do for me?" got the model's own
     improvised list; it is now a fixed overview of the real skills."""

@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.20 (2026-11-12)
+
+Alarm made dependable after its first live try and two review passes. A plain "set an alarm for 4:22" or "wake me up at 6:30" is set straight away with no brain call (the brain had answered "422 what?"). Times in words work ("seven thirty", "half past six", "7 am tomorrow"), and the time confirmed is the time asked (7:00 was confirmed as 6:59). Ringing: the volume raise and speaker switch now work from the alarm's own thread, a second alarm due during a ring is no longer lost, an unanswered alarm rings again after 5 minutes instead of giving up, an alarm survives a restart mid-ring, and "stop" works in standby. Room talk such as "the TV is off" no longer ends a ring. "Cancel the 7 am alarm" works. Not yet rung live.
+
 ## v3.0.19 (2026-11-12)
 
 Alarm fix from the first live try. "Set an alarm for 4:22" was heard as "422" and set 422 minutes ahead (11:23 PM). A spoken clock time ("422", "4 22", "1030") is now read as a time, and one with no AM or PM means the next time the clock reads it. A number with a unit ("100 seconds") or after "in" is still a length of time.

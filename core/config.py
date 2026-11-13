@@ -1336,6 +1336,12 @@ STT_ENGINE                 = "whisper"   # 'whisper' | 'parakeet'
 #            name ("Jervis", "Travis", "Jerry", "Gary", "Jersey")
 #   'always' the old behaviour      'off' never
 STT_RESCUE_NO_WAKE         = "hint"
+# ALARM_SET_FAST_PATH (2026-11-12): a plain "set an alarm for <time>" / "wake
+# me up at <time>" is set by the alarm skill with no brain call
+# (core/alarm_intent.py). The same line was passed through by the brain once
+# and answered with "422 what?" the next time. False = every alarm ask goes
+# through the brain again. FAST_PATHS_ENABLED off turns this off too.
+ALARM_SET_FAST_PATH        = True
 STT_SHADOW                 = ""          # '' | 'parakeet'
 PARAKEET_MODEL_DIR         = r"C:\JARVIS-models\parakeet-tdt-0.6b-v2-onnx"
 PARAKEET_THREADS           = 8

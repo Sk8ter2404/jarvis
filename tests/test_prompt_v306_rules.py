@@ -56,6 +56,52 @@ class TimerExampleTests(unittest.TestCase):
                                  "oven]", pc)
 
 
+class AlarmWordingTests(unittest.TestCase):
+    """2026-11-12 17:03:22: "set an alarm for 422" was answered with a
+    question about the number. The skill reads the time; the model hands his
+    words over. Every example argument shown must be one the skill reads."""
+
+    ASKS = ("set an alarm for 422", "wake me up at 7", "get me up at 6:30",
+            "I need to be up by 7 tomorrow")
+    # The answer to "what time should it ring?" arrives alone.
+    BARE = ("4:22", "422", "7 am", "at 7", "noon", "5.30 in the morning",
+            "I mean 4:22 this afternoon")
+    NOT_TIMES = ("what's 4 plus 4", "turn the volume to 30", "play track 7",
+                 "at 7 we leave", "7 of 9", "what time is it")
+
+    def test_the_alarm_grammar_loads_on_asks_and_on_a_bare_time(self):
+        for name, pc in _PCS.items():
+            for q in self.ASKS + self.BARE:
+                with self.subTest(prompt=name, q=q):
+                    block = pr.turn_pc_block(q, pc)
+                    self.assertIn("[ACTION: set_alarm, 422]", block)
+                    self.assertIn("never ask what it means", block)
+
+    def test_a_number_in_other_talk_does_not_load_it(self):
+        _core, sections = pr.split_pc_control(prompts.PC_CONTROL_PROMPT)
+        for q in self.NOT_TIMES:
+            with self.subTest(q=q):
+                self.assertFalse(pr._bare_time_request(q))
+
+    def test_every_example_is_a_time_the_skill_reads(self):
+        import contextlib
+        import io
+        import re
+        import tempfile
+        from unittest import mock
+        from tests._skill_harness import load_skill_isolated
+        with mock.patch.dict(os.environ,
+                             {"JARVIS_DATA_DIR": tempfile.mkdtemp(prefix="jarvis_alarm_prompt_")}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                alarm, _ = load_skill_isolated("alarm", register=False)
+            args = re.findall(r"\[ACTION: set_alarm, ([^\]]+)\]",
+                              prompts.PC_CONTROL_PROMPT)
+            self.assertGreaterEqual(len(args), 4, args)
+            for arg in args:
+                with self.subTest(arg=arg):
+                    self.assertIsNotNone(alarm._split_args(arg)[0])
+
+
 class IdeasInWordsTests(unittest.TestCase):
     UTTERANCE = "what's a good quick dinner idea?"
 

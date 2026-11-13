@@ -626,6 +626,41 @@ def is_timer_list_request(text) -> bool:
         return False
 
 
+# ── "what alarms do I have" (2026-11-12) ───────────────────────────────────
+# The alarm twin of the timer list above: the answer is the alarm store's, so
+# a whole-utterance question never reaches the model, which could state what
+# is set from memory. Setting / cancelling an alarm never matches, and a
+# question that names timers too ("any timers or alarms") is left to the
+# model.
+_ALARM_N = r"alarms?"
+_ALARM_LIST_RES = tuple(re.compile(p) for p in (
+    rf"^(?:can you |could you |would you )?(?:list|show|read|tell me|give me|"
+    rf"check|read out|read me)(?: me)?(?: all)?(?: of)? (?:my |the |our |any )?"
+    rf"(?:active |current |pending )?{_ALARM_N}(?: {_TIMER_STATE_W})?$",
+    rf"^(?:what|which) {_ALARM_N} (?:do i have|have i got|are "
+    rf"{_TIMER_STATE_W}|is {_TIMER_STATE_W}|do i have {_TIMER_STATE_W})$",
+    rf"^(?:do i have|have i got|are there|is there|got) (?:any|an) "
+    rf"(?:active |pending )?{_ALARM_N}(?: {_TIMER_STATE_W})?$",
+    rf"^any (?:active |pending )?{_ALARM_N}(?: {_TIMER_STATE_W})?$",
+    rf"^(?:when|what time) (?:does|will|is) {_TIMER_THE} (?:next )?alarm"
+    r"(?: (?:go off|going off|set for|set|ring|due))?$",
+    rf"^what (?:time )?is {_TIMER_THE} (?:next )?alarm(?: set for| at)?$",
+    rf"^(?:is|are) {_TIMER_THE} {_ALARM_N} (?:still )?(?:set|on)$",
+))
+
+
+def is_alarm_list_request(text) -> bool:
+    """True for a whole-utterance "what alarms do I have" / "is my alarm
+    set" / "when is my alarm" question. Never raises."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    try:
+        t = re.sub(r"\s+", " ", normalize(text)).strip()
+        return any(rx.match(t) for rx in _ALARM_LIST_RES)
+    except Exception:
+        return False
+
+
 # ── "what time is it" (2026-10-02) ─────────────────────────────────────────
 # Live 10:27:33 "Jarvis, what time is it?" went through the LLM ("One moment,
 # sir. [ACTION: get_time]", a second round, ~4 s) while "what day is it" and
