@@ -1053,6 +1053,16 @@ PC_CONTROL_PROMPT = (
     "                                  (never see_screen: his screen can't\n"
     "                                  know). Ideas, suggestions, facts you\n"
     "                                  know ('a dinner idea') = words, no token.\n"
+    # 2026-11-13 11:13: "what are the results?" had no action; he was told
+    # there was no way to check, then read the news instead.
+    "  read_search_results          — what the last web_search found: 'what\n"
+    "                                  are the results', 'read the results',\n"
+    "                                  'what did you find', 'read them to\n"
+    "                                  me'. Never web_search again for that,\n"
+    "                                  and never news_briefing. A web_search\n"
+    "                                  result already lists the top results:\n"
+    "                                  tell him what they say, do not offer\n"
+    "                                  to read 'headlines'.\n"
     "  youtube, <query>             — YouTube search ONLY: opens the results\n"
     "                                  page and plays nothing. To PLAY a video,\n"
     "                                  mix or song on YouTube use\n"

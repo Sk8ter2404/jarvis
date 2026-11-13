@@ -9,6 +9,7 @@ stdlib unittest + mock; no window, browser or UI Automation is touched.
 """
 from __future__ import annotations
 
+import time
 import unittest
 from unittest import mock
 
@@ -106,6 +107,92 @@ class SearchResultsLineTests(unittest.TestCase):
                 mock.patch.object(_st, "snapshot") as snap:
             self.assertEqual(A._search_results_line(FOUND), "")
         snap.assert_not_called()
+
+
+    def test_google_puts_the_title_site_and_address_in_one_tall_link(self):
+        # Live 2026-11-13 11:12: a loaded results page read as nothing. Every
+        # real result was taller than the 60 px limit (71 to 270 px), and its
+        # name carries the site and the address after the title.
+        page = HEADER + [
+            _el("Search Results", 223, ctype="Text"),
+            _el("Outlook down? Current outages and problems | Downdetector US", 300, h=122),
+            _el("CNBC", 337, h=20),
+            _el("Microsoft hit by global outages: What happened and why? "
+                "8 hours ago Al Jazeera", 378, h=270),
+            _el("Microsoft outage live updates: Email service is back CNN "
+                "https://www.cnn.com › microsoft-outage", 851, h=71),
+            _el("Read more", 949, h=17),
+            # The same story again, further down the page.
+            _el("Outlook down? Current outages and problems | Downdetector US "
+                "https://downdetector.com › status", 993, h=71),
+            _el("A full-page promo block that is no result at all here", 1200, h=900),
+        ]
+        self.assertEqual(
+            self._line(page),
+            '"Outlook down? Current outages and problems | Downdetector US", '
+            '"Microsoft hit by global outages: What happened and why? '
+            '8 hours ago Al Jazeera", '
+            '"Microsoft outage live updates: Email service is back CNN"')
+
+    def test_a_very_long_title_is_cut_at_a_word(self):
+        long = "Microsoft Outlook outage updates and " + "more words " * 20
+        out = self._line(RESULTS[:1] + [_el(long, 300, h=100)])
+        self.assertTrue(out.endswith('..."'), out)
+        self.assertLess(len(out), A._RESULT_TITLE_MAX + 10)
+
+
+class ReadSearchResultsTests(unittest.TestCase):
+    """2026-11-13 11:13: "what are the results?" had no action behind it. He
+    was told there was no way to check, the search ran again, and the news
+    briefing was read instead."""
+
+    def setUp(self):
+        saved = dict(A._last_search)
+        self.addCleanup(A._last_search.update, saved)
+        p = mock.patch("core.screen_privacy.window_private", return_value=False)
+        p.start()
+        self.addCleanup(p.stop)
+        p = mock.patch.object(A, "_RESULTS_RETRY_GAP_S", 0.0)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_nothing_searched_says_so(self):
+        A._last_search.update(query="", found=None, at=0.0)
+        self.assertIn("no web search is open", A._act_read_search_results(""))
+        A._last_search.update(query="old", found=FOUND,
+                              at=time.monotonic() - A._LAST_SEARCH_MAX_AGE_S - 5)
+        self.assertIn("no web search is open", A._act_read_search_results(""))
+
+    def test_it_reads_the_page_the_search_opened(self):
+        A._last_search.update(query="aa to c", found=FOUND, at=time.monotonic())
+        with mock.patch.object(_st, "snapshot", return_value=_snap(HEADER + RESULTS)),                 mock.patch.object(A, "_search_window") as find:
+            out = A._act_read_search_results("")
+        find.assert_not_called()
+        self.assertTrue(out.startswith(
+            "top results for 'aa to c': \"Powerlion C Size Battery Adapters"), out)
+
+    def test_a_search_that_was_still_loading_is_found_by_its_title(self):
+        A._last_search.update(query="aa to c", found=None, at=time.monotonic())
+        with mock.patch.object(_st, "snapshot", return_value=_snap(HEADER + RESULTS)),                 mock.patch.object(A, "_search_window",
+                                  return_value=(0x9, "aa to c - Google Search - Google Chrome")):
+            out = A._act_read_search_results("")
+        self.assertIn("AA to C Size Battery Spacer Converter Case", out)
+
+    def test_a_page_that_cannot_be_read_says_so_and_opens_nothing(self):
+        A._last_search.update(query="aa to c", found=None, at=time.monotonic())
+        with mock.patch.object(A, "_search_window", return_value=None),                 mock.patch.object(A, "_webbrowser_open") as opened:
+            out = A._act_read_search_results("")
+        self.assertIn("could not read the results for 'aa to c'", out)
+        opened.assert_not_called()
+
+    def test_web_search_remembers_what_it_searched(self):
+        bc = mock.MagicMock()
+        bc._VIDEO_QUERY_HINTS = ()
+        with mock.patch.object(A, "_bc", return_value=bc),                 mock.patch.object(A, "_foreground_snapshot", return_value=(None, "", None)),                 mock.patch.object(A, "_webbrowser_open"),                 mock.patch.object(A, "_await_opened_page", return_value=FOUND),                 mock.patch.object(A, "_note_browser_tab_open"),                 mock.patch.object(_st, "snapshot", return_value=_snap(HEADER + RESULTS)):
+            out = A._act_web_search("aa to c")
+        self.assertIn("top results: \"Powerlion", out)
+        self.assertEqual(A._last_search["query"], "aa to c")
+        self.assertEqual(A._last_search["found"], FOUND)
 
 
 if __name__ == "__main__":

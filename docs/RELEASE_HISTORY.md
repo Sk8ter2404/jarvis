@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.21 (2026-11-13)
+
+Web search can read its results again. Asked about the Outlook outage (11-13 11:12), he opened the search, read nothing off the page, offered "headlines" and read the news briefing instead. Google's result links had grown taller than the size his page reader accepted, so every real result was thrown out. Results are read again, with the web address trimmed off each title, and "what are the results" / "read the results" now has a real action behind it instead of a second search.
+
 ## v3.0.20 (2026-11-12)
 
 Alarm made dependable after its first live try and two review passes. A plain "set an alarm for 4:22" or "wake me up at 6:30" is set straight away with no brain call (the brain had answered "422 what?"). Times in words work ("seven thirty", "half past six", "7 am tomorrow"), and the time confirmed is the time asked (7:00 was confirmed as 6:59). Ringing: the volume raise and speaker switch now work from the alarm's own thread, a second alarm due during a ring is no longer lost, an unanswered alarm rings again after 5 minutes instead of giving up, an alarm survives a restart mid-ring, and "stop" works in standby. Room talk such as "the TV is off" no longer ends a ring. "Cancel the 7 am alarm" works. Not yet rung live.

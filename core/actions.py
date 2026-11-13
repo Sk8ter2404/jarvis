@@ -346,6 +346,29 @@ _SEARCH_CHROME_RE = re.compile(
 _RESULTS_TRIES = 4
 _RESULTS_RETRY_GAP_S = 0.5
 _RESULTS_MIN_WITHOUT_HEADING = 3
+# A result link's box. Live 2026-11-13 11:12 the limit was 60 px and every
+# real result on the page was taller (71 to 270: Google now puts the title,
+# the site and the address in one link, and news cards in a tall one), so a
+# loaded page read as "no results", twice, and the owner was offered the
+# news briefing instead.
+_RESULT_MAX_H = 300
+_RESULT_TITLE_MAX = 140
+
+
+def _result_title(name: str) -> str:
+    """A result link's name as a title to read out: the web address the link
+    carries after it is dropped, spaces are single, and it is not endless."""
+    t = re.sub(r"\s+", " ", name or "").strip()
+    t = re.split(r"\s+https?://", t, maxsplit=1)[0].strip()
+    if len(t) > _RESULT_TITLE_MAX:
+        t = t[:_RESULT_TITLE_MAX].rsplit(" ", 1)[0].rstrip(" ,;:-") + "..."
+    return t
+
+
+def _result_key(title: str) -> str:
+    """Two links to the same story (a news card and the list entry) share
+    this."""
+    return re.sub(r"[^a-z0-9]", "", title.lower())[:40]
 
 
 def _search_results_line(found) -> str:
@@ -379,15 +402,17 @@ def _search_results_line(found) -> str:
                                  (e.name or "").strip())), None)
             if anchor_y is not None:
                 break
-        heads = []
+        heads, seen = [], set()
         for e in els:
-            name = (e.name or "").strip()
+            raw = (e.name or "").strip()
+            name = _result_title(raw)
             if (e.in_document and e.ctype == "Hyperlink"
-                    and 12 <= len(name) <= 160 and e.rect[3] <= 60
+                    and 12 <= len(name) and e.rect[3] <= _RESULT_MAX_H
                     and (anchor_y is None or e.rect[1] > anchor_y)
                     and not _SEARCH_CHROME_RE.search(name)
-                    and "@" not in name
-                    and name not in heads):
+                    and "@" not in raw
+                    and _result_key(name) not in seen):
+                seen.add(_result_key(name))
                 heads.append(name)
             if len(heads) >= 5:
                 break
@@ -538,12 +563,72 @@ def _act_web_search(query: str) -> str:
     _note_browser_tab_open("web_search", url, _before,
                            page=_found[:3] if _found else None)
     where = f" on the {_found[3]} monitor" if _found and _found[3] else ""
+    _last_search.update(query=query, found=_found, at=time.monotonic())
     results = _search_results_line(_found)
     if results:
         return (f"opened Google search for '{query}'{where} \u2014 top "
                 f"results: {results}")
     return (f"opened Google search for '{query}'{where}"
             + ("" if _found else " (still loading)"))
+
+
+# The last web_search: what was asked, the window it opened in (None when the
+# page could not be told apart in time), and when.
+_last_search: dict = {"query": "", "found": None, "at": 0.0}
+_LAST_SEARCH_MAX_AGE_S = 30 * 60.0
+
+
+def _search_window(query: str):
+    """(hwnd, title) of a visible window showing the Google results for
+    ``query``, or None. For a search whose page was "still loading" when
+    web_search returned, or was opened again in a tab that already existed.
+    Never raises."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        want = f"{query} - Google Search".lower()
+        hits = []
+
+        @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        def each(hwnd, _l):
+            if user32.IsWindowVisible(hwnd):
+                n = user32.GetWindowTextLengthW(hwnd)
+                if n:
+                    buf = ctypes.create_unicode_buffer(n + 1)
+                    user32.GetWindowTextW(hwnd, buf, n + 1)
+                    if buf.value.lower().startswith(want):
+                        hits.append((int(hwnd), buf.value))
+            return True
+
+        user32.EnumWindows(each, 0)
+        return hits[0] if hits else None
+    except Exception:
+        return None
+
+
+def _act_read_search_results(_: str = "") -> str:
+    """What the last web_search found, read off its results page again.
+
+    Live 2026-11-13 11:13 "what are the results?" and "read the search
+    results" had no action behind them: the brain said it had no way to
+    check, searched again, then read the news briefing. Reads the page;
+    opens nothing."""
+    query = str(_last_search.get("query") or "")
+    age = time.monotonic() - float(_last_search.get("at") or 0.0)
+    if not query or age > _LAST_SEARCH_MAX_AGE_S:
+        return ("no web search is open to read - nothing was searched in "
+                "the last half hour")
+    found = _last_search.get("found")
+    line = _search_results_line(found) if found else ""
+    if not line:
+        win = _search_window(query)
+        if win is not None:
+            line = _search_results_line((win[0], win[1], None, None, ""))
+    if not line:
+        return (f"could not read the results for '{query}': the results "
+                "page is not open, or has nothing on it yet")
+    return f"top results for '{query}': {line}"
 
 
 def _act_youtube(query: str) -> str:
@@ -8159,6 +8244,7 @@ __all__ = [
     # Phase 4A
     "_act_open_url",
     "_act_web_search",
+    "_act_read_search_results",
     "_act_youtube",
     "_act_get_time",
     "_act_screenshot",

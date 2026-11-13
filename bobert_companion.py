@@ -36601,6 +36601,7 @@ ACTIONS = {
     "launch_app":      _act_launch_app,
     "web_search":      _act_web_search,
     "search":          _act_web_search,
+    "read_search_results": _act_read_search_results,
     "youtube":         _act_youtube,
     "screenshot":      _act_screenshot,
     "get_time":        _act_get_time,
@@ -41453,6 +41454,8 @@ INFORMATIVE_ACTIONS = {
     # Web actions: opening a URL or searching is preparatory — JARVIS should
     # follow up with see_screen to read what actually loaded rather than stopping.
     "open_url", "web_search",
+    # What the last search found (2026-11-13): the model words the titles.
+    "read_search_results",
     # Network roll-call returns a long device LIST — let the follow-up LLM
     # summarise it ("35 devices, including your phone and ...") rather than the
     # verbatim path reading out 35 raw client names.
