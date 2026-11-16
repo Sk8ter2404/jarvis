@@ -14,7 +14,9 @@ volume, then silence. A timer tells; an alarm rings.
 When an alarm is due it:
   * moves the default output to the desk speakers when the audio autoswitch
     skill offers that (a headset on the desk wakes nobody),
-  * unmutes and raises the master volume to ALARM_VOLUME (full; never lowers it),
+  * unmutes the master volume and starts it at ALARM_VOLUME_START, then
+    raises it a step at a time to the ALARM_VOLUME cap over ALARM_RAMP_S
+    (never above the cap, even when his own level was higher),
   * loops a tone through Windows' own player (winsound), not PortAudio, so a
     device re-enumeration or a busy TTS stream cannot stop or crash it,
   * says a wake-up line over the tone every ALARM_SAY_EVERY_S ("Sir, you
@@ -56,7 +58,14 @@ SPEAK_VERBATIM_ACTIONS = (
     "set_alarm", "list_alarms", "cancel_alarm", "stop_alarm", "snooze_alarm",
 )
 
-ALARM_VOLUME = 1.0           # master volume while ringing: he is a heavy sleeper
+# Live 2026-11-16 09:20, the first real ring: straight from his 18 % to 100 %
+# clipped the speakers and played through the whole house. He asked for a
+# ring that starts low and rises, with a ceiling: "start at like 15 and work
+# your way up to maybe 50".
+ALARM_VOLUME_START = 0.15    # master volume when the ring starts
+ALARM_VOLUME = 0.50          # rises to this cap, never above it
+ALARM_RAMP_S = 45.0          # from the start level to the cap over this long
+ALARM_RAMP_STEP_S = 3.0      # one volume step this often
 ALARM_MAX_RING_S = 600.0     # give up after ten minutes with no answer
 ALARM_SNOOZE_MIN = 9         # default snooze
 ALARM_INPUT_GRACE_S = 3.0    # input in the first seconds does not dismiss
@@ -745,18 +754,33 @@ def _start_tone() -> bool:
     return False
 
 
+def _ramp_level(age: float) -> float:
+    """The ring's master volume `age` seconds in: ALARM_VOLUME_START rising
+    in a straight line to the ALARM_VOLUME cap over ALARM_RAMP_S, then held
+    there. Never above the cap."""
+    cap = max(0.0, min(1.0, float(ALARM_VOLUME)))
+    start = max(0.0, min(cap, float(ALARM_VOLUME_START)))
+    if ALARM_RAMP_S <= 0:
+        return cap
+    frac = max(0.0, min(1.0, float(age) / float(ALARM_RAMP_S)))
+    return round(start + (cap - start) * frac, 3)
+
+
 def _prepare(box: dict) -> None:
     """Speakers and volume for a ring, on a thread of its own (see ring)."""
     try:
         _com_enter()
         _to_speakers()
         box["before"] = _volume_read()
-        level = ALARM_VOLUME if box["before"] is None \
-            else max(box["before"][0], ALARM_VOLUME)
-        # Raised even when the level could not be read: a quiet or muted PC
-        # is the one thing an alarm cannot have.
+        level = _ramp_level(0.0)
+        # Unmuted even when the level could not be read: a muted PC is the
+        # one thing an alarm cannot have. The ring loop takes it up from here.
         box["raised"] = bool(_volume_write(level, False))
-        print(f"  [alarm] volume {box['before']} -> {level:.2f}, unmuted "
+        if box["raised"]:
+            box["level"] = level
+        print(f"  [alarm] volume {box['before']} -> {level:.2f}, unmuted, "
+              f"rising to {_ramp_level(ALARM_RAMP_S):.2f} over "
+              f"{ALARM_RAMP_S:.0f} s "
               f"({'done' if box['raised'] else 'COULD NOT be set'})")
     except Exception as e:
         print(f"  [alarm] speakers / volume step failed ({e})")
@@ -784,7 +808,7 @@ def ring(aid: int, label: str = "", at: float | None = None,
     if cur is not None:
         _ring_while_busy(aid, label, at, tries, cur)
         return
-    box = {"before": None, "raised": False, "done": False}
+    box = {"before": None, "raised": False, "done": False, "level": None}
     try:
         print(f"  [alarm] \u23f0 ringing #{aid} {label}".rstrip())
         _persist()
@@ -804,7 +828,7 @@ def ring(aid: int, label: str = "", at: float | None = None,
         tick0 = None
         said = 0
         say_at = ALARM_SAY_FIRST_S
-        vol_at = ALARM_VOLUME_RETRY_S
+        vol_at = min(ALARM_VOLUME_RETRY_S, ALARM_RAMP_STEP_S)
         tone_at = ALARM_TONE_AGAIN_S
         beeps = True
         while not stop.wait(0.25):
@@ -817,14 +841,19 @@ def ring(aid: int, label: str = "", at: float | None = None,
                 _say(wake_line(said, age, label), key=f"alarm-wake#{aid}.{said}")
                 said += 1
                 say_at = age + ALARM_SAY_EVERY_S
-            if box["done"] and not box["raised"] and age >= vol_at:
-                # One failed write must not mean ten silent minutes.
-                if box["before"] is None:
-                    box["before"] = _volume_read()
-                box["raised"] = bool(_volume_write(
-                    ALARM_VOLUME if box["before"] is None
-                    else max(box["before"][0], ALARM_VOLUME), False))
-                vol_at = age + ALARM_VOLUME_RETRY_S
+            if box["done"] and age >= vol_at:
+                # One step up the ramp; a write that failed is tried again
+                # (one failed write must not mean ten silent minutes).
+                want = _ramp_level(age)
+                if box["level"] is None or abs(want - box["level"]) >= 0.005:
+                    if not box["raised"] and box["before"] is None:
+                        box["before"] = _volume_read()
+                    if _volume_write(want, False):
+                        box["raised"] = True
+                        box["level"] = want
+                        print(f"  [alarm] volume -> {want:.2f}")
+                vol_at = age + (ALARM_RAMP_STEP_S if box["level"] is not None
+                                else ALARM_VOLUME_RETRY_S)
             tick = _input_tick()
             if age < ALARM_INPUT_GRACE_S or tick0 is None:
                 tick0 = tick

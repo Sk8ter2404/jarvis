@@ -484,12 +484,15 @@ class SetListCancelTests(_AlarmCase):
 
 
 class RingTests(_AlarmCase):
-    def test_it_rings_loud_on_the_speakers_until_stopped_then_restores(self):
+    def test_it_rings_on_the_speakers_starting_quiet_until_stopped_then_restores(self):
         t = self._ring_in_thread()
         # COM first (the volume and the speaker switch are COM calls and a
-        # timer thread has none), then the speakers, then the volume.
+        # timer thread has none), then the speakers, then the volume: the
+        # START level, unmuted - not the cap, never 100 % (live 2026-11-16).
         self.assertEqual(self.rig.events[:2], [("com",), ("speakers",)])
-        self.assertIn(("volume", self.mod.ALARM_VOLUME, False), self.rig.events)
+        self.assertIn(("volume", self.mod.ALARM_VOLUME_START, False), self.rig.events)
+        self.assertEqual(self.mod.ALARM_VOLUME_START, 0.15)
+        self.assertEqual(self.mod.ALARM_VOLUME, 0.50)
         self.assertIn(("start", "alarm_tone.wav"), self.rig.events)
         self.assertNotIn(("stop",), self.rig.events, "still ringing")
         self.assertEqual(self.actions["stop_alarm"](""), "Alarm off, sir.")
@@ -498,15 +501,52 @@ class RingTests(_AlarmCase):
         self.assertEqual(self.rig.events[-2:], [("stop",), ("volume", 0.3, True)],
                          "the tone stops and his own volume and mute come back")
 
-    def test_a_louder_volume_is_never_lowered(self):
-        self.rig.volume = (0.95, False)
-        p = mock.patch.object(self.mod, "ALARM_VOLUME", 0.5)
-        p.start()
-        self.addCleanup(p.stop)
+    def _ramp_fast(self):
+        for name, value in (("ALARM_RAMP_S", 0.6), ("ALARM_RAMP_STEP_S", 0.05)):
+            p = mock.patch.object(self.mod, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _wait_volume(self, want, secs=5.0):
+        deadline = time.monotonic() + secs
+        while time.monotonic() < deadline and self.rig.volume != want:
+            time.sleep(0.02)
+
+    def test_it_rises_step_by_step_to_the_cap_and_no_higher(self):
+        # Live 2026-11-16: "start at like 15 and work your way up to maybe 50".
+        self._ramp_fast()
         t = self._ring_in_thread()
-        self.assertIn(("volume", 0.95, False), self.rig.events)
+        self._wait_volume((self.mod.ALARM_VOLUME, False))
+        time.sleep(0.3)                     # held at the cap, not past it
+        self.assertEqual(self.rig.volume, (self.mod.ALARM_VOLUME, False))
         self.mod._stop_ringing("voice")
         t.join(5.0)
+        levels = [e[1] for e in self.rig.events if e[0] == "volume"][:-1]
+        self.assertEqual(levels[0], self.mod.ALARM_VOLUME_START)
+        self.assertEqual(levels, sorted(levels), "it only ever goes up")
+        self.assertLessEqual(max(levels), self.mod.ALARM_VOLUME)
+        self.assertGreaterEqual(len(set(levels)), 3, levels)
+        self.assertEqual(self.rig.events[-2:], [("stop",), ("volume", 0.3, True)])
+
+    def test_a_louder_volume_of_his_own_is_capped_then_given_back(self):
+        # The cap holds even over his own level: 100 % clipped the speakers.
+        self.rig.volume = (0.95, False)
+        self._ramp_fast()
+        t = self._ring_in_thread()
+        self._wait_volume((self.mod.ALARM_VOLUME, False))
+        self.mod._stop_ringing("voice")
+        t.join(5.0)
+        levels = [e[1] for e in self.rig.events if e[0] == "volume"][:-1]
+        self.assertLessEqual(max(levels), self.mod.ALARM_VOLUME)
+        self.assertEqual(self.rig.events[-1], ("volume", 0.95, False))
+
+    def test_the_ramp_levels(self):
+        r = self.mod._ramp_level
+        self.assertEqual(r(0.0), 0.15)
+        self.assertAlmostEqual(r(self.mod.ALARM_RAMP_S / 2), 0.325, places=3)
+        self.assertEqual(r(self.mod.ALARM_RAMP_S), 0.5)
+        self.assertEqual(r(10 * self.mod.ALARM_RAMP_S), 0.5)
+        self.assertEqual(r(-5.0), 0.15)
 
     def test_a_key_or_the_mouse_stops_it_after_the_grace(self):
         with mock.patch.object(self.mod, "ALARM_INPUT_GRACE_S", 0.0):
@@ -585,8 +625,8 @@ class RingTests(_AlarmCase):
                 time.sleep(0.02)
             self.assertTrue(self.mod.is_ringing())
             self.assertGreaterEqual(self.rig.events.count(("beep",)), 2)
-            self.assertEqual(self.rig.volume, (self.mod.ALARM_VOLUME, False),
-                             "still loud while it beeps")
+            self.assertFalse(self.rig.volume[1], "unmuted while it beeps")
+            self.assertGreaterEqual(self.rig.volume[0], self.mod.ALARM_VOLUME_START)
             self.mod._stop_ringing("voice")
             t.join(5.0)
         self.assertFalse(self.mod.is_ringing())
@@ -650,7 +690,9 @@ class RingTests(_AlarmCase):
                 return False
             return self.rig._write(level, muted)
         with mock.patch.object(self.mod, "_volume_write", write), \
-                mock.patch.object(self.mod, "ALARM_VOLUME_RETRY_S", 0.2):
+                mock.patch.object(self.mod, "ALARM_VOLUME_RETRY_S", 0.2), \
+                mock.patch.object(self.mod, "ALARM_RAMP_S", 0.4), \
+                mock.patch.object(self.mod, "ALARM_RAMP_STEP_S", 0.05):
             t = self._ring_in_thread()
             deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline and \
@@ -685,7 +727,7 @@ class RingTests(_AlarmCase):
     def test_the_volume_is_raised_even_when_it_cannot_be_read(self):
         with mock.patch.object(self.mod, "_volume_read", lambda: None):
             t = self._ring_in_thread()
-            self.assertIn(("volume", self.mod.ALARM_VOLUME, False), self.rig.events)
+            self.assertIn(("volume", self.mod.ALARM_VOLUME_START, False), self.rig.events)
             n = len(self.rig.events)
             self.mod._stop_ringing("voice")
             t.join(5.0)
