@@ -548,6 +548,38 @@ class RingTests(_AlarmCase):
         self.assertEqual(r(10 * self.mod.ALARM_RAMP_S), 0.5)
         self.assertEqual(r(-5.0), 0.15)
 
+    def test_a_hung_volume_step_never_keeps_it_from_stopping(self):
+        # Review of v3.0.23 (2026-11-16): each ramp step is an audio-service
+        # call with no time limit. One that hangs must not hold up "stop" (the
+        # ring loop is where "stop" is seen), and his level still comes back
+        # once it returns.
+        gate = threading.Event()
+        self.addCleanup(gate.set)
+        entered = threading.Event()
+
+        def write(level, muted):
+            if not muted and level > self.mod.ALARM_VOLUME_START and not gate.is_set():
+                entered.set()
+                gate.wait(10)
+            return self.rig._write(level, muted)
+        with mock.patch.object(self.mod, "_volume_write", write), \
+                mock.patch.object(self.mod, "ALARM_RAMP_S", 0.6), \
+                mock.patch.object(self.mod, "ALARM_RAMP_STEP_S", 0.05), \
+                mock.patch.object(self.mod, "ALARM_PREP_MAX_S", 0.2):
+            t = self._ring_in_thread()
+            self.assertTrue(entered.wait(5.0), "a ramp step is in flight")
+            self.assertEqual(self.actions["stop_alarm"](""), "Alarm off, sir.")
+            t.join(5.0)
+            self.assertFalse(t.is_alive(), "stop is not held up by the hung write")
+            self.assertFalse(self.mod.is_ringing())
+            self.assertIn(("stop",), self.rig.events)
+            gate.set()
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and self.rig.volume != (0.30, True):
+                time.sleep(0.02)
+        self.assertEqual(self.rig.volume, (0.30, True),
+                         "his level comes back when the hung write returns")
+
     def test_a_key_or_the_mouse_stops_it_after_the_grace(self):
         with mock.patch.object(self.mod, "ALARM_INPUT_GRACE_S", 0.0):
             t = self._ring_in_thread()

@@ -788,6 +788,34 @@ def _prepare(box: dict) -> None:
         box["done"] = True
 
 
+def _volume_step(box: dict, level: float) -> None:
+    """One step up the ramp, on a short thread of its own (see ring).
+
+    The volume is a call into the audio service with no time limit of its
+    own, and the ring loop is the one place "stop", snooze, a key and the
+    timeout are seen: it must never wait on one (review of v3.0.23,
+    2026-11-16). A step that comes back after the ring ended puts his own
+    level back itself."""
+    try:
+        with box["lock"]:
+            if box["closed"]:
+                return
+            _com_enter()
+            if not box["raised"] and box["before"] is None:
+                box["before"] = _volume_read()
+            if _volume_write(level, False):
+                box["raised"] = True
+                box["level"] = level
+                print(f"  [alarm] volume -> {level:.2f}")
+            if box["closed"] and box["before"] is not None:
+                _volume_write(box["before"][0], box["before"][1])
+                print("  [alarm] a late volume step returned; your level is back")
+    except Exception as e:
+        print(f"  [alarm] volume step failed ({e})")
+    finally:
+        box["stepping"] = False
+
+
 def ring(aid: int, label: str = "", at: float | None = None,
          tries: int = 0) -> None:
     """Ring until answered. Blocks its own thread; never raises."""
@@ -808,7 +836,8 @@ def ring(aid: int, label: str = "", at: float | None = None,
     if cur is not None:
         _ring_while_busy(aid, label, at, tries, cur)
         return
-    box = {"before": None, "raised": False, "done": False, "level": None}
+    box = {"before": None, "raised": False, "done": False, "level": None,
+           "stepping": False, "closed": False, "lock": threading.Lock()}
     try:
         print(f"  [alarm] \u23f0 ringing #{aid} {label}".rstrip())
         _persist()
@@ -841,17 +870,16 @@ def ring(aid: int, label: str = "", at: float | None = None,
                 _say(wake_line(said, age, label), key=f"alarm-wake#{aid}.{said}")
                 said += 1
                 say_at = age + ALARM_SAY_EVERY_S
-            if box["done"] and age >= vol_at:
-                # One step up the ramp; a write that failed is tried again
-                # (one failed write must not mean ten silent minutes).
+            if box["done"] and not box["stepping"] and age >= vol_at:
+                # One step up the ramp, off this thread (_volume_step); a
+                # write that failed is tried again (one failed write must
+                # not mean ten silent minutes), one still running is waited
+                # out, never joined.
                 want = _ramp_level(age)
                 if box["level"] is None or abs(want - box["level"]) >= 0.005:
-                    if not box["raised"] and box["before"] is None:
-                        box["before"] = _volume_read()
-                    if _volume_write(want, False):
-                        box["raised"] = True
-                        box["level"] = want
-                        print(f"  [alarm] volume -> {want:.2f}")
+                    box["stepping"] = True
+                    threading.Thread(target=_volume_step, args=(box, want),
+                                     daemon=True).start()
                 vol_at = age + (ALARM_RAMP_STEP_S if box["level"] is not None
                                 else ALARM_VOLUME_RETRY_S)
             tick = _input_tick()
@@ -887,8 +915,19 @@ def ring(aid: int, label: str = "", at: float | None = None,
             _sound_stop()
         except Exception as e:
             print(f"  [alarm] could not stop the tone ({e})")
-        if box["before"] is not None:
-            _volume_write(box["before"][0], box["before"][1])
+        # No ramp step may land after this; one still running gets a few
+        # seconds, and if it is hung it puts his level back when it returns
+        # (_volume_step) rather than this thread waiting on it.
+        box["closed"] = True
+        if box["lock"].acquire(timeout=ALARM_PREP_MAX_S):
+            try:
+                if box["before"] is not None:
+                    _volume_write(box["before"][0], box["before"][1])
+            finally:
+                box["lock"].release()
+        else:
+            print("  [alarm] a volume step is still hung; it restores your "
+                  "level when it returns")
         with _lock:
             if _ringing[0] is me:
                 _ringing[0] = None
