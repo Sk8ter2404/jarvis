@@ -295,6 +295,27 @@ class SelectorArmTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertIn("1 run", out)
 
+    def test_selector_into_a_subpackage(self):
+        # "skills.test_sh_hue" / "monolith.test_monolith_x" (CONTRIBUTING.md)
+        # used to become "tests.test_skills.test_sh_hue" and fail to import.
+        pkg = types.ModuleType("tests.fixturepkg")
+        pkg.__path__ = []
+        sys.modules["tests.fixturepkg"] = pkg
+        setattr(self._pkg, "fixturepkg", pkg)
+        self._installed.append(("tests.fixturepkg", "fixturepkg"))
+        sub = types.ModuleType("tests.fixturepkg.test_sub")
+        exec(compile(_PASS_SRC, "tests.fixturepkg.test_sub", "exec"),
+             sub.__dict__)
+        sys.modules["tests.fixturepkg.test_sub"] = sub
+        pkg.test_sub = sub
+        self.addCleanup(sys.modules.pop, "tests.fixturepkg.test_sub", None)
+        rc, out = self._run(["fixturepkg.test_sub"])
+        self.assertEqual(rc, 0)
+        self.assertIn("1 run", out)
+        rc, out = self._run(["fixturepkg.test_sub.py"])
+        self.assertEqual(rc, 0)
+        self.assertIn("1 run", out)
+
     def test_multiple_selectors_aggregate(self):
         self._install("test_one", _PASS_SRC)
         self._install("test_two", _PASS_SRC)

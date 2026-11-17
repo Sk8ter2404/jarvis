@@ -35,6 +35,7 @@ class _Disk:
 class WatchdogDiskTests(unittest.TestCase):
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("disk_budget_watchdog")
+        self.state = _isolate_state(self, self.mod)
 
     def test_disk_free_gb_reads_psutil(self):
         fake = mock.MagicMock()
@@ -102,9 +103,21 @@ class WatchdogCreditsSnapshotTests(unittest.TestCase):
         self.assertIsNotNone(age)
 
 
+def _isolate_state(test, mod):
+    """Point the watchdog's persisted alert state at a temp file."""
+    d = tempfile.TemporaryDirectory()
+    test.addCleanup(d.cleanup)
+    path = os.path.join(d.name, "budget_watchdog_state.json")
+    p = mock.patch.object(mod, "_state_path", return_value=path)
+    p.start()
+    test.addCleanup(p.stop)
+    return path
+
+
 class WatchdogCreditsCheckTests(unittest.TestCase):
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("disk_budget_watchdog")
+        self.state = _isolate_state(self, self.mod)
 
     def test_alerts_low_fresh_balance(self):
         with mock.patch.object(self.mod, "_read_credits_snapshot",
@@ -133,11 +146,113 @@ class WatchdogCreditsCheckTests(unittest.TestCase):
     def test_silent_within_cooldown(self):
         now = time.time()
         self.mod._last_credits_alert_at[0] = now - 60
+        self.mod._last_credits_alert_balance[0] = 1.0
         with mock.patch.object(self.mod, "_read_credits_snapshot",
                                return_value=(1.0, 100.0)), \
              mock.patch.object(self.mod, "_enqueue_speech") as enq:
             self.mod._check_credits(now)
         enq.assert_not_called()
+
+
+class WatchdogCreditsRepeatTests(unittest.TestCase):
+    """Live 11-16 02:01 -> 11-17 16:02: "credit balance is down to 7.10
+    dollars" 8 times in 38 h, the balance unchanged, 6 restarts. The 4 h
+    cooldown lived in memory and no announced balance was kept."""
+
+    BAL = 7.10
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("disk_budget_watchdog")
+        self.state = _isolate_state(self, self.mod)
+        self.t0 = time.time() - 30 * 3600
+
+    def _check(self, mod, balance, at):
+        with mock.patch.object(mod, "_read_credits_snapshot",
+                               return_value=(balance, 100.0)), \
+             mock.patch.object(mod, "_enqueue_speech") as enq:
+            mod._check_credits(at)
+        return enq
+
+    def _restart(self):
+        """A new process: a fresh module whose register() restores the
+        persisted state (the monitor thread is neutered by the harness)."""
+        mod, _ = load_skill_isolated("disk_budget_watchdog", register=False)
+        p = mock.patch.object(mod, "_state_path", return_value=self.state)
+        p.start()
+        self.addCleanup(p.stop)
+        mod.register({})
+        return mod
+
+    def test_a_restart_does_not_announce_the_same_balance_again(self):
+        self.assertEqual(self._check(self.mod, self.BAL, self.t0).call_count, 1)
+        second = self._restart()
+        # 3 minutes after the boot, as live.
+        self._check(second, self.BAL, self.t0 + 180).assert_not_called()
+        self.assertEqual(second._last_credits_alert_balance[0], self.BAL)
+
+    def test_the_old_four_hour_repeat_is_gone(self):
+        self._check(self.mod, self.BAL, self.t0)
+        for hours in (4.1, 8.2, 12.3, 20.0):
+            self._check(self.mod, self.BAL,
+                        self.t0 + hours * 3600).assert_not_called()
+
+    def test_an_unchanged_balance_is_reminded_once_a_day(self):
+        self._check(self.mod, self.BAL, self.t0)
+        enq = self._check(self.mod, self.BAL, self.t0 + 24 * 3600 + 60)
+        self.assertEqual(enq.call_count, 1)
+
+    def test_a_lower_step_is_news_at_once(self):
+        self._check(self.mod, self.BAL, self.t0)
+        enq = self._check(self.mod, 4.50, self.t0 + 600)
+        self.assertEqual(enq.call_count, 1)
+        self.assertIn("4.50 dollars", enq.call_args.args[0])
+        # ...and a reading that bobs back over the step is not news twice.
+        self._check(self.mod, 5.02, self.t0 + 900).assert_not_called()
+        self._check(self.mod, 4.98, self.t0 + 1200).assert_not_called()
+
+    def test_a_top_up_rearms_it(self):
+        self._check(self.mod, self.BAL, self.t0)
+        self._check(self.mod, 25.0, self.t0 + 600).assert_not_called()
+        self.assertIsNone(self.mod._last_credits_alert_balance[0])
+        enq = self._check(self.mod, 8.0, self.t0 + 1200)
+        self.assertEqual(enq.call_count, 1)
+
+    def test_a_corrupt_or_future_state_is_ignored(self):
+        with open(self.state, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        mod = self._restart()
+        self.assertEqual(mod._last_credits_alert_at[0], 0.0)
+        with open(self.state, "w", encoding="utf-8") as f:
+            json.dump({"last_credits_alert_at": time.time() + 10 * 86400,
+                       "last_credits_alert_balance": "x"}, f)
+        mod = self._restart()
+        self.assertEqual(mod._last_credits_alert_at[0], 0.0)
+        self.assertIsNone(mod._last_credits_alert_balance[0])
+
+    def test_the_disk_cooldown_survives_a_restart_too(self):
+        with mock.patch.object(self.mod, "_disk_free_gb", return_value=3.0), \
+             mock.patch.object(self.mod, "_enqueue_speech") as enq:
+            self.mod._check_disk(self.t0)
+        self.assertEqual(enq.call_count, 1)
+        second = self._restart()
+        with mock.patch.object(second, "_disk_free_gb", return_value=3.0), \
+             mock.patch.object(second, "_enqueue_speech") as enq:
+            second._check_disk(self.t0 + 180)
+        enq.assert_not_called()
+
+    def test_queued_copies_share_one_family(self):
+        import sys
+        import types
+        bc = types.ModuleType("bobert_companion")
+        bc.proactive_announce = mock.MagicMock(return_value=True)
+        with mock.patch.dict(sys.modules, {"bobert_companion": bc}), \
+             mock.patch.object(self.mod, "_read_credits_snapshot",
+                               return_value=(self.BAL, 100.0)):
+            self.mod._check_credits(self.t0)
+        kw = bc.proactive_announce.call_args.kwargs
+        self.assertEqual(kw.get("supersede"), "credits_low")
+        self.assertEqual(kw.get("dedupe_key"), "credits_low")
+        self.assertEqual(kw.get("source"), "disk_budget_watchdog")
 
 
 class WatchdogActionTests(unittest.TestCase):

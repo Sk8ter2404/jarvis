@@ -58,7 +58,7 @@ _check_lock = threading.Lock()   # serialize: only one check at a time
 _speech_lock = threading.Lock()  # guard pending_speech.json read-modify-write
 
 
-def _enqueue_speech(message: str):
+def _enqueue_speech(message: str, family: "str | None" = None):
     """Route a proactive announcement through bobert_companion's public
     proactive_announce() API when available, falling back to a direct atomic
     write against pending_speech.json if the parent module hasn't loaded yet
@@ -66,12 +66,20 @@ def _enqueue_speech(message: str):
     finishes initialising). Matches the canonical pattern used by
     skills/bambu_monitor.py, skills/weather_briefing.py, skills/wellness.py,
     etc., so every co-writer of pending_speech.json funnels through the same
-    atomic helper and there's no per-skill race drift."""
+    atomic helper and there's no per-skill race drift.
+
+    ``family`` (2026-11-17): the supersede / dedupe tag of the line; the
+    low-balance alert shares skills/disk_budget_watchdog's "credits_low", so
+    the two skills' copies of one fact never queue behind each other."""
     try:
         bc = _import_companion()
         announcer = getattr(bc, "proactive_announce", None)
         if callable(announcer):
-            announcer(message, source="credits")
+            if family:
+                announcer(message, source="credits", supersede=family,
+                          dedupe_key=family)
+            else:
+                announcer(message, source="credits")
             return
     except Exception:
         pass
@@ -305,7 +313,8 @@ def _check_and_maybe_alert_now():
             if (now - _last_alert_at[0]) > ALERT_COOLDOWN_SECONDS:
                 _enqueue_speech(
                     f"Heads up, sir — your Claude credits are getting low. "
-                    f"Only ${dollars:.2f} remaining."
+                    f"Only ${dollars:.2f} remaining.",
+                    family="credits_low",
                 )
                 _last_alert_at[0] = now
         _save_state(dollars, raw)

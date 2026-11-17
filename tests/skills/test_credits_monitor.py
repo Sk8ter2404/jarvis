@@ -110,6 +110,16 @@ class CreditsAlertTests(unittest.TestCase):
         # (_currency_to_words) speaks it as money ("2 dollars"), not as a bare
         # decimal the TTS reads like a clock time. The raw queued string keeps $.
         self.assertIn("$2.00", enq.call_args.args[0])
+        # 2026-11-17: one family with skills/disk_budget_watchdog's alert.
+        self.assertEqual(enq.call_args.kwargs.get("family"), "credits_low")
+
+    def test_low_balance_family_reaches_proactive_announce(self):
+        bc = _fake_companion()
+        with mock.patch.object(self.mod, "_import_companion", return_value=bc):
+            self.mod._enqueue_speech("low credits sir", family="credits_low")
+        kw = bc.proactive_announce.call_args.kwargs
+        self.assertEqual((kw.get("supersede"), kw.get("dedupe_key")),
+                         ("credits_low", "credits_low"))
 
     def test_background_cycle_is_opt_in_work_and_waits_before_the_lock(self):
         # Speed plan R5 (2026-10-02): the hourly cycle is background work,
