@@ -52445,8 +52445,8 @@ def _capture_utterance(injected_text, memory):
     if _rt_sess is not None:
         _heartbeat()
         print("Listening… (realtime)")
-        resume_face_tracking()
         _boot_listening.set()   # BOOT ORDER: the first camera open may start
+        resume_face_tracking()
         try:
             _rt_cap = _realtime_capture(timeout=20.0)
         except Exception as _e:
@@ -52479,8 +52479,8 @@ def _capture_utterance(injected_text, memory):
     # episode has its own line and summary.
     if not _input_backoff_quiet():
         print("Listening…")
-    resume_face_tracking()
     _boot_listening.set()       # BOOT ORDER: the first camera open may start
+    resume_face_tracking()
 
     # Wait for speech, but only briefly — so we can check proactive
     _tt_rec_since = _tt("now")
