@@ -76,6 +76,9 @@ NOT_PROACTIVE = {
                                     "nothing",
     "PENDING_GREETING_FIRST": "the order of lines already queued; starts "
                               "nothing",
+    "AWAY_RECAP_ROUTE": "routes sir's own 'did anything happen while I was "
+                        "away' ask to the away recap; answers a question, "
+                        "starts nothing and never speaks unasked",
     "PROACTIVE_GROUNDED_ONLY": "narrows and filters the idle remark (its own "
                                "switches stay on the page); starts nothing",
     "BRIEFING_SIR_ONCE": "wording inside the morning briefing (one 'sir'); "
