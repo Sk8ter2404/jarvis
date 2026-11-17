@@ -6832,37 +6832,66 @@ _face_detect_shadow = _face_fast.ShadowStats()
 def _face_detect_due(now: float, state: "dict | None" = None,
                      idle_after: "float | None" = None,
                      idle_hz: "float | None" = None, *,
-                     key=None) -> bool:
+                     key=None, busy_hz: "float | None" = None) -> bool:
     """True when _detect_face should run on this frame. Every frame while a
     face was seen within `idle_after` s (or never backed off: either value
     <= 0); once idle, only when `1/idle_hz` s have passed since the last
     run. `state["seen"]` None = no hit since boot: the clock starts at the
     first call, so a camera that opens to an empty room still gets
     `idle_after` s of every-frame detection. `key` = the camera index: when
-    `state["ran"]` is a dict the idle interval is kept per camera. Pure (the
-    state dict is the only thing it touches); never raises."""
+    `state["ran"]` is a dict the idle interval is kept per camera.
+    `busy_hz` > 0 (the hand tracker sees a hand, see _hand_busy_face_hz)
+    caps the rate at that many runs a second even while a face is seen; the
+    slower of the two caps wins when both apply. Pure (the state dict is the
+    only thing it touches); never raises."""
     st = _face_detect_idle if state is None else state
     try:
         after = float(FACE_TRACK_IDLE_AFTER_S if idle_after is None
                       else idle_after)
         hz = float(FACE_TRACK_IDLE_HZ if idle_hz is None else idle_hz)
+        busy = float(busy_hz or 0.0)
     except Exception:
         return True
-    if after <= 0 or hz <= 0:
-        return True
-    seen = st.get("seen")
-    if seen is None:
-        st["seen"] = seen = float(now)
-    if now - seen < after:
+    rate = 0.0                      # 0 = every frame
+    if after > 0 and hz > 0:
+        seen = st.get("seen")
+        if seen is None:
+            st["seen"] = seen = float(now)
+        if now - seen >= after:
+            rate = hz
+    if busy > 0:
+        rate = busy if rate <= 0 else min(rate, busy)
+    if rate <= 0:
         return True
     ran = st.get("ran")
     try:
         last = float((ran.get(key) if isinstance(ran, dict) else ran) or 0.0)
     except Exception:
         return True
-    if now - last >= 1.0 / hz:
+    if now - last >= 1.0 / rate:
         return True
     return False
+
+
+def _hand_busy_face_hz() -> float:
+    """HAND_TRACK_FACE_DETECT_HZ while the hand tracker saw a hand within
+    HAND_TRACK_FACE_BUSY_S seconds, else 0.0 (no cap). Reads the hand_tracking
+    skill's own timestamp; 0.0 when the skill is not loaded. Never raises."""
+    try:
+        hz = float(HAND_TRACK_FACE_DETECT_HZ)
+        window = float(HAND_TRACK_FACE_BUSY_S)
+    except Exception:
+        return 0.0
+    if hz <= 0 or window <= 0:
+        return 0.0
+    mod = sys.modules.get("skill_hand_tracking")
+    fn = getattr(mod, "hands_seen_within", None) if mod is not None else None
+    if not callable(fn):
+        return 0.0
+    try:
+        return hz if fn(window) else 0.0
+    except Exception:
+        return 0.0
 
 
 def _face_detect_mark(now: float, hit: bool,
@@ -12933,6 +12962,70 @@ _handtrack_frames.PUMP.accept = _ht_pump_frame_ok
 _handtrack_frames.PUMP.on_frame = _ht_pump_preview
 
 
+# ── BOOT ORDER (2026-11-16, see CAMERA_FIRST_OPEN_WAIT_S) ─────────────────
+# Set at the main loop's first "Listening…". The boot's face-tracker thread
+# (_face_tracking_thread_after_boot) waits for it, then for the mic stream,
+# before its first camera open, so a camera driver that sits minutes inside
+# its first open can no longer hold up the boot line, the mic or the voice.
+_boot_listening = threading.Event()
+_BOOT_MIC_GRACE_S = 5.0     # listening but no mic stream yet: open anyway after this
+
+
+def _face_track_boot_wait(cap_s: "float | None" = None, *, listening=None,
+                          mic_open=None, stop=None,
+                          clock=time.monotonic, poll_s: float = 0.2) -> str:
+    """Hold the first camera open until the boot has settled: the main loop is
+    listening (`listening` set) and the mic stream is open, or
+    _BOOT_MIC_GRACE_S after listening began; never longer than `cap_s`
+    (CAMERA_FIRST_OPEN_WAIT_S) in all. Returns why it stopped waiting:
+    'settled', 'mic grace', 'cap', 'stop' or 'off' (cap <= 0). Never raises."""
+    try:
+        cap = float(CAMERA_FIRST_OPEN_WAIT_S if cap_s is None else cap_s)
+    except Exception:
+        cap = 0.0
+    if cap <= 0:
+        return "off"
+    listening = _boot_listening if listening is None else listening
+    mic_open = _mic_bus_open if mic_open is None else mic_open
+    stop = _face_track_stop if stop is None else stop
+    try:
+        t0 = clock()
+        heard_at = None
+        while True:
+            if stop.is_set():
+                return "stop"
+            now = clock()
+            if listening.is_set():
+                if heard_at is None:
+                    heard_at = now
+                try:
+                    if mic_open():
+                        return "settled"
+                except Exception:
+                    pass
+                if now - heard_at >= _BOOT_MIC_GRACE_S:
+                    return "mic grace"
+            if now - t0 >= cap:
+                return "cap"
+            stop.wait(poll_s)
+    except Exception:
+        return "cap"
+
+
+def _face_tracking_thread_after_boot():
+    """The boot's face-tracker thread target: _face_track_boot_wait, then the
+    supervisor exactly as before. Only main() uses it; every other start of
+    _face_tracking_thread (and every test) opens at once."""
+    t0 = time.monotonic()
+    why = _face_track_boot_wait()
+    if why != "off":
+        print(f"  [camera] first open waited {time.monotonic() - t0:.1f} s "
+              f"for the boot to settle ({why})")
+    if why == "stop":
+        return
+    _face_tracking_thread()
+
+
 def _face_tracking_thread():
     """SUPERVISOR around the real producer loop (_face_tracking_thread_body).
 
@@ -13818,7 +13911,10 @@ def _face_tracking_thread_body():
                 # A skipped frame is "no face this frame" for the eyes and
                 # nothing for presence (which only counts frames the
                 # detector ran on).
-                if not _face_detect_due(now_loop, key=cam["index"]):
+                # HAND BUSY (2026-11-16, see HAND_TRACK_FACE_DETECT_HZ): a
+                # hand in view caps it too, so the hand tracker gets the CPU.
+                if not _face_detect_due(now_loop, key=cam["index"],
+                                        busy_hz=_hand_busy_face_hz()):
                     continue
                 try:
                     face = _detect_face(frame)
@@ -52350,6 +52446,7 @@ def _capture_utterance(injected_text, memory):
         _heartbeat()
         print("Listening… (realtime)")
         resume_face_tracking()
+        _boot_listening.set()   # BOOT ORDER: the first camera open may start
         try:
             _rt_cap = _realtime_capture(timeout=20.0)
         except Exception as _e:
@@ -52383,6 +52480,7 @@ def _capture_utterance(injected_text, memory):
     if not _input_backoff_quiet():
         print("Listening…")
     resume_face_tracking()
+    _boot_listening.set()       # BOOT ORDER: the first camera open may start
 
     # Wait for speech, but only briefly — so we can check proactive
     _tt_rec_since = _tt("now")
@@ -54843,7 +54941,21 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     # Start face tracking thread — skipped in staging since the camera
     # device is owned by prod for the duration of the smoke test.
     if not _is_staging():
-        ft = threading.Thread(target=_face_tracking_thread, daemon=True)
+        # BOOT ORDER (2026-11-16, see CAMERA_FIRST_OPEN_WAIT_S): load the
+        # audio DSP (noisereduce -> scipy, ~1-2 s of DLL loads) now, before
+        # any camera open is in flight. On the Dell the boot line's first TTS
+        # preset built it while the webcam sat in its first open, and the
+        # main thread waited ~3.5 min inside scipy's DLL load.
+        try:
+            _t_ap = time.monotonic()
+            from core import audio_processor as _ap_boot
+            _ap_boot.get_processor()
+            print(f"  [boot] audio processor ready before the camera opens "
+                  f"({(time.monotonic() - _t_ap) * 1000:.0f} ms)")
+        except Exception as _ape:
+            print(f"  [boot] audio processor warm-up failed: {_ape}")
+        ft = threading.Thread(target=_face_tracking_thread_after_boot,
+                              daemon=True)
         ft.start()
 
         # Start the focused-window tracker so maybe_glance_response can tell

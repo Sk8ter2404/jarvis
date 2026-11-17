@@ -2851,6 +2851,17 @@ CAMERA_DIES_ON_OPEN_RETRY_S = 1800.0
 #   probe, self-diagnostic, side tiles, Kinect bridge) never open the same
 #   device less than this far apart. 0 disables the gap.
 CAMERA_OPEN_MIN_GAP_S       = 10.0
+# CAMERA_FIRST_OPEN_WAIT_S — the face tracker's FIRST camera open waits until
+#   the boot has settled: the main loop is listening and the microphone stream
+#   is open (2026-11-16). Measured on the Dell, both first v3 boots (11-06 and
+#   11-16): the webcam's first open sat ~3.5 min inside the camera driver, and
+#   for exactly that long the main thread could not get through the boot line
+#   (11-16: stuck inside the DLL load of scipy, imported by noisereduce for the
+#   TTS preset; 11-06: inside the boot line's playback), so the voice, the mic
+#   and the hand tracking all waited. With the camera second he can talk at
+#   once and the camera joins when its driver is ready. Never waits longer than
+#   this many seconds in all; 0 = open at once (the old order).
+CAMERA_FIRST_OPEN_WAIT_S    = 45.0
 # FACE_TRACK_IDLE_AFTER_S / FACE_TRACK_IDLE_HZ — the face detector's idle
 #   cadence (2026-10-28). The Haar cascade passes cost ~1 CPU-second per
 #   1280x720 frame with nobody in it (measured: 3.5 of the process's 4.1
@@ -2874,6 +2885,18 @@ FACE_DETECT_FAST_WIDTH      = 640
 FACE_DETECT_FAST_MIN_FRAC   = 0.05
 FACE_DETECT_SHADOW_EVERY_N  = 20
 FACE_DETECT_SHADOW_REPORT_N = 30
+# HAND_TRACK_FACE_DETECT_HZ / HAND_TRACK_FACE_BUSY_S — face detection slows
+#   while the hand tracker sees a hand (2026-11-16, his "hand tracking's not
+#   working ... it's spotty" on the Dell). Measured live there: with his face in
+#   view the every-frame detector kept the JARVIS process at 6.2 of the Dell's
+#   12 threads (CPU 82 %), the hand tracker got 0.8, and the hand mouse kept
+#   letting go ("the hand left the view"). While a hand was seen within the last
+#   HAND_TRACK_FACE_BUSY_S seconds, the detector runs at most
+#   HAND_TRACK_FACE_DETECT_HZ times a second per camera (he is plainly there);
+#   the idle back-off above still applies when it is slower. 0 for either value
+#   = every frame (the old behaviour). Machine-local (HAND_ prefix).
+HAND_TRACK_FACE_DETECT_HZ   = 1.0
+HAND_TRACK_FACE_BUSY_S      = 3.0
 
 # Processes that commonly hold exclusive locks on webcams. If the probe
 # finds zero cameras, we scan for these and surface them so the user

@@ -78,6 +78,28 @@ _reticle_sink: list = [None]         # tests inject a fake; None = the real over
 _reticle_state = {"last": None, "at": 0.0}
 RETICLE_KEEPALIVE_S = 0.25           # rewrite this often while shown (the overlay hides
                                      # a state older than its STATE_STALE_HIDE_S, 0.6 s)
+# time.monotonic() of the last tracker message that carried a hand (a "hands"
+# message with one in it, or any gesture). The face tracker reads it through
+# hands_seen_within() to slow its detector while a hand is in use
+# (HAND_TRACK_FACE_DETECT_HZ, 2026-11-16).
+_hands_seen_at: list = [None]
+
+
+def _note_hand_seen(now: Optional[float] = None) -> None:
+    _hands_seen_at[0] = time.monotonic() if now is None else now
+
+
+def hands_seen_within(window_s: float, now: Optional[float] = None) -> bool:
+    """True when the tracker reported a hand within the last `window_s`
+    seconds. Never raises."""
+    try:
+        at = _hands_seen_at[0]
+        if at is None:
+            return False
+        now = time.monotonic() if now is None else now
+        return 0.0 <= now - at <= float(window_s)
+    except Exception:
+        return False
 
 
 # ── config ────────────────────────────────────────────────────────────────
@@ -208,6 +230,11 @@ def _wants_hands() -> bool:
 def _mouse_hands(msg: dict) -> None:
     """One "hands" message: the two-hand grab first (so the cursor knows to
     stand down on this very frame), then the hand mouse, then its reticle."""
+    try:
+        if msg.get("hands"):
+            _note_hand_seen()
+    except Exception:
+        pass
     if _two_hand_enabled():
         g = _get_two_hand()
         if g is not None:
@@ -518,6 +545,7 @@ def handle_gesture(ev: dict, now: Optional[float] = None) -> str:
     try:
         name = str(ev.get("name", ""))
         now = time.monotonic() if now is None else now
+        _note_hand_seen(now)
         _state["last_event"] = name
         _state["last_event_at"] = time.time()
         if name == "pinch_hold" and _mouse_enabled():

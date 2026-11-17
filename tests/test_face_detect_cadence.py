@@ -143,13 +143,98 @@ class DueTests(unittest.TestCase):
         self.assertIn("no idle back-off", off)
 
 
+class HandBusyTests(unittest.TestCase):
+    """2026-11-16 (the Dell, his "hand tracking ... it's spotty"): with his
+    face in view the every-frame detector held 6.2 of 12 threads and starved
+    the hand tracker. busy_hz caps the detector while a hand is in use."""
+
+    def setUp(self):
+        self.ns = _lift_helpers(15.0, 1.0)
+        self.due = self.ns["_face_detect_due"]
+        self.mark = self.ns["_face_detect_mark"]
+
+    def test_busy_caps_the_rate_while_a_face_is_seen(self):
+        st = {"seen": 100.0, "ran": {0: 100.0}}          # face just seen
+        self.assertTrue(self.due(100.05, st, key=0))     # no cap: every frame
+        self.assertFalse(self.due(100.05, st, key=0, busy_hz=2.0))
+        self.assertFalse(self.due(100.45, st, key=0, busy_hz=2.0))
+        self.assertTrue(self.due(100.5, st, key=0, busy_hz=2.0))
+
+    def test_the_slower_cap_wins_when_both_apply(self):
+        st = {"seen": 0.0, "ran": {0: 1000.0}}           # idle (1 Hz)
+        self.assertFalse(self.due(1000.6, st, key=0, busy_hz=2.0))
+        self.assertTrue(self.due(1001.0, st, key=0, busy_hz=2.0))
+        st = {"seen": 0.0, "ran": {0: 1000.0}}
+        self.assertFalse(self.due(1001.5, st, key=0, busy_hz=0.5))
+        self.assertTrue(self.due(1002.0, st, key=0, busy_hz=0.5))
+
+    def test_busy_still_caps_with_the_idle_backoff_off(self):
+        st = {"seen": 0.0, "ran": {0: 50.0}}
+        self.assertTrue(self.due(50.1, st, 0.0, 1.0, key=0))
+        self.assertFalse(self.due(50.1, st, 0.0, 1.0, key=0, busy_hz=1.0))
+        self.assertTrue(self.due(51.0, st, 0.0, 1.0, key=0, busy_hz=1.0))
+
+    def test_zero_or_bad_busy_means_no_cap(self):
+        st = {"seen": 100.0, "ran": {0: 100.0}}
+        for busy in (0.0, None, -3.0):
+            self.assertTrue(self.due(100.01, st, key=0, busy_hz=busy), busy)
+        self.assertTrue(self.due(100.01, st, key=0, busy_hz="x"))
+
+    def _busy_fn(self, hz, window, module):
+        tree = _tree()
+        fn = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+              and n.name == "_hand_busy_face_hz"]
+        self.assertEqual(len(fn), 1)
+        fake_sys = type("S", (), {"modules": {} if module is None
+                                  else {"skill_hand_tracking": module}})
+        ns = {"HAND_TRACK_FACE_DETECT_HZ": hz, "HAND_TRACK_FACE_BUSY_S": window,
+              "sys": fake_sys}
+        exec(compile(ast.Module(body=fn, type_ignores=[]), _MONOLITH, "exec"), ns)
+        return ns["_hand_busy_face_hz"]
+
+    def test_busy_hz_follows_the_skill(self):
+        seen = {"v": True, "window": None}
+
+        def hands_seen_within(window):
+            seen["window"] = window
+            return seen["v"]
+        mod = type("M", (), {"hands_seen_within": staticmethod(hands_seen_within)})
+        f = self._busy_fn(1.0, 3.0, mod)
+        self.assertEqual(f(), 1.0)
+        self.assertEqual(seen["window"], 3.0)
+        seen["v"] = False
+        self.assertEqual(f(), 0.0)
+
+    def test_busy_hz_is_zero_without_the_skill_or_when_off(self):
+        self.assertEqual(self._busy_fn(1.0, 3.0, None)(), 0.0)
+        mod = type("M", (), {"hands_seen_within": staticmethod(lambda w: True)})
+        self.assertEqual(self._busy_fn(0.0, 3.0, mod)(), 0.0)
+        self.assertEqual(self._busy_fn(1.0, 0.0, mod)(), 0.0)
+        self.assertEqual(self._busy_fn("x", 3.0, mod)(), 0.0)
+
+        def boom(w):
+            raise RuntimeError("no")
+        bad = type("M", (), {"hands_seen_within": staticmethod(boom)})
+        self.assertEqual(self._busy_fn(1.0, 3.0, bad)(), 0.0)
+
+    def test_config_defaults(self):
+        from core import config
+        self.assertGreater(config.HAND_TRACK_FACE_DETECT_HZ, 0)
+        self.assertLessEqual(config.HAND_TRACK_FACE_DETECT_HZ, 5.0)
+        self.assertGreater(config.HAND_TRACK_FACE_BUSY_S, 0)
+        from core import peer_settings
+        self.assertFalse(peer_settings.is_shared("HAND_TRACK_FACE_DETECT_HZ"))
+        self.assertFalse(peer_settings.is_shared("HAND_TRACK_FACE_BUSY_S"))
+
+
 class SourceOrderTests(unittest.TestCase):
     """The gate sits in the tracking loop right before the detector, the
     detector's run is marked, and the policy prints where the thread starts."""
 
     def test_gate_precedes_detect_in_the_loop(self):
         src = _source()
-        gate = src.index('if not _face_detect_due(now_loop, key=cam["index"]):')
+        gate = src.index('if not _face_detect_due(now_loop, key=cam["index"],\n'
+                         '                                        busy_hz=_hand_busy_face_hz()):')
         detect = src.index("face = _detect_face(frame)", gate)
         self.assertLess(gate, detect)
         self.assertLess(detect - gate, 1200, "gate and detect drifted apart")

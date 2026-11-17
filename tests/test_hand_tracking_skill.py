@@ -453,3 +453,38 @@ class OffStopsTheAirMouseTests(_ActionBase):
         self.assertIn("Kinect gestures and point control are still on.",
                       ht._hand_tracking_off())
 
+
+class HandsSeenTests(unittest.TestCase):
+    """hands_seen_within(): the face tracker slows its detector while a hand is
+    in use (HAND_TRACK_FACE_DETECT_HZ, 2026-11-16)."""
+
+    def setUp(self):
+        old = ht._hands_seen_at[0]
+        self.addCleanup(ht._hands_seen_at.__setitem__, 0, old)
+        ht._hands_seen_at[0] = None
+
+    def test_nothing_seen_yet(self):
+        self.assertFalse(ht.hands_seen_within(3.0, now=100.0))
+
+    def test_window(self):
+        ht._note_hand_seen(100.0)
+        self.assertTrue(ht.hands_seen_within(3.0, now=100.0))
+        self.assertTrue(ht.hands_seen_within(3.0, now=103.0))
+        self.assertFalse(ht.hands_seen_within(3.0, now=103.5))
+        self.assertFalse(ht.hands_seen_within("x", now=101.0))
+
+    def test_a_hands_message_with_a_hand_stamps_it(self):
+        with mock.patch.object(ht, "_two_hand_enabled", return_value=False), \
+                mock.patch.object(ht, "_publish_reticle"), \
+                mock.patch.object(ht, "_mouse", [None]):
+            ht._mouse_hands({"type": "hands", "hands": []})
+            self.assertIsNone(ht._hands_seen_at[0])
+            ht._mouse_hands({"type": "hands", "hands": [{"id": 0}]})
+        self.assertIsNotNone(ht._hands_seen_at[0])
+        self.assertTrue(ht.hands_seen_within(3.0))
+
+    def test_a_gesture_stamps_it(self):
+        with mock.patch.object(ht, "_mouse_enabled", return_value=False):
+            ht.handle_gesture({"type": "gesture", "name": "fist_grab"}, now=50.0)
+        self.assertEqual(ht._hands_seen_at[0], 50.0)
+

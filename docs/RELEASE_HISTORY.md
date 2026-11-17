@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.24 (2026-11-16)
+
+Two fixes from the Dell tonight. The boot no longer freezes behind the webcam: both first boots there sat about 3.5 minutes with no voice, no listening and no hand tracking, because the webcam's first open hung inside its driver and held up the boot line until it came back. The camera now opens once he is already listening (45 seconds at most), and the sound library it was stuck on loads before any camera opens. Hand tracking is steadier: with his face in view the face detector ran on every frame and took half the Dell's processor, so the hand tracker kept losing his hand. While a hand is in view, face detection now runs once a second.
+
 ## v3.0.23 (2026-11-16)
 
 The alarm starts quiet and gets louder, with a ceiling. The first real ring (11-16 09:20) jumped the PC from 18 % straight to 100 %, clipped the speakers and played through the whole house. Now it starts at 15 %, rises a step every 3 seconds, reaches 50 % after 45 seconds and never goes above it, even when the volume was higher before. His wake-up lines ride the same volume. Your own volume and mute come back when it stops.

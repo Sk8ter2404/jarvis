@@ -4,7 +4,7 @@ Generated from the maintainer's private master sheet. Do not edit by hand.
 
 ## Live now
 
-- Version: v3.0.22
+- Version: v3.0.23
 - Live since: 2026-11-16
 - Latest change: v3.0.11 (11-05, LIVE since 18:55): looks through the camera before answering, 'look again' really looks, no invented Teams counts, idle remarks stay grounded, stale queued lines stay quiet.
 
@@ -58,6 +58,7 @@ Open, planned and idea items. Wording is generic on purpose.
 
 ## Recent releases
 
+- v3.0.24 (2026-11-16): Two fixes from the Dell tonight. The boot no longer freezes behind the webcam: both first boots there sat about 3.5 minutes with no voice, no listening and no hand tracking, because the webcam's first open hung inside its driver and held up the boot line until it came back. The camera now opens once he is already listening (45 seconds at most), and the sound library it was stuck on loads before any camera opens. Hand tracking is steadier: with his face in view the face detector ran on every frame and took half the Dell's processor, so the hand tracker kept losing his hand. While a hand is in view, face detection now runs once a second.
 - v3.0.23 (2026-11-16): The alarm starts quiet and gets louder, with a ceiling. The first real ring (11-16 09:20) jumped the PC from 18 % straight to 100 %, clipped the speakers and played through the whole house. Now it starts at 15 %, rises a step every 3 seconds, reaches 50 % after 45 seconds and never goes above it, even when the volume was higher before. His wake-up lines ride the same volume. Your own volume and mute come back when it stops.
 - v3.0.22 (2026-11-13): "What are the results?" now gets a spoken answer. In the v3.0.21 live check he picked the right command and read the page, then said the results were "too long" because that path handed the brain an oversized prompt. The command now speaks its own finished answer: the top three results, numbered, straight from the page. The search also waits up to 4 seconds for results to appear instead of 2.
 - v3.0.21 (2026-11-13): Web search can read its results again. Asked about the Outlook outage (11-13 11:12), he opened the search, read nothing off the page, offered "headlines" and read the news briefing instead. Google's result links had grown taller than the size his page reader accepted, so every real result was thrown out. Results are read again, with the web address trimmed off each title, and "what are the results" / "read the results" now has a real action behind it instead of a second search.
@@ -67,6 +68,5 @@ Open, planned and idea items. Wording is generic on purpose.
 - v3.0.17 (2026-11-12): A real alarm. "Wake me up at 7" or "alarm in 20 minutes" now rings a loud tone on the desk speakers at full volume and he talks over it ("Sir, you need to wake up.") until you say stop, say snooze, or touch the keyboard or mouse. It gives up after 10 minutes, puts the volume back, and saved alarms survive a restart. Before this, asking for an alarm set a timer that spoke one quiet line.
 - v3.0.16 (2026-11-12): Finishes the v3.0.15 microphone-switch fix. Live at 11:10 he followed a switch but the device-list refresh it asked for kept being postponed, because his speaker-side checks ran first and used up the slot. His listening loop now makes room for an owed refresh before each listen.
 - v3.0.15 (2026-11-12): He went deaf after a microphone switch on 11-12: Windows moved the default mic, he announced the new one, and then heard nothing until a restart. A followed switch now also refreshes his device list, which is what the restart did. The dead-microphone warning also fires for a muted mic now; its threshold sat exactly on a muted mic's background level.
-- v3.0.14 (2026-11-10): From today's live log. A sworn "what did you just say?" now gets his last line back word for word (it started a robot banter action instead). "Shut up, stop listening to me" now puts him to sleep: insults and courtesy no longer count toward the six-word limit that keeps casual mentions from triggering it.
 
 Full history: [RELEASE_HISTORY.md](RELEASE_HISTORY.md).
