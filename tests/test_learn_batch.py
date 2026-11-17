@@ -333,12 +333,163 @@ class FailureTests(unittest.TestCase):
         self.assertEqual(got_ok, ["PERSON"])
         self.assertEqual(got_bad, [])
         self.assertEqual(b.pending(), 1)
-        for _ in range(2):                   # attempts 2 and 3
+        for _ in range(2):                   # attempts 2 and 3, BBB alone
             clock.t += 400.0
             b.flush_once()
         self.assertEqual(got_bad, [""], "answered empty after the retries")
         self.assertEqual(b.pending(), 0)
-        self.assertEqual(b.stats["solo"], 1)
+        # v3.0.26: attempts 2 and 3 already sent BBB alone; the last one
+        # failing answers "" at once instead of a fourth identical request.
+        self.assertEqual(len(llm.calls), 3)
+        self.assertEqual(b.stats["dropped"], 1)
+
+    def test_a_retry_waits_an_interval_never_the_same_pass(self):
+        b, clock, llm, _s, _logs = _make()
+        b.submit(_simple([], user="one AAA"))
+        b.submit(_simple([], user="two BBB"))
+        llm.reply = lambda *a: "not json at all"
+        clock.t += 400.0
+        b.flush_once()
+        self.assertEqual(len(llm.calls), 1)
+        clock.t += 10.0                      # well inside the interval
+        self.assertIsNone(b.flush_once())
+        self.assertEqual(len(llm.calls), 1)
+
+
+class FailedPackTests(unittest.TestCase):
+    """v3.0.26 (reliability-07): 14 packed batches in the 11-16/17 logs came
+    back with ok=0 although the model wrote a full-length reply, and the
+    retry re-sent the IDENTICAL request, which failed again. A failed packed
+    request is split, the format is restated at the end, and the reply's
+    shape (never its words) is logged once an hour."""
+
+    @staticmethod
+    def _batch(b, got, big=6000):
+        # One learn-sized job and three judge-sized jobs, as in the logs.
+        b.submit(lb.Job.simple("learn", "LEARN-SYS", "L" * big, 400,
+                               got.append))
+        for i in range(3):
+            b.submit(lb.Job.simple("judge", "JUDGE-SYS", f"line {i} JJJ", 4,
+                                   got.append))
+
+    def test_pack_restates_the_reply_format_last_with_the_ids(self):
+        _s, user, _mt = lb.pack([(7, "S1", "u one", 4), (9, "S2", "u two", 4)])
+        tail = user.rsplit("=== JOB 9", 1)[1]
+        self.assertIn("REPLY FORMAT", tail)
+        self.assertIn("ids 7, 9", tail)
+        self.assertIn('{"results": [...]}', tail)
+        self.assertTrue(user.rstrip().endswith("No other text before or "
+                                               "after it."))
+
+    def test_an_unreadable_packed_reply_is_split_not_resent(self):
+        b, clock, llm, _s, logs = _make()
+        got = []
+        self._batch(b, got)
+        # The model answers every job, in a shape the parser cannot read.
+        llm.reply = lambda s, u, m: ("=== JOB 1 ===\nREAL\n=== JOB 2 ===\n"
+                                     "MEDIA" if u.count("=== JOB ") > 1
+                                     else "PERSON")
+        clock.t += 400.0
+        first = b.flush_once()
+        self.assertEqual(first["ok"], 0)
+        self.assertTrue(first["packed"])
+        self.assertGreater(first["split_cap"], 0)
+        self.assertLessEqual(first["split_cap"], first["chars"] // 2)
+        self.assertEqual(b.pending(), 4)
+        clock.t += 400.0
+        b.flush_once()
+        self.assertEqual(len(llm.calls), 2)
+        sent_1 = len(llm.calls[0][0]) + len(llm.calls[0][1])
+        sent_2 = len(llm.calls[1][0]) + len(llm.calls[1][1])
+        self.assertNotEqual(llm.calls[0], llm.calls[1],
+                            "the identical request was sent again")
+        self.assertLess(sent_2, sent_1)
+        # the retry holds fewer jobs (here: the learn-sized one, alone)
+        self.assertLess(llm.calls[1][1].count("=== JOB "),
+                        llm.calls[0][1].count("=== JOB "))
+        line = [l for l in logs if "split<=" in l][0]
+        self.assertIn("ok=0", line)
+
+    def test_the_split_jobs_all_get_answered(self):
+        """Learn-sized job alone, the judges together: every job answered
+        and no job asked more than MAX_ATTEMPTS + 1 times."""
+        b, clock, llm, _s, _logs = _make()
+        got = []
+        self._batch(b, got)
+
+        def reply(s, u, m):
+            if "LLLL" in u and "JJJ" in u:
+                return "garbled reply with no rows"
+            if u.count("=== JOB ") > 1:
+                return _echo_packed({"JJJ": "PERSON"})(s, u, m)
+            return '{"new_facts": []}'
+        llm.reply = reply
+        for _ in range(4):
+            clock.t += 400.0
+            b.flush_once()
+        self.assertEqual(sorted(got), sorted(['{"new_facts": []}', "PERSON",
+                                              "PERSON", "PERSON"]))
+        self.assertEqual(b.pending(), 0)
+        self.assertLessEqual(len(llm.calls), 3)
+
+    def test_the_shape_line_masks_every_word_and_runs_once_an_hour(self):
+        b, clock, llm, _s, logs = _make()
+        secret = "my sister Kayla called 5551234567 about Denver"
+        for round_ in range(2):
+            got = []
+            self._batch(b, got, big=3000)
+            llm.reply = lambda *a: f'{{"answers": ["{secret}"]}}'
+            clock.t += 400.0
+            b.flush_once()
+            # drain what is left without logging (answers readable now)
+            llm.reply = lambda s, u, m: (
+                _echo_packed({"JJJ": "PERSON", "LLL": "{}"})(s, u, m)
+                if u.count("=== JOB ") > 1 else "PERSON")
+            for _ in range(3):
+                clock.t += 400.0
+                b.flush_once()
+        shapes = [l for l in logs if "unreadable packed reply" in l]
+        self.assertEqual(len(shapes), 1, "once an hour, not per batch")
+        for word in ("sister", "Kayla", "Denver", "5551234567", "answers"):
+            self.assertNotIn(word, shapes[0])
+        self.assertIn("shape: {", shapes[0])
+        clock.t += lb.SHAPE_LOG_EVERY_S
+        self._batch(b, [], big=3000)
+        llm.reply = lambda *a: f'{{"answers": ["{secret}"]}}'
+        clock.t += 400.0
+        b.flush_once()
+        self.assertEqual(len([l for l in logs
+                              if "unreadable packed reply" in l]), 2)
+
+    def test_reply_shape(self):
+        self.assertEqual(
+            lb._reply_shape('{"results": [{"id": 12, "output": "MEDIA"}]}'),
+            '{"results": [{"id": 12, "output": "w"}]}')
+        self.assertEqual(lb._reply_shape("=== JOB 3 ===\nThe café, 2024!"),
+                         "=== JOB 3 === w w, 9!")
+        self.assertEqual(lb._reply_shape(None), "")
+        self.assertLessEqual(len(lb._reply_shape("x " * 500)), 160)
+
+    def test_a_partly_readable_reply_is_not_split(self):
+        b, clock, llm, _s, _logs = _make()
+        got = []
+        self._batch(b, got)
+        llm.reply = _echo_packed({"line 0": "PERSON"})
+        clock.t += 400.0
+        res = b.flush_once()
+        self.assertEqual(res["ok"], 1)
+        self.assertEqual(res["split_cap"], 0)
+
+    def test_a_dead_model_is_not_split(self):
+        """An empty reply (model down / wedged) says nothing about the
+        request's size: back off, do not shrink."""
+        b, clock, llm, _s, _logs = _make()
+        self._batch(b, [])
+        llm.reply = lambda *a: ""
+        clock.t += 400.0
+        res = b.flush_once()
+        self.assertEqual(res["split_cap"], 0)
+        self.assertEqual(b.pending(), 4)
 
     def test_a_dead_model_gives_every_job_back_for_a_later_flush(self):
         b, clock, llm, _s, logs = _make()

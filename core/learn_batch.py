@@ -31,9 +31,34 @@ A ``LearnBatcher`` collects those small jobs and sends them as ONE call.
   one job is due, byte-identical to the old per-job prompt). The reply is a
   JSON object ``{"results": [{"id": n, "output": ...}]}``; each job's
   ``apply`` gets its own output as text. A job with no usable output is
-  retried on a later flush; after ``MAX_ATTEMPTS`` it is sent alone, once, as
-  it always was, and if that also fails ``apply("")`` runs (the same empty
-  answer the per-job path produced on a failure).
+  retried on a later flush (one interval later, never in the same pass);
+  after ``MAX_ATTEMPTS`` it is sent alone, once, as it always was, and if
+  that also fails ``apply("")`` runs (the same empty answer the per-job path
+  produced on a failure).
+
+FAILED PACKED BATCHES (v3.0.26, overhaul finding reliability-07)
+================================================================
+The 11-16/17 logs had 14 packed batches with ok=0 - every job of the reply
+unreadable - and the retry re-packed the IDENTICAL batch, which failed the
+same way (16:15:44 and 16:20:54: the same 10 jobs, ok=0 both times). The
+replies were not short: each failed call generated 14-20 tokens per job,
+the same as a call that worked, so the model answered every job but in a
+shape the parser could not read. What the failures had in common was size:
+packed prompts with a learn job failed 1 time in 58 under 9,500 characters,
+8 in 43 from 9,500 to 10,500 and 5 in 5 above. The format instruction sits
+at the very top of the system prompt, ~10,000 characters before the point
+where the model starts writing. So:
+
+* ``pack()`` restates the reply format, with the exact job ids, at the END
+  of the request, next to where the answer starts;
+* a packed batch whose non-empty reply yields NO job is split: each of its
+  jobs carries a character cap of half that request (``Job.cap``) into the
+  next pass, so the retry is a smaller request, never the same one; the job
+  that keeps failing ends up alone, and alone it is dropped (``apply("")``)
+  after ``MAX_ATTEMPTS`` instead of being sent a fourth time;
+* the first such reply in an hour is logged by its SHAPE only (words masked,
+  ``_reply_shape``) so the next session shows what the model wrote without a
+  word of the owner's speech in the log.
 
 An in-flight HTTP request cannot be cancelled, so "abort when the owner
 starts talking" means: never START one then, keep a batch small
@@ -42,8 +67,12 @@ call. ``enabled()`` False restores the old behaviour: ``submit`` returns
 False and the caller runs its job the way it used to.
 
 Log lines (numbers and tags only, never prompt or speech text):
-``[learn-batch] sent N job(s) (a=x b=y) chars=C in T.Ts`` and
-``[learn-batch] deferred N job(s): <reason>``.
+``[learn-batch] sent N job(s) (a=x b=y) chars=C in T.Ts`` (with
+``split<=N`` when a failed packed request is split, ``dropped=N`` when a
+job is answered "" after its last attempt),
+``[learn-batch] deferred N job(s): <reason>`` and, at most hourly,
+``[learn-batch] unreadable packed reply (N job(s), C chars) shape: ...``
+(words masked by _reply_shape).
 """
 from __future__ import annotations
 
@@ -57,6 +86,13 @@ DEFAULT_INTERVAL_S = 300.0
 DEFAULT_MAX_JOBS = 20
 DEFAULT_MAX_CHARS = 14000
 DEFAULT_POLL_S = 5.0
+# A split never asks for a request smaller than this (one learn job alone is
+# ~8,000 characters, and the greedy cap always keeps the first job anyway).
+SPLIT_MIN_CHARS = 1000
+# Job.cap of a job that must go out alone on its next pass.
+SOLO_CAP = 1
+# At most one "unreadable packed reply" shape line per this many seconds.
+SHAPE_LOG_EVERY_S = 3600.0
 # Hard ceiling on the queue: past it the OLDEST simple job is answered with ""
 # (fail-open) so a day of never-quiet cannot grow it without bound.
 QUEUE_HARD_CAP = 200
@@ -78,10 +114,13 @@ class Job:
     ``tag``: caller name for the log. ``build()``: returns
     ``(system, user, max_tokens, ctx)`` or None when there is nothing to send
     any more. ``apply(text, ctx)``: gets the answer ("" on failure).
-    ``unbuild(ctx)``: gives a lazily built input back (optional)."""
+    ``unbuild(ctx)``: gives a lazily built input back (optional).
+    ``cap``: 0, or the most characters the next request carrying this job
+    may hold (set when a packed request with it failed outright; SOLO_CAP =
+    it goes out alone)."""
 
     __slots__ = ("tag", "build", "apply", "unbuild", "queued_at", "attempts",
-                 "id")
+                 "id", "cap")
 
     def __init__(self, tag, build, apply, unbuild=None):
         self.tag = _clean_tag(tag)
@@ -91,6 +130,7 @@ class Job:
         self.queued_at = 0.0
         self.attempts = 0
         self.id = 0
+        self.cap = 0
 
     @classmethod
     def simple(cls, tag, system, user, max_tokens, apply):
@@ -212,10 +252,22 @@ def parse_results(text, ids) -> dict:
     return out
 
 
+def _format_reminder(ids) -> str:
+    """The reply format again, at the END of a packed request (see the
+    module docstring: on a ~10,000-character request the system prompt's
+    format line is too far from where the model starts writing)."""
+    listed = ", ".join(str(i) for i in ids)
+    return ("REPLY FORMAT (all jobs above)\n"
+            'Now reply with ONLY one JSON object, {"results": [...]}, holding '
+            f'exactly one {{"id": <job id>, "output": <answer>}} entry for each '
+            f"of the {len(ids)} jobs, in this order: ids {listed}. "
+            "No other text before or after it.")
+
+
 def pack(specs) -> "tuple[str, str, int]":
     """(system, user, max_tokens) of one packed request over
     [(job_id, system, user, max_tokens)]. Identical instruction sets are
-    written once."""
+    written once; the reply format is restated last (_format_reminder)."""
     sets: dict = {}
     order: list = []
     for _jid, system, _user, _mt in specs:
@@ -230,8 +282,36 @@ def pack(specs) -> "tuple[str, str, int]":
     for jid, system, user, _mt in specs:
         parts.append(f"=== JOB {jid} (instruction set {sets[system]}) ===\n"
                      f"{user}")
+    parts.append(_format_reminder([jid for jid, *_r in specs]))
     budget = sum(int(mt) for *_a, mt in specs) + 20 * len(specs) + 40
     return _WRAP_SYSTEM, "\n\n".join(parts), min(2000, budget)
+
+
+_SHAPE_KEEP = frozenset({"results", "id", "output", "job", "null", "true",
+                         "false"})
+_SHAPE_WORD_RE = re.compile(r"[^\W\d_]+")
+_SHAPE_DIGITS_RE = re.compile(r"\d+")
+
+
+def _reply_shape(text, limit: int = 160) -> str:
+    """A reply's SHAPE for the log: every word except the format's own
+    (results / id / output / job / null / true / false) becomes "w", every
+    run of more than three digits "9", whitespace collapses, at most
+    ``limit`` characters. Shows how the model laid the reply out without a
+    word of what it said (the outputs are extracted from the owner's
+    speech). Never raises."""
+    try:
+        s = " ".join(str(text or "").split())
+
+        def word(m):
+            return m.group(0) if m.group(0).lower() in _SHAPE_KEEP else "w"
+
+        def digits(m):
+            return m.group(0) if len(m.group(0)) <= 3 else "9"
+        s = _SHAPE_DIGITS_RE.sub(digits, _SHAPE_WORD_RE.sub(word, s))
+        return s[:max(0, int(limit))]
+    except Exception:
+        return ""
 
 
 class LearnBatcher:
@@ -259,7 +339,8 @@ class LearnBatcher:
         self._thread = None
         self._stop = threading.Event()
         self.stats = {"flushes": 0, "jobs": 0, "deferred": 0, "retried": 0,
-                      "solo": 0}
+                      "solo": 0, "split": 0, "dropped": 0}
+        self._shape_logged_at = None     # clock() of the last shape line
 
     # -- settings (read at call time, never raise) --------------------------
     @staticmethod
@@ -416,14 +497,20 @@ class LearnBatcher:
         if not built:
             return None
         # Greedy size cap: the rest goes back (lazy jobs hand their input
-        # back) and rides the next pass.
+        # back) and rides the next pass. A job split out of a failed packed
+        # request (Job.cap) lowers the cap of any request it is in, so the
+        # retry is smaller than the request that failed; SOLO_CAP = alone.
         kept, size = [], 0
+        limit = self.max_chars()
         for item in built:
             add = len(item[1]) + len(item[2])
-            if kept and size + add > self.max_chars():
+            cap = int(getattr(item[0], "cap", 0) or 0)
+            item_limit = min(limit, cap) if cap > 0 else limit
+            if kept and size + add > item_limit:
                 break
             kept.append(item)
             size += add
+            limit = item_limit
         spill = built[len(kept):]
         if spill:
             self._unbuild_all(spill)
@@ -458,7 +545,15 @@ class LearnBatcher:
         owner_during = not self._is_quiet()
         results = ({built[0][0].id: text} if (not packed and text.strip())
                    else parse_results(text, [it[0].id for it in built]))
-        ok = fail = 0
+        if packed and text.strip() and not any(
+                results.get(it[0].id, "").strip() for it in built):
+            # The model answered but not one job could be read: re-packing
+            # the same request fails the same way (reliability-07), so split.
+            split_cap = max(SPLIT_MIN_CHARS, chars // 2)
+            self._note_unreadable(text, len(built))
+        else:
+            split_cap = 0
+        ok = fail = dropped = 0
         retry: list = []
         for job, _s, _u, _mt, ctx in built:
             out = results.get(job.id)
@@ -468,26 +563,56 @@ class LearnBatcher:
                 continue
             fail += 1
             job.attempts += 1
+            if job.attempts >= MAX_ATTEMPTS and not packed:
+                # It already went out ALONE and failed at its last attempt:
+                # the old per-job failure answer, not a fourth identical call.
+                dropped += 1
+                self._give_up(job, ctx)
+                continue
+            self._unbuild_all([(job, _s, _u, _mt, ctx)])
+            job.queued_at = float(self._clock())    # back off one interval
             if job.attempts >= MAX_ATTEMPTS:
-                self._solo(job, _s, _u, _mt, ctx)
-            else:
-                self._unbuild_all([(job, _s, _u, _mt, ctx)])
-                job.queued_at = float(self._clock())    # back off one interval
-                retry.append(job)
+                job.cap = SOLO_CAP                  # alone, on the next pass
+            elif split_cap:
+                job.cap = min(job.cap, split_cap) if job.cap else split_cap
+            retry.append(job)
         if retry:
             self.stats["retried"] += len(retry)
             self._requeue(retry)
+        if split_cap:
+            self.stats["split"] += 1
+        self.stats["dropped"] += dropped
         elapsed = float(self._clock()) - float(started)
         self.stats["flushes"] += 1
         self.stats["jobs"] += ok
+        if not packed and getattr(built[0][0], "cap", 0) == SOLO_CAP:
+            self.stats["solo"] += 1
         extra = (f" retry={len(retry)}" if retry else "") \
+            + (f" split<={split_cap}" if split_cap else "") \
+            + (f" dropped={dropped}" if dropped else "") \
             + (" owner-spoke-during-call" if owner_during else "")
         self._say(f"  [learn-batch] sent {len(built)} job(s) ({mix}) "
                   f"packed={'yes' if packed else 'no'} ok={ok} fail={fail} "
                   f"chars={chars} in {elapsed:.1f}s{extra}")
         return {"jobs": len(built), "ok": ok, "failed": fail,
                 "retried": len(retry), "chars": chars, "elapsed_s": elapsed,
-                "packed": packed, "owner_during": owner_during}
+                "packed": packed, "owner_during": owner_during,
+                "split_cap": split_cap, "dropped": dropped}
+
+    def _note_unreadable(self, text, n_jobs: int) -> None:
+        """At most once per SHAPE_LOG_EVERY_S: the shape of a packed reply
+        none of whose jobs could be read (_reply_shape: words masked)."""
+        try:
+            now = float(self._clock())
+            last = self._shape_logged_at
+            if last is not None and (now - last) < SHAPE_LOG_EVERY_S:
+                return
+            self._shape_logged_at = now
+            self._say(f"  [learn-batch] unreadable packed reply ({n_jobs} "
+                      f"job(s), {len(text)} chars) shape: "
+                      f"{_reply_shape(text)}")
+        except Exception:
+            pass
 
     # -- helpers --------------------------------------------------------------
     def _unbuild_all(self, items) -> None:
@@ -505,19 +630,6 @@ class LearnBatcher:
         except Exception as e:
             self._say(f"  [learn-batch] {job.tag} apply failed: "
                       f"{type(e).__name__}")
-
-    def _solo(self, job, system, user, max_tokens, ctx) -> None:
-        """Last resort for a job the packed call keeps failing: the old
-        one-request-per-job path, once, only while the owner is quiet. An
-        empty answer is what a failed single call always returned."""
-        self.stats["solo"] += 1
-        text = ""
-        if self._is_quiet():
-            try:
-                text = self._llm(system, user, int(max_tokens)) or ""
-            except Exception:
-                text = ""
-        self._deliver(job, text, ctx)
 
     def _give_up(self, job, ctx) -> None:
         self._deliver(job, "", ctx)
