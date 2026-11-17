@@ -229,7 +229,13 @@ def main(argv: list[str]) -> int:
     if selectors:
         suite = unittest.TestSuite()
         for sel in selectors:
-            name = sel if sel.startswith("test_") else f"test_{sel}"
+            # A dotted selector naming a module in a subpackage of tests/
+            # ("skills.test_sh_hue", "monolith.test_monolith_x", as
+            # CONTRIBUTING.md documents) is taken as it is: prefixing it gave
+            # "tests.test_skills.test_sh_hue", which does not exist.
+            _sub = any(p.startswith("test_") for p in sel.split(".")[1:])
+            name = (sel if sel.startswith("test_") or _sub
+                    else f"test_{sel}")
             name = name[:-3] if name.endswith(".py") else name
             suite.addTests(loader.loadTestsFromName(f"tests.{name}"))
     else:

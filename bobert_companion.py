@@ -26602,6 +26602,9 @@ def _note_first_owner_turn_of_day(test_inject: bool = False) -> bool:
 def _note_turn_boundary() -> None:
     """Main loop, top of every iteration: the previous turn (if any) is over,
     and any capture that did not become a turn was dropped."""
+    # The follow-up window runs from the end of the reply (3.0.26): the
+    # previous pass's reply (and any encore) has been played by now.
+    _followup_turn_over(bool(_turn_in_progress[0]))
     # Listening over media (2026-10-05): the minute line, and the wake duck
     # (D3) of the capture whose turn just ended goes back up.
     _listen_tick()
@@ -39136,6 +39139,57 @@ def _followup_keep_for_reply(why: str = "") -> None:
             _followup_window.forget_admit()
     except Exception:
         pass
+    _followup_note_cue()
+
+
+# ── the follow-up window runs from the END of the reply (3.0.26) ──────────
+# FOLLOWUP_WINDOW_FROM_REPLY_END (core/config.py; core/followup_window.py
+# "3.0.26"). The window used to open at the wake gate, before the brain and
+# the reply: live 11-16..11-17 the median voice turn ended 9.8 s after he
+# stopped talking, so a 20 s window often had 12 s or less left - and 5 of 55
+# had closed before JARVIS stopped speaking. _note_turn_boundary (the top of
+# every main-loop pass, i.e. after the reply and any encore have played)
+# calls _followup_turn_over: an answered turn that opened or kept-extended
+# the window re-arms it from now. A cue a drop gate spoke ("say it again")
+# or the standby greeting counts as a reply too (_followup_note_cue).
+_followup_cue_spoken = [False]
+
+
+def _followup_note_cue() -> None:
+    """JARVIS just spoke (or is about to speak) to the owner without a turn
+    being accepted - a drop gate's "say it again" cue or the standby
+    greeting: for the follow-up re-arm this pass counts as answered. Never
+    raises."""
+    try:
+        _followup_cue_spoken[0] = True
+    except Exception:
+        pass
+
+
+def _followup_turn_over(answered: bool) -> "float | None":
+    """The previous main-loop pass is over (_note_turn_boundary). When it
+    was answered (``answered``: its "You:" line was printed) or a cue was
+    spoken, and the window has a reply due (core.followup_window
+    rearm_after_reply), the window now runs FOLLOWUP_WINDOW_S from here.
+    Otherwise - or with FOLLOWUP_WINDOW_FROM_REPLY_END off - nothing is
+    re-armed. Logs one numbers-only line per re-arm. Returns the seconds
+    that were left before the re-arm, or None. Never raises."""
+    try:
+        cue, _followup_cue_spoken[0] = bool(_followup_cue_spoken[0]), False
+        win = _followup_window
+        if (not bool(globals().get("FOLLOWUP_WINDOW_FROM_REPLY_END", True))
+                or not (answered or cue)):
+            win.drop_reply_due()
+            return None
+        left = win.rearm_after_reply()
+        if left is not None:
+            print(f"  [follow-up] window re-armed after the reply "
+                  f"({left:.1f} s were left, now {win.window_s:.0f} s"
+                  f"{'; it had closed while JARVIS spoke' if left <= 0 else ''}"
+                  f")")
+        return left
+    except Exception:
+        return None
 
 
 def _followup_reply_expected(now: "float | None" = None) -> bool:
@@ -53376,6 +53430,9 @@ def _handle_sleep_standby(injected_text: str | None):
             from_standby=_was_standby, wake_text=text)
         print(f"  [wake] greeting='{_greeting}' vol={_vol}")
         _speak(_greeting, volume_scale=_vol)
+        # The follow-up window the wake opened runs from the end of the
+        # greeting (3.0.26, _followup_turn_over at the next pass).
+        _followup_note_cue()
         # The greeting is a question ("Yes, sir?"): in wake-word mode admit
         # exactly ONE un-prefixed reply to it (see _should_refuse_background_
         # audio), even with FOLLOWUP_WINDOW_S at 0.

@@ -1005,6 +1005,16 @@ FOLLOWUP_UNSURE_NO_EXTEND = True
 # control) is dropped silently, unless JARVIS just asked a question or a
 # prompt waits for your answer. False = such lines are answered as before.
 FOLLOWUP_UNSURE_COMMANDS_ONLY = True
+# FOLLOWUP_WINDOW_FROM_REPLY_END (3.0.26) - the follow-up window runs
+# FOLLOWUP_WINDOW_S from the END of JARVIS's reply, not from the moment you
+# stopped talking (the wake gate, before the brain and the reply). Live
+# 11-16..11-17 the median voice turn ended 9.8 s after you stopped, so a 20 s
+# window often had 12 s or less left, and 5 of 55 had closed before JARVIS
+# finished speaking. Only a turn that opened the window (the wake word) or
+# extended it with a confirmed voice re-arms it; an extension the rules above
+# took back never does. Logs "[follow-up] window re-armed after the reply".
+# Nothing changes while FOLLOWUP_WINDOW_S is 0. False = the old clock.
+FOLLOWUP_WINDOW_FROM_REPLY_END = True
 
 # Owner speech vocabulary (core/stt_vocab.py). STT_HOTWORDS: comma-separated names
 # Whisper should expect (faster-whisper "hotwords"). STT_REPLACEMENTS: phrases Whisper

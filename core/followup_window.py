@@ -61,6 +61,19 @@ Instead:
     keeps the window the follow-up opened, so the repeat needs no wake word
     (the owner is answering JARVIS); silent drops are still taken back.
 
+3.0.26 FROM THE END OF THE REPLY (setting FOLLOWUP_WINDOW_FROM_REPLY_END).
+The window used to run from the wake gate, about 0.3 s after he stopped
+talking - before the brain, the actions and the reply. Live 11-16..11-17 the
+median voice turn ended 9.8 s after he stopped, 37 of 55 left him 12 s or
+less of a 20 s window, and 5 closed before JARVIS had finished speaking. Now
+a turn that OPENED the window (a wake-word turn, note_addressed) or EXTENDED
+it with a confirmed voice (admit, not taken back) marks it "reply due"; when
+that turn's reply has been played the main loop calls rearm_after_reply(),
+and the window runs window_s from THAT moment (never shorter than it already
+was). An extension that was taken back (an unsure voice, an unanswered line)
+clears the mark, so it cannot re-arm anything: the 3.0.6 / 3.0.7 rules are
+unchanged, only the clock's starting point moves.
+
 Pure stdlib, no I/O, injectable clock — testable on the light-deps CI runner.
 """
 from __future__ import annotations
@@ -232,6 +245,9 @@ class FollowupWindow:
         # the window, until the turn is judged (take_back_admit) or a new
         # gate decision starts (forget_admit / note_addressed).
         self._last_admit = None
+        # The current turn opened or extended the window and its reply has
+        # not been played yet (rearm_after_reply, 3.0.26).
+        self._reply_due = False
 
     @property
     def enabled(self) -> bool:
@@ -242,6 +258,7 @@ class FollowupWindow:
         self._last_admit = None
         if self.enabled:
             self._until = self._clock() + self.window_s
+            self._reply_due = True
 
     def admit(self) -> bool:
         """True if a no-wake-word utterance is admissible right now.
@@ -254,9 +271,44 @@ class FollowupWindow:
         if now < self._until:
             self._last_admit = (self._until, now + self.window_s)
             self._until = now + self.window_s
+            self._reply_due = True
             return True
         self._last_admit = None
+        self._reply_due = False
         return False
+
+    @property
+    def reply_due(self) -> bool:
+        """The current turn opened or (still) extends the window and its
+        reply has not been played yet."""
+        return bool(self._reply_due)
+
+    def rearm_after_reply(self) -> "float | None":
+        """The turn's reply has just been played: when that turn opened the
+        window (note_addressed) or extended it and kept the extension
+        (admit, not taken back), the window now runs ``window_s`` from NOW -
+        never shorter than it already ran. Returns the seconds that were left
+        before (0.0 = it had closed while JARVIS spoke), or None when nothing
+        was re-armed (disabled, or no reply due). The mark is consumed either
+        way, and a pending take_back_admit no longer applies (the turn was
+        answered). Never raises."""
+        try:
+            due, self._reply_due = self._reply_due, False
+            if not self.enabled or not due:
+                return None
+            now = self._clock()
+            left = max(0.0, self._until - now)
+            self._until = max(self._until, now + self.window_s)
+            self._last_admit = None
+            return left
+        except Exception:
+            return None
+
+    def drop_reply_due(self) -> None:
+        """The turn ended without a reply (a drop gate took it): nothing to
+        re-arm. The deadline is untouched, so a pending take_back_admit still
+        applies. Never raises."""
+        self._reply_due = False
 
     def forget_admit(self) -> None:
         """A new gate decision starts: an earlier turn's extension can no
@@ -273,6 +325,9 @@ class FollowupWindow:
             memo, self._last_admit = self._last_admit, None
             if not memo:
                 return False
+            # The extension is refused whether or not the deadline can still
+            # be put back: this turn must not re-arm the window either.
+            self._reply_due = False
             before, after = memo
             if self._until != after:
                 return False
