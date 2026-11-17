@@ -155,9 +155,32 @@ class WellnessGateTests(unittest.TestCase):
             self.assertFalse(self.mod._bambu_print_active())
 
 
+def _isolate_wellness_state(test, mod):
+    """Point the day's used-lines file at a temp file."""
+    d = tempfile.TemporaryDirectory()
+    test.addCleanup(d.cleanup)
+    path = os.path.join(d.name, "wellness_state.json")
+    p = mock.patch.object(mod, "_wellness_state_path", return_value=path)
+    p.start()
+    test.addCleanup(p.stop)
+    return path
+
+
+def _a_nudge_line(mod, text) -> bool:
+    """``text`` is one of NUDGE_LINES with its {duration} filled in."""
+    import re
+    for tpl in mod.NUDGE_LINES:
+        rx = re.escape(tpl).replace(r"\{duration\}", ".+").replace(
+            r"\{Duration\}", ".+")
+        if re.fullmatch(rx, text):
+            return True
+    return False
+
+
 class WellnessPollStateMachineTests(unittest.TestCase):
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("wellness")
+        self.state = _isolate_wellness_state(self, self.mod)
         # Reset block-tracking state.
         self.mod._block_started_at[0] = 0.0
         self.mod._last_presence_at[0] = 0.0
@@ -196,9 +219,25 @@ class WellnessPollStateMachineTests(unittest.TestCase):
             self.mod._poll_once()
         enq.assert_called_once()
         spoken = enq.call_args[0][0]
-        self.assertIn(spoken, self.mod.NUDGE_LINES)
+        self.assertTrue(_a_nudge_line(self.mod, spoken), spoken)
+        self.assertNotIn("{", spoken)
         # Firing stamps the snooze clock.
         self.assertGreater(self.mod._last_nudge_at[0], 0.0)
+
+    def test_live_151_minute_block_is_not_called_an_hour_and_a_half(self):
+        # Live 11-16 12:45:16: "151 min focus block: You've been at it for an
+        # hour and a half, sir." The line now names the measured block.
+        self.mod._block_started_at[0] = time.time() - 151 * 60
+        self.mod._last_presence_at[0] = time.time()
+        with mock.patch.object(self.mod, "_user_present", return_value=True), \
+             mock.patch.object(self.mod, "_gate_reasons", return_value=[]), \
+             mock.patch.object(self.mod.random, "choice",
+                               side_effect=lambda xs: 0 if 0 in xs else xs[0]), \
+             mock.patch.object(self.mod, "_enqueue_speech") as enq:
+            self.mod._poll_once()
+        self.assertEqual(enq.call_args[0][0],
+                         "You've been at it for two and a half hours, sir. "
+                         "Hydration, perhaps?")
 
     def test_gate_blocks_nudge_even_past_threshold(self):
         self.mod._block_started_at[0] = time.time() - (self.mod.FOCUS_BLOCK_SECONDS + 60)
@@ -234,7 +273,8 @@ class WellnessFormatAndStatusTests(unittest.TestCase):
         self.assertEqual(f(7325), "2h 2m")
 
     def test_pick_nudge_line_in_bank(self):
-        self.assertIn(self.mod._pick_nudge_line(), self.mod.NUDGE_LINES)
+        _isolate_wellness_state(self, self.mod)
+        self.assertTrue(_a_nudge_line(self.mod, self.mod._pick_nudge_line()))
 
     def test_status_no_block(self):
         with mock.patch.object(self.mod, "_physical_input_seconds", return_value=30.0), \
@@ -553,20 +593,53 @@ class WellnessPickNudgeLineTests(unittest.TestCase):
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("wellness")
         self.mod._last_phrase_idx[0] = -1
+        self.state = _isolate_wellness_state(self, self.mod)
 
     def test_single_line_bank_returns_it_directly(self):
         with mock.patch.object(self.mod, "NUDGE_LINES", ("only one",)):
             self.assertEqual(self.mod._pick_nudge_line(), "only one")
+            self.assertEqual(self.mod._pick_nudge_line(), "only one")
 
-    def test_avoids_back_to_back_repeat(self):
-        # Force the RNG to first re-pick the just-used index, then a new one, so
-        # the dedupe loop (idx == last → retry) runs.
-        self.mod._last_phrase_idx[0] = 0
-        with mock.patch.object(self.mod.random, "randrange",
-                               side_effect=[0, 0, 1]):
-            line = self.mod._pick_nudge_line()
-        self.assertEqual(line, self.mod.NUDGE_LINES[1])
-        self.assertEqual(self.mod._last_phrase_idx[0], 1)
+    def test_no_line_twice_in_a_day_while_another_is_unused(self):
+        # Live 11-16: "your eyes will thank you" at 09:51, 11:45 and 14:39.
+        day = "2026-11-16"
+        n = len(self.mod.NUDGE_LINES)
+        picks = [self.mod._pick_nudge_line(100 * 60, today=day)
+                 for _ in range(n)]
+        self.assertEqual(len(set(picks)), n)
+        # The next one may repeat, but never the line just said.
+        self.assertNotEqual(self.mod._pick_nudge_line(100 * 60, today=day),
+                            picks[-1])
+
+    def test_the_days_picks_survive_a_restart(self):
+        day = "2026-11-16"
+        first = self.mod._pick_nudge_line(100 * 60, today=day)
+        mod, _ = load_skill_isolated("wellness")       # JARVIS restarted
+        with mock.patch.object(mod, "_wellness_state_path",
+                               return_value=self.state):
+            for _ in range(len(mod.NUDGE_LINES) - 1):
+                self.assertNotEqual(mod._pick_nudge_line(100 * 60, today=day),
+                                    first)
+
+    def test_a_new_day_starts_fresh(self):
+        self.mod._pick_nudge_line(100 * 60, today="2026-11-16")
+        self.assertEqual(self.mod._used_today("2026-11-17"), [])
+
+    def test_duration_phrase_never_overstates(self):
+        f = self.mod._duration_phrase
+        self.assertEqual(f(90 * 60), "an hour and a half")
+        self.assertEqual(f(119 * 60), "an hour and a half")
+        self.assertEqual(f(120 * 60), "two hours")
+        self.assertEqual(f(151 * 60), "two and a half hours")
+        self.assertEqual(f(185 * 60), "three hours")
+        self.assertEqual(f(60 * 60), "an hour")
+        self.assertEqual(f(10 * 60), "half an hour")
+
+    def test_a_capitalised_duration_opens_its_line(self):
+        with mock.patch.object(self.mod, "NUDGE_LINES",
+                               ("{Duration} at the desk, sir.",)):
+            self.assertEqual(self.mod._pick_nudge_line(120 * 60),
+                             "Two hours at the desk, sir.")
 
 
 class WellnessPollBreakResetEdgeTests(unittest.TestCase):

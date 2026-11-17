@@ -19,9 +19,15 @@ walk to grab coffee — but resets when no presence signal has fired for
 BREAK_RESET_SECONDS (default 5 min).
 
 Once the block reaches FOCUS_BLOCK_SECONDS (default 90 min) and no gate is
-blocking, JARVIS volunteers one of:
-  "You've been at it for an hour and a half, sir. Hydration, perhaps?"
+blocking, JARVIS volunteers one of NUDGE_LINES, e.g.
+  "You've been at it for two and a half hours, sir. Hydration, perhaps?"
   "If I may, sir — your eyes will thank you for a thirty-second break."
+A line that names how long he has worked names the MEASURED block, rounded
+down to the half hour (2026-11-17: live 11-16 12:45 a 151-minute block got the
+fixed "an hour and a half"), and no line is used twice in one day while
+another is unused (the day's picks persist in data/wellness_state.json, so a
+restart does not reset them: "your eyes will thank you" was said three times
+on 11-16).
 
 After firing the nudge enters a SNOOZE_SECONDS (default 60 min) cooldown,
 during which the block tracker keeps running but no further nudge fires.
@@ -68,10 +74,18 @@ RECENT_VOICE_WINDOW      = 10 * 60   # an owner MIC turn within 10 min counts as
 SNOOZE_SECONDS           = 60 * 60   # 1 hour cooldown after a fired nudge
 INITIAL_DELAY_SECONDS    = 120.0     # let JARVIS boot before we start counting
 
+# {duration} / {Duration}: the measured block ("two and a half hours"),
+# _duration_phrase. A line with neither names no length at all.
 NUDGE_LINES = (
-    "You've been at it for an hour and a half, sir. Hydration, perhaps?",
+    "You've been at it for {duration}, sir. Hydration, perhaps?",
     "If I may, sir — your eyes will thank you for a thirty-second break.",
+    "{Duration} at the desk, sir. A stretch might be in order.",
+    "Perhaps a glass of water, sir? You've been going for {duration}.",
+    "A short walk would do you good, sir — even five minutes.",
 )
+_WELLNESS_STATE_NAME = "wellness_state.json"
+_NUMBER_WORDS = ("zero", "one", "two", "three", "four", "five", "six",
+                 "seven", "eight", "nine", "ten", "eleven", "twelve")
 
 # Window-title fragments indicating the user is on a call — mirrors the list
 # used by anticipation_engine so wellness nudges follow the same etiquette.
@@ -290,15 +304,63 @@ def _gate_reasons() -> list[str]:
 
 # ── Poll loop ─────────────────────────────────────────────────────────────
 
-def _pick_nudge_line() -> str:
-    """Pick a nudge phrase, avoiding back-to-back repeats."""
-    if len(NUDGE_LINES) == 1:
-        return NUDGE_LINES[0]
-    while True:
-        idx = random.randrange(len(NUDGE_LINES))
-        if idx != _last_phrase_idx[0]:
-            _last_phrase_idx[0] = idx
-            return NUDGE_LINES[idx]
+def _duration_phrase(seconds: float) -> str:
+    """The block length in words, rounded DOWN to the half hour (never more
+    than he has done): 90 min "an hour and a half", 151 min "two and a half
+    hours", 180 min "three hours". Under an hour: "half an hour"."""
+    halves = max(1, int(max(0.0, float(seconds)) // 1800))
+    hours, half = divmod(halves, 2)
+    if hours == 0:
+        return "half an hour"
+    if hours == 1:
+        return "an hour and a half" if half else "an hour"
+    word = _NUMBER_WORDS[hours] if hours < len(_NUMBER_WORDS) else str(hours)
+    return f"{word} and a half hours" if half else f"{word} hours"
+
+
+def _wellness_state_path() -> str:
+    """data/wellness_state.json, resolved at call time (core/paths)."""
+    from core.paths import data_file
+    return data_file(_WELLNESS_STATE_NAME)
+
+
+def _used_today(today: str) -> list:
+    """The NUDGE_LINES indexes already used on ``today`` ([] on any error)."""
+    try:
+        with open(_wellness_state_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("date") == today:
+            return [int(i) for i in data.get("used") or []
+                    if isinstance(i, int) and 0 <= i < len(NUDGE_LINES)]
+    except Exception:
+        pass
+    return []
+
+
+def _pick_nudge_line(block_seconds: "float | None" = None,
+                     today: "str | None" = None) -> str:
+    """A nudge for a block of ``block_seconds`` (default FOCUS_BLOCK_SECONDS):
+    one of NUDGE_LINES not yet used today (the day's picks persist, so a
+    restart does not reset them), else any but the last one; its {duration}
+    is the measured block (_duration_phrase)."""
+    today = today or time.strftime("%Y-%m-%d")
+    used = _used_today(today)
+    idxs = list(range(len(NUDGE_LINES)))
+    fresh = [i for i in idxs if i not in used]
+    if not fresh:
+        last = used[-1] if used else _last_phrase_idx[0]
+        fresh = [i for i in idxs if i != last] or idxs
+    idx = random.choice(fresh)
+    _last_phrase_idx[0] = idx
+    try:
+        _atomic_write_json(_wellness_state_path(),
+                           {"date": today, "used": used + [idx]})
+    except Exception as e:
+        print(f"  [wellness] could not save today's nudge lines: {e}")
+    dur = _duration_phrase(FOCUS_BLOCK_SECONDS if block_seconds is None
+                           else block_seconds)
+    return NUDGE_LINES[idx].format(duration=dur,
+                                   Duration=dur[:1].upper() + dur[1:])
 
 
 def _poll_once() -> None:
@@ -333,7 +395,7 @@ def _poll_once() -> None:
     if gates:
         return
 
-    line = _pick_nudge_line()
+    line = _pick_nudge_line(block_duration)
     with _state_lock:
         _last_nudge_at[0] = now
 
