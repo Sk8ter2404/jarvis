@@ -12,7 +12,9 @@ Both background threads (_hud_publish_loop, _proactive_loop) are never started
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -2323,3 +2325,147 @@ class PulseMemoryUsersTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+class PythonProcessNamesTests(unittest.TestCase):
+    """v3.0.26 (reliability-08): the 11-16/17 RAM alerts said "Python at 12 /
+    17 / 18 / 22 / 28 GB" - every python.exe but JARVIS's own summed into one
+    figure, no pid logged. A Python process is named by what it runs; the
+    top pids go in the log. Synthetic pids and scripts throughout."""
+
+    OWN = 4242
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("system_pulse")
+
+    def _rows(self):
+        return [(self.OWN, "pythonw.exe", 2.6 * _GB),
+                (501, "pythonw.exe", 22.0 * _GB),     # the clone voice server
+                (502, "pythonw.exe", 1.2 * _GB),      # the HUD
+                (503, "python.exe", 2.0 * _GB),       # the test runner
+                (504, "python.exe", 3.0 * _GB),       # someone else's script
+                (505, "python.exe", 1.5 * _GB),       # -c code
+                (506, "python.exe", 1.1 * _GB),       # unreadable cmdline
+                (600, "chrome.exe", 4.5 * _GB)]
+
+    def _cmdlines(self):
+        return {
+            501: ["C:/venv/Scripts/pythonw.exe", "-u",
+                  "C:/somewhere/clone_tts_server.py", "--ref", "r.wav",
+                  "--port", "8767"],
+            502: ["pythonw.exe", "C:/JARVIS/hud/jarvis_unified_hud.py",
+                  "--parent-pid", "4242"],
+            503: ["python.exe", "tools/run_tests.py", "test_x"],
+            504: ["python.exe", "-X", "utf8", "D:/stuff/approve_server.py",
+                  "--token", "SECRET-TOKEN-123"],
+            505: ["python.exe", "-c", "print(1)"],
+        }
+
+    def test_python_processes_are_named_by_what_they_run(self):
+        users = dict(self.mod._memory_users(self._rows(), own_pid=self.OWN,
+                                            top=10,
+                                            cmdlines=self._cmdlines()))
+        self.assertAlmostEqual(users["my voice server"], 22.0, places=6)
+        self.assertAlmostEqual(users["my HUD"], 1.2, places=6)
+        self.assertAlmostEqual(users["the test runner"], 2.0, places=6)
+        self.assertAlmostEqual(users["the Python script approve server"], 3.0,
+                               places=6)
+        # -c code and an unreadable command line stay plain "Python"
+        self.assertAlmostEqual(users["Python"], 1.5 + 1.1, places=6)
+        self.assertAlmostEqual(users["my own process"], 2.6, places=6)
+        top = self.mod._memory_users(self._rows(), own_pid=self.OWN,
+                                     cmdlines=self._cmdlines())
+        self.assertEqual(top[0][0], "my voice server")
+        sentence = self.mod._memory_users_sentence(top)
+        self.assertTrue(sentence.startswith(
+            "The biggest memory users are my voice server at 22 gigabytes"),
+            sentence)
+
+    def test_the_configured_voice_server_script_is_my_voice_server(self):
+        rows = [(701, "python.exe", 9.0 * _GB)]
+        argv = {701: ["python.exe", "-u", "E:/tts/my_cloner.py"]}
+        with mock.patch("core.config.VOICE_CLONE_SERVER_CMD",
+                        '"E:/venv/python.exe" -u E:/tts/my_cloner.py '
+                        '--ref {ref} --port {port}', create=True):
+            self.assertEqual(self.mod._memory_users(rows, own_pid=1,
+                                                    cmdlines=argv),
+                             [("my voice server", 9.0)])
+        with mock.patch("core.config.VOICE_CLONE_SERVER_CMD",
+                        '["E:/venv/python.exe", "E:/tts/my_cloner.py"]',
+                        create=True):
+            self.assertEqual(self.mod._voice_server_stem(), "my_cloner")
+        with mock.patch("core.config.VOICE_CLONE_SERVER_CMD", "",
+                        create=True):
+            self.assertEqual(self.mod._memory_users(rows, own_pid=1,
+                                                    cmdlines=argv),
+                             [("the Python script my cloner", 9.0)])
+
+    def test_python_script_parsing(self):
+        ps = self.mod._python_script
+        self.assertEqual(ps(["python", "-u", "x/y/run_tests.py", "a"]),
+                         "run_tests")
+        self.assertEqual(ps(["pythonw", "-m", "tools.settings_window"]),
+                         "settings_window")
+        self.assertEqual(ps(["python", "-mjson.tool"]), "tool")
+        self.assertEqual(ps(["python", "-X", "utf8", "-W", "ignore",
+                             "C:\\a\\b\\Foo.pyw"]), "foo")
+        self.assertEqual(ps(["python", "-c", "print(1)"]), "")
+        self.assertEqual(ps(["python"]), "")
+        self.assertEqual(ps(None), "")
+        self.assertEqual(ps([object()]), "")
+
+    def test_an_injected_table_never_reads_this_boxs_processes(self):
+        # Synthetic pids may be real pids here: no live command-line reads.
+        with mock.patch.object(self.mod.psutil, "Process",
+                               side_effect=AssertionError("live read")):
+            users = dict(self.mod._memory_users(self._rows(),
+                                                own_pid=self.OWN, top=10))
+        self.assertAlmostEqual(users["Python"], 22.0 + 1.2 + 2.0 + 3.0 + 1.5
+                               + 1.1, places=6)
+
+    def test_the_live_table_reads_python_command_lines_only(self):
+        asked = []
+        cmd = self._cmdlines()
+
+        def proc(pid):
+            asked.append(pid)
+            if pid not in cmd:
+                raise self.mod.psutil.AccessDenied(pid)
+            return types.SimpleNamespace(cmdline=lambda: cmd[pid])
+        with mock.patch.object(self.mod, "_read_process_memory",
+                               return_value=self._rows()), \
+             mock.patch.object(self.mod.psutil, "Process", side_effect=proc), \
+             mock.patch.object(self.mod.os, "getpid", return_value=self.OWN):
+            users = dict(self.mod._memory_users(top=10))
+        self.assertNotIn(600, asked, "chrome is not a Python process")
+        self.assertEqual(sorted(asked), [501, 502, 503, 504, 505, 506,
+                                         self.OWN])
+        self.assertIn("my voice server", users)
+        self.assertIn("the Python script approve server", users)
+
+    def test_the_log_line_names_the_top_pids_without_their_arguments(self):
+        line = self.mod._memory_hogs_line(91.0, self._rows(),
+                                          own_pid=self.OWN,
+                                          cmdlines=self._cmdlines())
+        self.assertTrue(line.startswith("  [mem-users] RAM 91%: pid 501 "
+                                        "22.0 GB my voice server (pythonw "
+                                        "clone_tts_server.py); "), line)
+        self.assertIn("pid 600 4.5 GB Chrome (chrome)", line)
+        self.assertIn("pid 504 3.0 GB the Python script approve server "
+                      "(python approve_server.py)", line)
+        self.assertEqual(line.count("pid "), 3)
+        for leak in ("SECRET", "--token", "r.wav", "D:/stuff", "8767"):
+            self.assertNotIn(leak, line)
+        self.assertEqual(self.mod._memory_hogs_line(91.0, []), "")
+        self.assertEqual(self.mod._memory_hogs_line(91.0, object()), "")
+
+    def test_log_memory_hogs_prints_the_line(self):
+        out = io.StringIO()
+        with mock.patch.object(self.mod, "_read_process_memory",
+                               return_value=self._rows()), \
+             mock.patch.object(self.mod, "_python_cmdlines",
+                               return_value=self._cmdlines()), \
+             contextlib.redirect_stdout(out):
+            line = self.mod._log_memory_hogs(97)
+        self.assertIn("[mem-users] RAM 97%: pid 501", out.getvalue())
+        self.assertEqual(out.getvalue().strip(), line.strip())
+
+

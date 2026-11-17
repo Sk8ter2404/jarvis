@@ -180,6 +180,30 @@ class SystemMonitorRamUsersTests(unittest.TestCase):
                                return_value=list(self.procs)):
             return self.actions["check_system"](arg)
 
+    def test_v3026_the_ram_alert_logs_the_top_pids(self):
+        """reliability-08: the alert's culprits go in the log by pid, even
+        with RAM_ALERT_NAME_USERS off (a held-and-dropped alert left no
+        trace of which process held 22-28 GB)."""
+        import contextlib
+        import io
+        for name_users in (True, False):
+            out = io.StringIO()
+            with mock.patch.dict(sys.modules,
+                                 {"skill_system_pulse": self.pulse}), \
+                 mock.patch("core.config.RAM_ALERT_NAME_USERS", name_users,
+                            create=True), \
+                 mock.patch.object(self.pulse, "_read_process_memory",
+                                   return_value=list(self.procs)), \
+                 mock.patch.object(self.pulse, "_python_cmdlines",
+                                   return_value={}), \
+                 contextlib.redirect_stdout(out):
+                line = self.mod._ram_alert_line(91.0)
+            self.assertIn("[mem-users] RAM 91%: pid 9001 8.0 GB my local "
+                          "brain model (llama-server); pid 9002 6.7 GB "
+                          "Claude (claude)", out.getvalue())
+            self.assertTrue(line.startswith(
+                "Sir, memory usage is at 91 percent."), line)
+
     def test_live_92_percent_names_the_memory_users(self):
         # v3.0.7: asked about memory, the number and the users lead.
         out = self._check(92, self.LIVE_SAID)

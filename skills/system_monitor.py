@@ -240,10 +240,19 @@ def _ram_alert_line(ram_pct: float) -> str:
     Never raises."""
     head = f"Sir, memory usage is at {ram_pct:.0f} percent."
     old = head + " Things may start swapping shortly."
+    pulse = sys.modules.get("skill_system_pulse")
+    # v3.0.26 (reliability-08): the top pids go in the LOG whether or not the
+    # spoken line names anyone - the 11-16/17 alerts were held and dropped,
+    # and the 22-28 GB "Python" could not be found afterwards.
+    try:
+        log_hogs = getattr(pulse, "_log_memory_hogs", None)
+        if log_hogs is not None:
+            log_hogs(ram_pct)
+    except Exception:
+        pass
     try:
         if not bool(_cfg_value("RAM_ALERT_NAME_USERS", False)):
             return old
-        pulse = sys.modules.get("skill_system_pulse")
         if pulse is None:
             return old
         users = pulse._memory_users_sentence(pulse._memory_users()) or ""
