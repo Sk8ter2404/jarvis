@@ -1496,6 +1496,67 @@ def _act_apple_music(query: str) -> str:
 
 # ─── App launching (Phase 4D) ──────────────────────────────────────────
 
+# ── "open YouTube" is the home page, not a search (2026-11-17) ──────────────
+# Live 16:12:48 "open YouTube." -> [ACTION: youtube_search_direct, YouTube]
+# played a random Short ("WORLD'S FUNNIEST YOUTUBE SHORTS"); 16:13:51 "go to
+# the YouTube homepage, not this." A search whose whole query is the site's
+# own name opens the home page (bobert_companion._youtube_home_alias).
+YOUTUBE_HOME_URL = "https://www.youtube.com"
+_BARE_YOUTUBE_QUERY_RE = re.compile(
+    r"^(?:(?:open|go\s+to|show\s+me|pull\s+up)\s+)?(?:the\s+)?"
+    r"(?:youtube|you\s+tube|yt)(?:\s*\.\s*com)?"
+    r"(?:\s+(?:home\s*page|home|main\s+page|front\s+page|site|website|app))?$",
+    re.IGNORECASE)
+
+
+def is_bare_youtube_query(query) -> bool:
+    """True when a YouTube search query is only the site's name ("YouTube",
+    "you tube", "the YouTube homepage"). Never raises."""
+    try:
+        q = " ".join(str(query or "").split()).strip(" .!?,'\"")
+        return bool(q) and bool(_BARE_YOUTUBE_QUERY_RE.match(q))
+    except Exception:
+        return False
+
+
+# ── Fortnite (2026-11-17) ───────────────────────────────────────────────────
+# core/prompts.py teaches "Open Fortnite" -> [ACTION: launch_app, Fortnite],
+# but Fortnite has no exe on PATH and no name os.startfile resolves (live
+# 16:03:23: "could not launch Fortnite: not found as an app on this PC
+# ([WinError 2] ...)"). The Epic Games launcher starts it from its URI.
+FORTNITE_EPIC_URI = ("com.epicgames.launcher://apps/fn%3A4fe75bbc5a674f4f9b356b5c"
+                     "90567da5%3AFortnite?action=launch&silent=true")
+# The spoken names, after _fortnite_key (lower case, one space, no leading
+# "the" / trailing "game"). "fortnight" is how Whisper / Parakeet spell it.
+_FORTNITE_LAUNCH_ALIASES = frozenset({"fortnite", "fort nite", "fortnight"})
+
+
+def _fortnite_key(name) -> str:
+    key = re.sub(r"\s+", " ", str(name or "").strip().lower()).strip(" .!?,")
+    key = re.sub(r"^the ", "", key)
+    return re.sub(r" game$", "", key)
+
+
+def _is_fortnite_name(name) -> bool:
+    """True when a launch_app argument names Fortnite. Never raises."""
+    try:
+        return _fortnite_key(name) in _FORTNITE_LAUNCH_ALIASES
+    except Exception:
+        return False
+
+
+def _launch_fortnite() -> str:
+    """Start Fortnite through the Epic Games launcher (FORTNITE_EPIC_URI,
+    os.startfile). Windows only; any error is the normal launch failure."""
+    if sys.platform != "win32":
+        return "could not launch Fortnite: the Epic Games launcher is Windows-only"
+    try:
+        os.startfile(FORTNITE_EPIC_URI)
+        return "launched Fortnite (through the Epic Games launcher)"
+    except Exception as e:
+        return f"could not launch Fortnite through the Epic Games launcher: {e}"
+
+
 # Spoken names that mean "Apple Music". They open the web player (see
 # _act_open_apple_music) rather than a doomed exe / startfile lookup.
 _APPLE_MUSIC_LAUNCH_ALIASES = frozenset({
@@ -1577,6 +1638,11 @@ def _act_launch_app(name: str) -> str:
     #    os.startfile("apple music") fails.
     if re.sub(r"\s+", " ", (name or "").strip().lower()) in _APPLE_MUSIC_LAUNCH_ALIASES:
         return _act_open_apple_music()
+    # 0b) Fortnite (2026-11-17) - through the Epic Games launcher's URI; it
+    #     has no exe on PATH (live 16:03:23 "could not launch Fortnite: not
+    #     found as an app on this PC ([WinError 2]...)").
+    if _is_fortnite_name(name):
+        return _launch_fortnite()
 
     # 1) Known-app table for things shutil.which / os.startfile can't resolve
     #    (e.g. Bambu Studio, which installs to Program Files without a

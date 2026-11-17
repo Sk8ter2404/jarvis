@@ -62,17 +62,19 @@ class FakeFrames:
         self.seq = 0
         self.raise_on_publish = False
         self.accept = True
+        self.sources = []                 # the header "source" each frame was tagged with
 
     def active(self):
         return self._active
 
-    def publish(self, frame):
+    def publish(self, frame, source=None):
         if self.raise_on_publish:
             raise RuntimeError("boom")
         if not self.accept:
             return False
         self.seq += 1
         self.published.append(frame)
+        self.sources.append(source)
         return True
 
     def status(self):
@@ -431,15 +433,18 @@ class FeedGateTests(unittest.TestCase):
         clock.t += hd.MIN_GAP_S
         self.assertEqual(feed.step(), "")
         self.assertEqual(len(fr.published), 2)
-        # a loop spinning at 1 kHz for one second still yields at most ~16 frames
+        # a loop spinning at 1 kHz for one second still yields at most ~40 frames
         n0 = len(fr.published)
         for _ in range(1000):
             clock.t += 0.001
             br.color_clock += 1
             feed.step()
         self.assertLessEqual(len(fr.published) - n0, int(1.0 / hd.MIN_GAP_S) + 1)
-        self.assertGreaterEqual(1.0 / hd.MIN_GAP_S, 15.0)
-        self.assertLessEqual(hd.MAX_FPS, 15.0)
+        # 2026-11-17: the Kinect pump steps at the sensor's own 30 fps, so the
+        # cap must pass a 30 fps stream (gap < 33 ms) yet still stop a flood.
+        self.assertGreaterEqual(1.0 / hd.MIN_GAP_S, 30.0)
+        self.assertLess(hd.MIN_GAP_S, 1.0 / 30)
+        self.assertLessEqual(hd.MAX_FPS, 30.0)
 
     def test_a_frame_already_sent_is_not_sent_again(self):
         feed, br, fr, _dw, clock = make_feed()
@@ -688,7 +693,9 @@ class BridgeContractTests(unittest.TestCase):
         self.assertIn("from core import handtrack_depth as _handtrack_depth", src)
         i = src.index("_handtrack_depth.publish_kinect()")
         self.assertEqual(src.count("_handtrack_depth.publish_kinect()"), 1)
-        self.assertIn("if not camera_off:", src[i - 80:i])
+        # 2026-11-17: the gate may also skip the call while the Kinect pump
+        # feeds (core builder's _handtrack_pump_running hook); camera_off stays.
+        self.assertRegex(src[i - 80:i], r"if not camera_off(:| and )")
         j = src.index("# Read all cameras, run face detection on each", i)
         self.assertLess(j - i, 200)                            # right before the per-camera loop
         # it sits in the face-tracking loop, after the per-pass camera_off decision
@@ -700,12 +707,197 @@ class BridgeContractTests(unittest.TestCase):
         top = src.split("\nclass Calib", 1)[0]
         for line in top.splitlines():
             if line.startswith(("import ", "from ")):
-                self.assertTrue(line.split()[1] in ("__future__", "math", "struct", "time", "typing"), line)
+                self.assertTrue(line.split()[1] in ("__future__", "math", "struct", "threading",
+                                                    "time", "typing"), line)
 
     def test_no_windows_only_path_literals(self):
         with open(os.path.join(_ROOT, "core", "handtrack_depth.py"), encoding="utf-8") as f:
             src = f.read()
         self.assertNotRegex(src, r"[A-Za-z]:\\\\")
+
+
+# ── 2026-11-17: the Kinect pump + per-frame camera tag ────────────────────
+# Live 11-17 16:03-16:11 the Kinect reached the tracker only once per face-loop
+# pass (~7-10 fps): 38 fist_grab with no release between, 12 repeated
+# pinch_start. FAKES ONLY below: a fake feed, real (short-lived) threads.
+import threading  # noqa: E402
+import time  # noqa: E402
+
+
+class FakePumpFeed:
+    def __init__(self):
+        self.selected = True
+        self.active = True
+        self.steps = 0
+        self.stepped = threading.Event()
+        self.concurrent = 0
+        self._in = 0
+
+    def kinect_selected(self):
+        return self.selected
+
+    def _frames_mod(self):
+        return types.SimpleNamespace(active=lambda: self.active)
+
+    def step(self):
+        self._in += 1
+        self.concurrent = max(self.concurrent, self._in)
+        self.steps += 1
+        self.stepped.set()
+        self._in -= 1
+        return ""
+
+
+def _wait(pred, timeout=2.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if pred():
+            return True
+        time.sleep(0.002)
+    return pred()
+
+
+class KinectPumpTests(unittest.TestCase):
+    def make(self, gate=None):
+        feed = FakePumpFeed()
+        pump = hd.KinectPump(feed=feed, gate=gate, poll_s=0.002, idle_s=0.005,
+                             step_lock=threading.Lock())
+        self.addCleanup(pump.stop)
+        return feed, pump
+
+    def test_steps_the_feed_at_its_own_pace_and_stops_cleanly(self):
+        feed, pump = self.make()
+        self.assertTrue(pump.start())
+        self.assertTrue(_wait(lambda: feed.steps >= 5))
+        self.assertTrue(pump.running())
+        self.assertTrue(pump.stop())
+        self.assertFalse(pump.alive())
+        self.assertFalse(pump.running())
+        n = feed.steps
+        time.sleep(0.03)
+        self.assertEqual(feed.steps, n)                       # nothing after stop()
+
+    def test_never_more_than_one_pump_thread(self):
+        _feed, pump = self.make()
+        self.assertTrue(pump.start())
+        self.assertFalse(pump.start())                        # already running
+        self.assertFalse(pump.start())
+        names = [t.name for t in threading.enumerate()
+                 if t.name == "handtrack-kinect-pump" and t.is_alive()]
+        self.assertEqual(len(names), 1)
+        self.assertEqual(pump.starts, 1)
+        pump.stop()
+        self.assertTrue(pump.start())                         # a fresh one after stop
+        self.assertEqual(pump.starts, 2)
+
+    def test_stands_still_without_a_tracker_another_camera_or_camera_off(self):
+        for what in ("tracker", "camera", "gate"):
+            gate_on = [True]
+            feed, pump = self.make(gate=lambda: gate_on[0])
+            if what == "tracker":
+                feed.active = False
+            elif what == "camera":
+                feed.selected = False
+            else:
+                gate_on[0] = False
+            pump.start()
+            time.sleep(0.04)
+            self.assertEqual(feed.steps, 0, what)
+            self.assertTrue(pump.alive(), what)
+            self.assertFalse(pump.running(), what)          # the face loop keeps its call
+            # the condition clears: it starts feeding without a restart
+            feed.active, feed.selected, gate_on[0] = True, True, True
+            self.assertTrue(_wait(lambda: feed.steps > 0), what)
+            self.assertTrue(pump.running(), what)
+            pump.stop()
+
+    def test_the_face_loop_entry_point_is_a_no_op_while_the_pump_feeds(self):
+        feed, pump = self.make()
+        loop_feed, _br, fr, _dw, _ = make_feed()
+        with mock.patch.object(hd, "PUMP", pump), mock.patch.object(hd, "FEED", loop_feed):
+            self.assertFalse(hd.pump_running())
+            self.assertEqual(hd.publish_kinect(), "")           # no pump: the loop steps it
+            self.assertEqual(len(fr.published), 1)
+            self.assertTrue(hd.start_pump())
+            self.assertTrue(_wait(hd.pump_running))
+            self.assertEqual(hd.publish_kinect(), "pump")       # never two steppers
+            self.assertEqual(len(fr.published), 1)
+            self.assertIn("pump", hd.feed_status())
+            self.assertTrue(hd.stop_pump())
+            self.assertFalse(hd.pump_running())
+
+    def test_module_helpers_never_raise(self):
+        broken = types.SimpleNamespace()                       # no methods at all
+        with mock.patch.object(hd, "PUMP", broken):
+            self.assertFalse(hd.pump_running())
+            self.assertFalse(hd.start_pump())
+            self.assertFalse(hd.stop_pump())
+            self.assertEqual(hd.publish_kinect(), "error")
+
+    def test_a_step_that_raises_does_not_kill_the_pump(self):
+        feed, pump = self.make()
+        calls = []
+
+        def bad_step():
+            calls.append(1)
+            raise RuntimeError("boom")
+        feed.step = bad_step
+        pump.start()
+        # KinectFeed.step never raises; a stand-in that does is noted and
+        # retried after a nap - nothing escapes the daemon thread.
+        self.assertTrue(_wait(lambda: len(calls) >= 2))
+        self.assertTrue(pump.alive())
+        self.assertIn("boom", pump.last_error)
+
+    def test_camera_on_follows_the_face_loops_gate(self):
+        ev = threading.Event()
+        fake = types.SimpleNamespace(_face_track_camera_off=ev, _standby_mode=[False])
+        with mock.patch.dict(sys.modules, {"bobert_companion": fake}):
+            self.assertTrue(hd._camera_on())
+            ev.set()
+            self.assertFalse(hd._camera_on())                  # the low-memory guard
+            ev.clear()
+            fake._standby_mode[0] = True
+            self.assertFalse(hd._camera_on())                  # standby
+            fake._standby_mode[0] = False
+            fake._face_track_camera_off = object()             # odd attribute: fail closed
+            self.assertFalse(hd._camera_on())
+        self.assertIs(hd.PUMP._gate, hd._camera_on)
+
+
+class FeedCadenceTests(unittest.TestCase):
+    def test_frames_are_tagged_as_the_kinect(self):
+        from core import handtrack_frames as hf
+        self.assertEqual(hd._SOURCE_KINECT, hf.SOURCE_KINECT)
+        feed, _br, fr, _dw, _ = make_feed()
+        self.assertEqual(feed.step(), "")
+        self.assertEqual(fr.sources, [hf.SOURCE_KINECT])
+
+    def test_a_30fps_sensor_passes_the_cap(self):
+        feed, br, fr, _dw, clock = make_feed()
+        for _ in range(30):                                   # one second at 30 fps
+            br.color_clock += 1
+            self.assertEqual(feed.step(), "")
+            clock.t += 1.0 / 30
+        self.assertEqual(len(fr.published), 30)
+
+    def test_depth_keeps_its_old_ceiling_while_colour_runs_at_30(self):
+        feed, br, fr, _dw, clock = make_feed(depth=True)
+        for _ in range(30):
+            br.color_clock += 1
+            feed.step()
+            clock.t += 1.0 / 30
+        self.assertEqual(len(fr.published), 30)
+        self.assertLessEqual(feed.depth_frames, int(1.0 / hd.DEPTH_MIN_GAP_S) + 1)
+        self.assertGreaterEqual(feed.depth_frames, 10)
+
+    def test_no_new_frame_does_not_ask_for_stream_health(self):
+        feed, br, _fr, _dw, clock = make_feed()
+        feed.step()
+        br.calls.clear()
+        clock.t += 1.0
+        self.assertEqual(feed.step(), "no new colour")
+        self.assertEqual(br.calls, ["clock"])                 # one attribute peek, nothing else
 
 
 if __name__ == "__main__":

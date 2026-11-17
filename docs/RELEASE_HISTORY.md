@@ -2,6 +2,10 @@
 
 Every tagged release, newest first. Generated; do not edit by hand.
 
+## v3.0.25 (2026-11-17)
+
+Fixes from a full review of the 11-16 and 11-17 logs, where he misread about a third of the turns. "Open YouTube" opens the YouTube home page instead of a random Short. "Time to play Fortnite" turns on game mode and starts Fortnite through the Epic launcher (it used to fail). "Did anything happen while I was at school?" gets the real away recap instead of a made-up "I've checked the logs". Game mode can no longer switch on from a misheard line: it needs you to mention a game, gaming or power (a mishearing on the Dell had turned off the camera and the hand mouse). "Etsy" is heard correctly. In wake-word mode the camera now opens as soon as he is listening asleep, not after 45 seconds. Hand tracking on the Kinect: frames reach the tracker at the camera's own speed (about 30 a second instead of about 8), a grab survives a missed frame or a left/right mix-up, the size limits fit the Kinect's wide view, dim frames are brightened before tracking, and the tracker logs its real frame rate and brightness.
+
 ## v3.0.24 (2026-11-16)
 
 Two fixes from the Dell tonight. The boot no longer freezes behind the webcam: both first boots there sat about 3.5 minutes with no voice, no listening and no hand tracking, because the webcam's first open hung inside its driver and held up the boot line until it came back. The camera now opens once he is already listening (45 seconds at most), and the sound library it was stuck on loads before any camera opens. Hand tracking is steadier: with his face in view the face detector ran on every frame and took half the Dell's processor, so the hand tracker kept losing his hand. While a hand is in view, face detection now runs once a second.

@@ -177,6 +177,9 @@ class RobotSpeechEnforceTests(_FitBase):
 
     def test_other_rules_stay_in_shadow(self):
         game_on = self.acts["game_mode_on"]
+        # 2026-11-17: game mode ON has its own enforce flag now
+        # (ACTION_FIT_GAME_MODE_ENFORCE); off, rule 2 is a plain shadow rule.
+        self._p(self.bc, "ACTION_FIT_GAME_MODE_ENFORCE", False, create=True)
         self._turn("Certainly, sir. [ACTION: game_mode_on]",
                    "Jarvis, get out of the way for just a second.")
         game_on.assert_called_once()

@@ -1047,6 +1047,13 @@ PC_CONTROL_PROMPT = (
     "                                  URL: a show on a streaming service is\n"
     "                                  play_streaming / streaming_search)\n"
     "  launch_app, <name>           — launch an app by name\n"
+    # 2026-11-17 16:03:21: "It's time to play Fortnite." ran launch_app only
+    # (it could not find Fortnite then) and never game_mode_on, which frees
+    # the GPU for the game. launch_app now starts Fortnite via Epic.
+    "                                  Time to play Fortnite / get out of\n"
+    "                                  the way, I'm gaming = [ACTION:\n"
+    "                                  game_mode_on] [ACTION: launch_app,\n"
+    "                                  Fortnite]\n"
     "  web_search, <query>          — Google search. Is a show, episode,\n"
     "                                  film or game out yet / time to watch\n"
     "                                  it = web_search, <title> release date\n"

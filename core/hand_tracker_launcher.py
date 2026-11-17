@@ -16,6 +16,15 @@ process, a heartbeat file and a websocket on 127.0.0.1.
   * stop()   asks the child to exit by removing its lifeline (it also gets a
              terminate after a short grace) and removes the heartbeat files.
              Hand tracking off means NOTHING runs and no frames are copied.
+  * Kinect pump (2026-11-17): start() / stop() also start / stop
+             core.handtrack_depth's Kinect pump, the thread that hands the
+             tracker Kinect colour frames at the sensor's rate (it stands still
+             unless the Kinect is the selected camera and the tracker is alive).
+  * --camera / --det-conf / --presence-conf / --track-conf (2026-11-17): the
+             camera kind the tracker starts with (its size / score limits;
+             each frame's header can still say otherwise) and MediaPipe's three
+             confidences from HAND_TRACK_DET_CONF / _PRESENCE_CONF /
+             _TRACKING_CONF.
 
 Never raises into callers. Stdlib only. Tests: tests/test_hand_tracker_launcher.py
 (fake Popen, fake clock; no real subprocess).
@@ -51,12 +60,75 @@ def _cfg(name: str, default):
         return default
 
 
+CAMERA_KINDS = ("webcam", "kinect")
+CONF_DEFAULT = 0.5
+CONF_MIN, CONF_MAX = 0.05, 0.95
+
+
 def build_argv(python: str, script: str, model: str, port: int,
-               jarvis_pid: int, alive: str, jarvis_alive: str):
-    """The service's command line (a list: no shell)."""
-    return [python, "-u", script, "--host", "127.0.0.1", "--port", str(int(port)),
+               jarvis_pid: int, alive: str, jarvis_alive: str,
+               camera: str = "", det_conf=None, presence_conf=None,
+               track_conf=None):
+    """The service's command line (a list: no shell). ``camera`` (one of
+    CAMERA_KINDS) and the three confidences are only passed when given."""
+    argv = [python, "-u", script, "--host", "127.0.0.1", "--port", str(int(port)),
             "--model", model, "--alive", alive, "--jarvis-pid", str(int(jarvis_pid)),
             "--jarvis-alive", jarvis_alive]
+    if camera in CAMERA_KINDS:
+        argv += ["--camera", camera]
+    for flag, val in (("--det-conf", det_conf), ("--presence-conf", presence_conf),
+                      ("--track-conf", track_conf)):
+        if val is not None:
+            argv += [flag, f"{float(val):.2f}"]
+    return argv
+
+
+def camera_kind() -> str:
+    """"kinect" when the tracker's frames will come from the Kinect
+    (HAND_TRACK_CAMERA, or a Kinect hologram that is up), else "webcam".
+    Live 11-17: the desktop runs HAND_TRACK_CAMERA = "kinect", whose wide view
+    makes hands ~0.065 of the frame height at 1.2 m - under the webcam-tuned
+    0.075 floor, so palm_hold / pinch_hold almost never fired. Never raises."""
+    try:
+        from core import handtrack_depth
+        setting = str(_cfg("HAND_TRACK_CAMERA", "primary") or "primary")
+        eff = handtrack_depth.effective_camera_setting(setting)
+        return "kinect" if handtrack_depth.is_kinect_setting(eff) else "webcam"
+    except Exception:
+        return "webcam"
+
+
+def conf_value(name: str) -> float:
+    """A MediaPipe confidence setting, clamped to CONF_MIN..CONF_MAX; a bad
+    value falls back to CONF_DEFAULT (0.5, MediaPipe's own default)."""
+    try:
+        v = float(_cfg(name, CONF_DEFAULT))
+    except Exception:
+        return CONF_DEFAULT
+    if v != v:                                       # NaN
+        return CONF_DEFAULT
+    return min(CONF_MAX, max(CONF_MIN, v))
+
+
+class _DepthPumpHook:
+    """core.handtrack_depth's Kinect pump, imported when first used (the
+    module-level LAUNCHER's default; tests pass their own or none)."""
+
+    @staticmethod
+    def start() -> bool:
+        try:
+            from core import handtrack_depth
+            return bool(handtrack_depth.start_pump())
+        except Exception:
+            return False
+
+    @staticmethod
+    def stop() -> bool:
+        try:
+            from core import handtrack_depth
+            return bool(handtrack_depth.stop_pump())
+        except Exception:
+            return False
 
 
 class HandTrackerLauncher:
@@ -67,8 +139,11 @@ class HandTrackerLauncher:
                  alive_file: Optional[str] = None,
                  jarvis_file: Optional[str] = None,
                  log_path: Optional[str] = None,
-                 start_keeper: bool = True):
+                 start_keeper: bool = True,
+                 kinect_pump=None):
         self._popen = popen
+        # start() / stop() objects for the Kinect pump (None = no pump: tests).
+        self._kinect_pump = kinect_pump
         self._clock = clock
         self._pid = pid if pid is not None else os.getpid()
         self._log = log
@@ -109,6 +184,7 @@ class HandTrackerLauncher:
             self._wanted = True
             self._gave_up = False
             if self.running():
+                self._pump_start()
                 return True, "already running"
             why = self.prerequisites()
             if why:
@@ -121,6 +197,7 @@ class HandTrackerLauncher:
                 self._wanted = False
                 return False, msg
             self._ensure_keeper()
+            self._pump_start()
             return True, "started"
 
     def stop(self) -> None:
@@ -128,6 +205,7 @@ class HandTrackerLauncher:
             self._wanted = False
             proc = self._proc
             self._proc = None
+        self._pump_stop()
         # Removing the lifeline makes the service exit by itself (it also
         # watches our pid); terminate only if it lingers.
         self._remove(self._jarvis_file)
@@ -161,6 +239,20 @@ class HandTrackerLauncher:
         return self._last_error
 
     # ── internals ───────────────────────────────────────────────────────
+    def _pump_start(self) -> None:
+        if self._kinect_pump is not None:
+            try:
+                self._kinect_pump.start()
+            except Exception:
+                pass
+
+    def _pump_stop(self) -> None:
+        if self._kinect_pump is not None:
+            try:
+                self._kinect_pump.stop()
+            except Exception:
+                pass
+
     def _touch_lifeline(self) -> None:
         try:
             os.makedirs(os.path.dirname(self._jarvis_file) or ".", exist_ok=True)
@@ -180,7 +272,11 @@ class HandTrackerLauncher:
         argv = build_argv(str(_cfg("HAND_TRACK_PYTHON", "")), SERVICE_SCRIPT,
                           str(_cfg("HAND_TRACK_MODEL", "")),
                           int(_cfg("HAND_TRACK_PORT", 8793)), self._pid,
-                          self._alive_file, self._jarvis_file)
+                          self._alive_file, self._jarvis_file,
+                          camera=camera_kind(),
+                          det_conf=conf_value("HAND_TRACK_DET_CONF"),
+                          presence_conf=conf_value("HAND_TRACK_PRESENCE_CONF"),
+                          track_conf=conf_value("HAND_TRACK_TRACKING_CONF"))
         self._argv = argv
         env = {k: v for k, v in os.environ.items() if k not in _STRIP_ENV}
         kw = {"stdin": subprocess.DEVNULL, "stderr": subprocess.STDOUT,
@@ -278,4 +374,4 @@ class HandTrackerLauncher:
         return d
 
 
-LAUNCHER = HandTrackerLauncher()
+LAUNCHER = HandTrackerLauncher(kinect_pump=_DepthPumpHook())

@@ -17,7 +17,9 @@ THE SEGMENT  (name ``jarvis_handtrack_frame``; all little-endian)
       24     4  width            uint32 (640)
       28     4  height           uint32 (480)
       32     4  channels         uint32 (3, BGR, uint8, row-major)
-      36     4  (reserved)
+      36     4  source           uint32 which camera this frame came from
+                                  (0 unknown / older writer, 1 webcam, 2 Kinect;
+                                  2026-11-17, was reserved = 0)
       40     8  seq_begin        uint64, set to seq+1 BEFORE the copy
       48    16  (reserved, zero)
       64   w*h*c pixel bytes
@@ -68,12 +70,24 @@ HEADER_SIZE = 64
 FRAME_BYTES = WIDTH * HEIGHT * CHANNELS
 TOTAL_SIZE = HEADER_SIZE + FRAME_BYTES
 
-# magic, seq, timestamp_ms, width, height, channels, reserved, seq_begin
+# magic, seq, timestamp_ms, width, height, channels, source, seq_begin
 _HEAD_FMT = "<8sQQIIIIQ"
 _HEAD_BYTES = struct.calcsize(_HEAD_FMT)          # 48
 OFF_SEQ = 8
 OFF_WH = 24                    # width, height (u32 each)
+OFF_SOURCE = 36
 OFF_SEQ_BEGIN = 40
+
+# Which camera a frame came from (header field ``source``, 2026-11-17). The
+# tracker picks its size / score limits per frame from it (Kinect wide view vs
+# a close webcam, tools/handtrack_gestures.py CAMERA_LIMITS): the camera can
+# change while the tracker runs - "open the hologram with the Kinect" borrows
+# the Kinect for as long as that hologram is up (handtrack_depth.holo_session)
+# - so a flag fixed at spawn alone would be wrong for that whole session.
+SOURCE_UNKNOWN = 0
+SOURCE_WEBCAM = 1
+SOURCE_KINECT = 2
+SOURCE_NAMES = {SOURCE_WEBCAM: "webcam", SOURCE_KINECT: "kinect"}
 
 ALIVE_MAX_AGE_S = 3.0          # tracker heartbeat older than this = inactive
 ALIVE_CHECK_EVERY_S = 0.5      # how often the heartbeat file is stat()ed
@@ -114,9 +128,10 @@ def file_age_s(path: str, now: Optional[float] = None) -> Optional[float]:
 
 def pack_header(seq: int, timestamp_ms: int, width: int = WIDTH,
                 height: int = HEIGHT, channels: int = CHANNELS,
-                seq_begin: Optional[int] = None) -> bytes:
+                seq_begin: Optional[int] = None,
+                source: int = SOURCE_UNKNOWN) -> bytes:
     head = struct.pack(_HEAD_FMT, MAGIC, seq, timestamp_ms, width, height,
-                       channels, 0, seq if seq_begin is None else seq_begin)
+                       channels, int(source), seq if seq_begin is None else seq_begin)
     return head.ljust(HEADER_SIZE, bytes(1))
 
 
@@ -125,13 +140,22 @@ def unpack_header(buf) -> Optional[dict]:
     try:
         if len(buf) < HEADER_SIZE:
             return None
-        magic, seq, ts, w, h, ch, _res, begin = struct.unpack_from(_HEAD_FMT, buf, 0)
+        magic, seq, ts, w, h, ch, src, begin = struct.unpack_from(_HEAD_FMT, buf, 0)
     except Exception:
         return None
     if magic != MAGIC:
         return None
     return {"seq": seq, "timestamp_ms": ts, "width": w, "height": h,
-            "channels": ch, "seq_begin": begin}
+            "channels": ch, "seq_begin": begin, "source": src}
+
+
+def frame_source(buf) -> str:
+    """"kinect" / "webcam" for the newest frame in ``buf``, "" when the writer
+    did not say (an older JARVIS) or the buffer is not ours. Never raises."""
+    hdr = unpack_header(buf)
+    if hdr is None:
+        return ""
+    return SOURCE_NAMES.get(int(hdr.get("source", 0)), "")
 
 
 def fit_size(w: int, h: int) -> Tuple[int, int]:
@@ -275,13 +299,15 @@ class HandTrackFrames:
                 pass
 
     # ── the hot path ────────────────────────────────────────────────────
-    def publish(self, frame) -> bool:
+    def publish(self, frame, source: int = SOURCE_WEBCAM) -> bool:
         """Publish ``frame`` (BGR uint8, any size) if the tracker is alive.
-        Returns True when a frame was written. Never raises."""
+        ``source``: SOURCE_WEBCAM (every webcam path here) or SOURCE_KINECT
+        (core/handtrack_depth.KinectFeed). Returns True when a frame was
+        written. Never raises."""
         with self._pub_lock:
-            return self._publish(frame)
+            return self._publish(frame, source)
 
-    def _publish(self, frame) -> bool:
+    def _publish(self, frame, source: int = SOURCE_WEBCAM) -> bool:
         try:
             if not self.active():
                 if (self._shm is not None and self._inactive_since
@@ -309,6 +335,11 @@ class HandTrackFrames:
             struct.pack_into("<Q", buf, OFF_SEQ_BEGIN, nxt)
             self._view_for(tw, th)[:, :, :] = small
             struct.pack_into("<II", buf, OFF_WH, tw, th)
+            try:
+                src = int(source) & 0xFFFFFFFF
+            except Exception:
+                src = SOURCE_UNKNOWN
+            struct.pack_into("<I", buf, OFF_SOURCE, src)
             struct.pack_into("<QQ", buf, OFF_SEQ, nxt, ts)   # seq then timestamp
             self._seq = nxt
             self._last_pub = now

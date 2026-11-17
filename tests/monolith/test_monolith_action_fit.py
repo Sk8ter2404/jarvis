@@ -94,6 +94,8 @@ class _Base(MonolithGlobalsTestCase):
 @requires_monolith
 class ShadowTests(_Base):
     def test_c006_runs_and_logs(self):
+        # The generic shadow path, with the 2026-11-17 game-mode guard off.
+        self._p(self.bc, "ACTION_FIT_GAME_MODE_ENFORCE", False, create=True)
         _c, results = self._dispatch("Certainly, sir. [ACTION: game_mode_on]",
                                      _C006)
         self.game_on.assert_called_once()
@@ -101,6 +103,18 @@ class ShadowTests(_Base):
         self.assertEqual(results[0], ("game_mode_on",
                                       "Game mode engaged, sir.",
                                       results[0][2]))
+
+    def test_c006_is_skipped_in_shadow_by_the_game_mode_guard(self):
+        # 2026-11-17 (ACTION_FIT_GAME_MODE_ENFORCE, default True; Dell 12:46
+        # "Jarvis is running on Quinn36B"): game mode ON is enforced in shadow
+        # and JARVIS says he skipped it (a terminal line).
+        self._p(self.bc, "ACTION_FIT_GAME_MODE_ENFORCE", True, create=True)
+        _c, results = self._dispatch("Certainly, sir. [ACTION: game_mode_on]",
+                                     _C006)
+        self.game_on.assert_not_called()
+        self.assertIn("[action-fit] blocked game_mode_on", self.log)
+        line = self.bc._terminal_failure_text(results[0][1])
+        self.assertIn("skipped game mode", line)
 
     def test_c030_runs_and_logs(self):
         self._dispatch("Very good. [ACTION: list_smart_home_devices]", _C030)
@@ -112,6 +126,9 @@ class ShadowTests(_Base):
 @requires_monolith
 class OnTests(_Base):
     def test_c006_is_refused_without_running(self):
+        # The generic 'on' refusal (the 2026-11-17 game-mode guard off; with
+        # it on the result is its terminal line, see ShadowTests).
+        self._p(self.bc, "ACTION_FIT_GAME_MODE_ENFORCE", False, create=True)
         _c, results = self._dispatch("On it, sir. [ACTION: game_mode_on]",
                                      _C006, mode="on")
         self.game_on.assert_not_called()

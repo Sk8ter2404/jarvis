@@ -205,6 +205,19 @@ class SourceTests(unittest.TestCase):
             nxt = src.index("_boot_listening.set()", at)
             self.assertLess(nxt - at, 160, line)
 
+    def test_the_sleeping_standby_listen_sets_the_event_too(self):
+        # 2026-11-17 (Dell 12:32): wake-word mode boots asleep, so only the
+        # "Sleeping… (say 'JARVIS' to wake)" listen runs at first; without
+        # the event there the first camera open waited the whole cap.
+        src = _source()
+        start = src.index("\ndef _handle_sleep_standby(")
+        body = src[start:src.index("\ndef ", start + 1)]
+        at = body.index("(say 'JARVIS' to wake)")
+        nxt = body.index("_boot_listening.set()", at)
+        self.assertLess(nxt - at, 600)
+        # It must be on the mic-listen path, before the capture starts.
+        self.assertLess(nxt, body.index("_tt_rec_since = _tt(\"now\")", at))
+
     def test_config_default_is_bounded_and_machine_local(self):
         from core import config, peer_settings
         self.assertGreater(config.CAMERA_FIRST_OPEN_WAIT_S, 0)

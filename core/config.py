@@ -1010,11 +1010,19 @@ FOLLOWUP_UNSURE_COMMANDS_ONLY = True
 # Whisper should expect (faster-whisper "hotwords"). STT_REPLACEMENTS: phrases Whisper
 # keeps mishearing -> what was said ({"a cello": "Zorblat"}), whole words, every
 # transcript. SITE_SHORTCUTS: {"name": "https://..."} so "open <name>" (also on a
-# monitor) opens that page. All empty by default; set in user_settings.json.
+# monitor) opens that page. Set in user_settings.json; empty by default except
+# STT_REPLACEMENTS' built-in name fixes below (2026-11-17).
 # STT_HOTWORDS also applies LIVE: an edit to user_settings.json after start reaches
 # the next transcription (core/stt_vocab.live_hotwords); the other two need a restart.
 STT_HOTWORDS = ""
-STT_REPLACEMENTS: dict = {}
+# 2026-11-17 built-in entries (both engines; user_settings.json MERGES into this
+# dict, so the owner's own entries are kept, and private names live only there):
+# live 11-16 23:57:51 "how's the Yetsi pace doing?" (the Etsy page) ->
+# project_status.
+STT_REPLACEMENTS: dict = {
+    "yetsi": "Etsy", "yetsy": "Etsy", "etsey": "Etsy",
+    "yetsi pace": "Etsy page", "yetsy pace": "Etsy page",
+}
 SITE_SHORTCUTS: dict = {}
 
 # Owner-only learning (core/learn_gate.py). When True, JARVIS learns facts,
@@ -2074,6 +2082,27 @@ LOOK_RETRY_ROUTE = True
 # every rule off). "What is this" may be the screen and never counts. False: no
 # rule 8. Applies on the next start.
 ACTION_FIT_CAMERA_ASK_ENFORCE = True
+# ACTION_FIT_GAME_MODE_ENFORCE (bool, 2026-11-17; core/action_fit rule 2) -
+# live on the Dell 11-17 12:46: "Jarvis is running on Quinn36B" ran
+# game_mode_on (brain swapped down, cameras stopped) while action-fit only
+# logged "would block". True (default): game_mode_on (and its alias
+# low_power_mode) does not run when sir's words have no game / gaming / play /
+# Fortnite / mode / power / performance word, even while ACTION_FIT_MODE is
+# 'shadow'; JARVIS says he skipped it and why (bobert_companion.
+# _game_mode_fit_refusal). game_mode_off is unchanged. ACTION_FIT_MODE 'off'
+# still turns every rule off. False: rule 2 as before. Applies on the next start.
+ACTION_FIT_GAME_MODE_ENFORCE = True
+# AWAY_RECAP_ROUTE (bool, 2026-11-17; core/owner_presence.is_away_recap_ask) -
+# live 16:02:13 "did you log anything while I was at school today?" got a
+# false "I've checked the logs, sir" and then the Claude-chats status; the real
+# "While you were away" recap waited in the queue until 16:02:41. True
+# (default): "did anything happen / did you log anything / what happened while
+# I was away / at school / gone" drains the speech queue at once with no brain
+# call (bobert_companion._away_recap_shortcut); with nothing queued he repeats
+# the recap he gave in the last 3 hours, or says nothing was waiting. A
+# question naming its own subject (Teams, email, a print...) is not routed.
+# False: the brain answers, as before. Applies on the next start.
+AWAY_RECAP_ROUTE = True
 # CAMERA_CLAIM_CHECK (bool, v3.0.11; core/claim_validator.find_camera_claim) -
 # live 2026-11-05 14:58:04 and 14:58:33: what sir was holding, stated as fact
 # with no look. True (default): in your turn a sentence saying what he is
@@ -4395,3 +4424,54 @@ def _apply_user_settings() -> None:
 
 
 _apply_user_settings()
+
+
+# ── Hand tracker: MediaPipe confidences (2026-11-17, hand-tracking builder) ──
+# One block at the very end so parallel edits never collide. Live 11-17
+# 16:03-16:11 (desktop, Kinect, dusk): 9 releases with Left/Right swapped and
+# 38 re-grabs fit MediaPipe dropping its track whenever presence / tracking
+# confidence dipped under its hard-coded 0.5 on dim, blurred frames.
+# core/hand_tracker_launcher.py passes these to tools/hand_tracker_service.py
+# (--det-conf / --presence-conf / --track-conf), clamped to 0.05-0.95; they
+# apply when the tracker next starts. 0.5 = MediaPipe's own default (no change).
+# Worth trying at dusk: 0.4 / 0.4 / 0.3 - false triggers stay guarded by the
+# separate size / score limits in tools/handtrack_gestures.py.
+#   HAND_TRACK_DET_CONF       palm detection (a NEW hand is found)
+#   HAND_TRACK_PRESENCE_CONF  is the tracked hand still there
+#   HAND_TRACK_TRACKING_CONF  landmark tracking (under it: re-run detection)
+HAND_TRACK_DET_CONF = 0.5
+HAND_TRACK_PRESENCE_CONF = 0.5
+HAND_TRACK_TRACKING_CONF = 0.5
+_HAND_TRACK_CONF_KEYS = ("HAND_TRACK_DET_CONF", "HAND_TRACK_PRESENCE_CONF",
+                         "HAND_TRACK_TRACKING_CONF")
+
+
+def _apply_hand_track_conf_settings() -> None:
+    """These three sit AFTER the boot-time _apply_user_settings() call above, so
+    a saved value in data/user_settings.json is applied here, for these keys
+    only (same file, same utf-8-sig read; a value outside 0-1 or not a number
+    is ignored). A later manual _apply_user_settings() covers them too. Never
+    raises."""
+    try:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "data", "user_settings.json")
+        if not os.path.exists(path):
+            return
+        with open(path, "r", encoding="utf-8-sig") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return
+        g = globals()
+        for key in _HAND_TRACK_CONF_KEYS:
+            if key in data:
+                try:
+                    v = float(data[key])
+                except Exception:
+                    continue
+                if 0.0 < v <= 1.0:
+                    g[key] = v
+    except Exception:
+        return
+
+
+_apply_hand_track_conf_settings()

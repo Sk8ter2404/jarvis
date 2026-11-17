@@ -61,6 +61,77 @@ const TESTS = [
   ["thresholds are sane", () => {
     if (!(T.INFO_HOLD_S >= 0.5 && T.INFO_HOLD_S <= 2)) throw new Error("INFO_HOLD_S");
     if (!(T.SPIN_MAX > 0 && T.SPIN_GAIN > 0)) throw new Error("spin consts");
+    // 2026-11-17: one dropped frame at ~8 fps must not let go
+    if (!(T.PINCH_RELEASE_S >= 0.3 && T.PINCH_RELEASE_S <= 0.5)) throw new Error("PINCH_RELEASE_S");
+    if (!(T.HAND_LOST_S >= 0.3 && T.HAND_LOST_S <= 0.5)) throw new Error("HAND_LOST_S");
+  }],
+  // ---- grab stability (2026-11-17; live 11-17 16:03-16:11 on the Kinect at dusk:
+  // 38 re-grabs, 9 releases on the other side than the grab)
+  ["grab: a hand missing for a moment keeps the grab; missing too long lets go", () => {
+    const s = new MockScene(), r = new GestureRouter(s);
+    r.onGesture({ name: "fist_grab", side: "Right", pos: [0.5, 0.5] });
+    r.update([hand("Right", "fist")], 0.03);
+    for (let i = 0; i < 10; i++) r.update([], 0.03);                    // 0.3 s unseen
+    if (!r.grab) throw new Error("dropped after 0.3 s");
+    r.update([hand("Right", "fist", { palm: [0.55, 0.5] })], 0.03);
+    eq(s.calls.filter(c => c[0] === "target").pop()[1], 550, "follows again");
+    for (let i = 0; i < 15; i++) r.update([], 0.03);                    // 0.45 s unseen
+    eq(r.grab, null, "kept a lost hand too long");
+  }],
+  ["grab: a Left/Right label flip in place keeps holding", () => {
+    const s = new MockScene(), r = new GestureRouter(s);
+    r.onGesture({ name: "fist_grab", side: "Right", pos: [0.5, 0.5] });
+    r.update([hand("Right", "fist", { palm: [0.5, 0.5] })], 0.03);
+    for (let i = 0; i < 20; i++) r.update([hand("Left", "fist", { palm: [0.52, 0.5] })], 0.03);
+    if (!r.grab) throw new Error("a label flip dropped the reactor");
+    eq(r.grab.side, "Left");
+    eq(s.calls.filter(c => c[0] === "target").pop()[1], 520);
+    // the flipped release (live: "fist_grab Right" then "fist_release Left") still lets go
+    r.onGesture({ name: "fist_release", side: "Left", pos: [0.52, 0.5] });
+    eq(r.grab, null);
+  }],
+  ["grab: the nearest fist holds it, not the one with the old label", () => {
+    const s = new MockScene(), r = new GestureRouter(s);
+    r.onGesture({ name: "fist_grab", side: "Right", pos: [0.5, 0.5] });
+    // labels swapped: the holder now reads "Left", the far hand reads "Right"
+    r.update([hand("Left", "fist", { palm: [0.51, 0.5] }),
+              hand("Right", "fist", { palm: [0.9, 0.5] })], 0.03);
+    eq(s.calls.filter(c => c[0] === "target").pop()[1], 510, "followed the far hand");
+    // the far hand letting go of ITS fist does not end this grab
+    r.onGesture({ name: "fist_release", side: "Right", pos: [0.9, 0.5] });
+    if (!r.grab) throw new Error("the other hand's release ended the grab");
+  }],
+  ["grab: an open hand still lets go after the release time", () => {
+    const s = new MockScene(), r = new GestureRouter(s);
+    r.onGesture({ name: "fist_grab", side: "Right", pos: [0.5, 0.5] });
+    r.update([hand("Right", "fist")], 0.03);
+    r.update([hand("Right", "open")], 0.2);
+    if (!r.grab) throw new Error("let go inside the jitter guard");
+    r.update([hand("Right", "open")], 0.2);
+    eq(r.grab, null);
+  }],
+  ["pull: a pulled part survives a label flip and a short loss", () => {
+    const s = new MockScene(), r = new GestureRouter(s);
+    s.exploded = true;
+    r.update([hand("Right", "pinch")], 0.03);
+    r.onGesture({ name: "pinch_start", side: "Right", pos: [0.5, 0.5] });
+    eq(s.count("pull"), 1);
+    r.update([hand("Left", "pinch")], 0.03);                            // label flip
+    for (let i = 0; i < 10; i++) r.update([], 0.03);                    // 0.3 s unseen
+    r.update([hand("Left", "pinch")], 0.03);
+    eq(s.count("release"), 0, "dropped the part");
+    for (let i = 0; i < 15; i++) r.update([], 0.03);
+    eq(s.count("release"), 1, "kept a lost pinch too long");
+  }],
+  ["two pinching hands scale even when both carry the same label", () => {
+    const s = new MockScene(), r = new GestureRouter(s);
+    const a = hand("Right", "pinch"), b = hand("Right", "pinch");
+    a.lm = makeLandmarks({ x: 0.3, y: 0.5, pinch: true });
+    b.lm = makeLandmarks({ x: 0.6, y: 0.5, pinch: true });
+    r.update([a, b], 0.03);
+    b.lm = makeLandmarks({ x: 0.9, y: 0.5, pinch: true });
+    r.update([a, b], 0.03);
+    if (!(s.scale > 1.5)) throw new Error("scale did not grow: " + s.scale);
   }],
   ["mapToScreen desktop stretches", () => {
     const p = mapToScreen(0.5, 0.25, 1000, 800, "desktop", 4 / 3);
@@ -152,7 +223,7 @@ const TESTS = [
     eq(s.count("info"), 0);
     for (let i = 0; i < 20; i++) r.update([h], 0.03);   // 1.2 s
     eq(s.count("info"), 1);
-    r.update([hand("Right", "open")], 0.2);
+    r.update([hand("Right", "open")], T.PINCH_RELEASE_S + 0.05);
     eq(s.count("release"), 1);
     eq(s.calls.filter(c => c[0] === "info").pop()[1], null, "info cleared");
   }],
@@ -385,7 +456,7 @@ TESTS.push(
     const s = new MockScene(), r = new GestureRouter(s);
     r.onGesture({ name: "fist_grab", side: "Right", pos: [0.5, 0.5] });
     r.update([hand("Right", "fist", { z: 0.9 })], 0.03);
-    r.update([hand("Right", "open", { z: 0.9 })], 0.3);              // let go without fist_release
+    r.update([hand("Right", "open", { z: 0.9 })], T.PINCH_RELEASE_S + 0.05);  // let go without fist_release
     eq(s.count("ppEnd"), 1);
     const bare = new MockScene();
     bare.beginPushPull = bare.pushPull = bare.endPushPull = undefined;

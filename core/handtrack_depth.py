@@ -12,8 +12,11 @@ page can be hidden behind real objects (occlusion) and pushed / pulled in depth.
 Both are OFF by default (a hologram opened by voice "with the Kinect" turns them on
 for exactly as long as that hologram is up, see ``holo_session`` - no setting is
 rewritten). Nothing here opens the Kinect: ``KinectFeed.step()`` is
-called by the face-tracking loop (the thread that already reads Kinect colour
-for the preview composite) and only uses the bridge's own accessors
+called by the Kinect PUMP below (2026-11-17, a daemon thread that polls the
+sensor's colour clock every ~10 ms while the tracker is alive and the Kinect is
+selected) and, when no pump is feeding, by the face-tracking loop (the thread
+that already reads Kinect colour for the preview composite). Either way it
+only uses the bridge's own accessors
 (``get_stream_health`` for "is a runtime open", ``frame_clock`` to skip a frame
 it already sent, ``get_color_bgr`` / ``get_depth`` for the pixels), so the
 bridge's freshness rules apply unchanged and the pump is never touched. It
@@ -92,8 +95,9 @@ from __future__ import annotations
 
 import math
 import struct
+import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 DEPTH_SHM_NAME = "jarvis_handtrack_depth"
 MAGIC = b"JVHD0001"
@@ -121,8 +125,21 @@ OFF_WH = 24
 OFF_SEQ_BEGIN = 40
 OFF_COLOR_SEQ = 48
 
-MAX_FPS = 15.0
-MIN_GAP_S = 0.06                  # ~16 fps ceiling; the loop's own pace (~12-15) rules
+# 2026-11-17: was MAX_FPS 15 / MIN_GAP_S 0.06, when the face loop's own pace
+# (~7-10 passes/s on the desktop: a webcam read + preview + face pass + a fixed
+# 50 ms nap) was the real limit anyway. Live 11-17 16:03-16:11 (holo on the
+# Kinect, dusk) that pace lost the hand for 2+ frames often enough to restart
+# grabs: 38 fist_grab with no release between, 12 repeated pinch_start. The
+# Kinect pump below now steps the feed at the SENSOR's rate (30 fps colour),
+# so the cap only has to stop a flood: 25 ms, not 33, so a frame that lands a
+# little early after a late one is not dropped (the 1/32 lesson in
+# handtrack_frames.MIN_PUBLISH_GAP_S).
+MAX_FPS = 30.0
+MIN_GAP_S = 0.025
+# The depth plane keeps its old ceiling (~16/s, ~29 KB each on the wire): the
+# hologram's occlusion / push-pull never needed more, and registering a plane
+# is the costly half of a step.
+DEPTH_MIN_GAP_S = 0.06
 # The Kinect v2 colour image arrives MIRRORED (the SDK's own orientation, as
 # the depth image does), while the published frame must be the sensor's TRUE
 # orientation, like a webcam's: the tracker mirrors every frame once for its
@@ -150,6 +167,10 @@ COLOR_FOV = (84.1, 53.8)
 
 
 KINECT_WORDS = ("kinect", "kinect2", "kinect v2", "kinect_v2")
+# core/handtrack_frames.SOURCE_KINECT (the colour frame header's "source",
+# 2026-11-17), spelled here so this module imports nothing from JARVIS at load
+# time; a test pins the two equal.
+_SOURCE_KINECT = 2
 
 
 def is_kinect_setting(setting) -> bool:
@@ -485,6 +506,7 @@ class KinectFeed:
         self._clock = clock
         self.depth_writer = depth_writer if depth_writer is not None else DepthWriter()
         self._last_pub = -1e9
+        self._last_depth_pub = -1e9
         self._color_clock = None
         self._backoff_until = 0.0
         self._calib: Optional[Calib] = None
@@ -570,24 +592,27 @@ class KinectFeed:
         if now - self._last_pub < MIN_GAP_S:
             return self._note("rate cap")
         kb = self._bridge_mod()
-        health = kb.get_stream_health() or {}
-        if not health.get("open") or health.get("enabled") is False:
-            return self._note("kinect not open")
+        # The colour clock first (2026-11-17): it is a pure attribute peek, and
+        # the pump asks ~100 times a second, so "nothing new yet" must not pay
+        # for the health dict. It opens nothing (BridgeContractTests).
         clk = kb.frame_clock("color") if hasattr(kb, "frame_clock") else None
         if clk is not None and clk == self._color_clock:
             return self._note("no new colour")
+        health = kb.get_stream_health() or {}
+        if not health.get("open") or health.get("enabled") is False:
+            return self._note("kinect not open")
         frame = kb.get_color_bgr(require_new=False)
         if frame is None:
             return self._note("no colour frame")
         if KINECT_COLOR_MIRRORED:
             frame = frame[:, ::-1].copy()        # back to the true orientation
-        if not wr.publish(frame):
+        if not wr.publish(frame, source=_SOURCE_KINECT):
             return self._note("writer declined")
         self._last_pub = now
         self._color_clock = clk
         self.color_frames += 1
         color_seq = int(wr.status().get("seq", 0))
-        if self.depth_wanted():
+        if self.depth_wanted() and now - self._last_depth_pub >= DEPTH_MIN_GAP_S:
             self._depth_step(kb, now, color_seq)
         return self._note("")
 
@@ -602,6 +627,7 @@ class KinectFeed:
         if self.depth_writer.publish(plane, color_seq, calib.method):
             self.depth_frames += 1
             self.last_depth_at = now
+            self._last_depth_pub = now
 
     def _idle_close(self) -> None:
         now = self._clock()
@@ -653,17 +679,232 @@ def holo_session() -> bool:
 FEED = KinectFeed(session=holo_session)
 
 
-def publish_kinect() -> str:
-    """The ONE call the face-tracking loop makes per pass. Never raises."""
+# ── the Kinect pump (2026-11-17) ──────────────────────────────────────────
+# WHY: live 11-17 16:03-16:11 (desktop, HAND_TRACK_CAMERA = "kinect", holo on
+# the Kinect, dusk) the tracker only got a Kinect frame once per pass of the
+# face-tracking loop - the webcam read, the preview, a face pass and a fixed
+# 50 ms nap per pass, about 7-10 frames/s (the webcam path has its own reader,
+# handtrack_frames.FramePump; the Kinect had none). Two missed frames were
+# past the gesture engine's track-drop time, so grabs and pinches restarted:
+# 38 fist_grab with no release between, 12 repeated pinch_start, 9 releases
+# with Left/Right swapped, 1 pinch_hold out of 51 pinches.
+#
+# WHAT: ONE daemon thread that polls the bridge's colour frame clock every
+# PUMP_POLL_S and steps FEED whenever the sensor has a new frame - only while
+# the tracker is alive (its heartbeat, handtrack_frames.WRITER.active()), the
+# Kinect is the selected camera (HAND_TRACK_CAMERA or a Kinect hologram) and
+# the face loop's own camera_off gate is clear (low-memory event / standby).
+# Otherwise it naps PUMP_IDLE_S and leaves the face loop's per-pass call to do
+# what it always did. The core builder's hook asks pump_running() to skip that
+# per-pass call (and the loop's 50 ms nap) while the pump feeds; publish_kinect()
+# is a no-op then anyway, so the feed is never stepped by two threads (plus
+# _STEP_LOCK, belt and braces).
+#
+# It opens nothing and owns nothing: the same read accessors the face loop
+# used (KinectFeed contract), from one more reader thread - the bridge's
+# accessors read inside _reading(rt), which is what already lets the face loop
+# and the body pump share a runtime. Started / stopped with the tracker
+# (core/hand_tracker_launcher.py). Never more than one thread.
+PUMP_POLL_S = 0.010               # colour clock poll while feeding (sensor: 33 ms)
+PUMP_IDLE_S = 0.25                # nap while not feeding (no tracker / other camera)
+PUMP_JOIN_S = 1.0                 # stop() waits this long for an in-flight step
+
+_STEP_LOCK = threading.Lock()
+
+
+def _camera_on() -> bool:
+    """The face loop's own gate, read from the running monolith: False while
+    ``_face_track_camera_off`` (the low-memory guard) is set or JARVIS is in
+    standby - the loop does not feed the tracker then, so neither does the
+    pump. Not running inside JARVIS (tests, a tool): True. Fails CLOSED on an
+    odd attribute (the loop's per-pass call then decides, as before)."""
     try:
-        return FEED.step()
+        import sys
+        bc = sys.modules.get("bobert_companion") or sys.modules.get("__main__")
+        ev = getattr(bc, "_face_track_camera_off", None)
+        if ev is not None and ev.is_set():
+            return False
+        sb = getattr(bc, "_standby_mode", None)
+        if isinstance(sb, list) and sb and bool(sb[0]):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+class KinectPump:
+    """The paced Kinect reader for the hand tracker. One instance (``PUMP``).
+
+    Collaborators are injectable so tests never start a real Kinect read:
+      feed     a KinectFeed-like object (default: the module's FEED, per call)
+      gate     () -> False to stand still (default for PUMP: _camera_on)
+    """
+
+    def __init__(self, feed=None, gate: Optional[Callable[[], bool]] = None,
+                 poll_s: float = PUMP_POLL_S, idle_s: float = PUMP_IDLE_S,
+                 step_lock=None):
+        self._feed = feed
+        self._gate = gate
+        self._poll_s = float(poll_s)
+        self._idle_s = float(idle_s)
+        self._step_lock = step_lock if step_lock is not None else _STEP_LOCK
+        self._mu = threading.Lock()
+        self._thread: Optional[threading.Thread] = None
+        self._stop: Optional[threading.Event] = None
+        self._feeding = False
+        self.starts = 0
+        self.steps = 0
+        self.published = 0
+        self.last_error = ""
+
+    def _f(self):
+        return self._feed if self._feed is not None else FEED
+
+    # -- lifecycle -----------------------------------------------------
+    def start(self) -> bool:
+        """Start the thread unless one is already running. True when this call
+        started it. Never raises."""
+        try:
+            with self._mu:
+                if self._thread is not None and self._thread.is_alive():
+                    return False
+                stop = threading.Event()
+                t = threading.Thread(target=self._run, args=(stop,),
+                                     name="handtrack-kinect-pump", daemon=True)
+                self._thread, self._stop = t, stop
+                self.starts += 1
+                t.start()
+                return True
+        except Exception as e:
+            self.last_error = f"{type(e).__name__}: {e}"
+            return False
+
+    def stop(self, timeout: float = PUMP_JOIN_S) -> bool:
+        """Stop the thread and wait (up to ``timeout``) for its in-flight step.
+        True when a thread was running. Never raises."""
+        try:
+            with self._mu:
+                t, stop = self._thread, self._stop
+                self._thread, self._stop = None, None
+                self._feeding = False
+            if stop is not None:
+                stop.set()
+            if t is not None and t is not threading.current_thread():
+                t.join(timeout)
+            return t is not None
+        except Exception:
+            return False
+
+    def alive(self) -> bool:
+        t = self._thread
+        return t is not None and t.is_alive()
+
+    def running(self) -> bool:
+        """The thread is up AND feeding the tracker right now (the face loop's
+        per-pass call is then redundant)."""
+        return self._feeding and self.alive()
+
+    # -- the thread ----------------------------------------------------
+    def _should_feed(self, feed) -> bool:
+        if self._gate is not None and not self._gate():
+            return False
+        if not feed.kinect_selected():
+            return False
+        return bool(feed._frames_mod().active())
+
+    def _set_feeding(self, stop: threading.Event, value: bool) -> None:
+        # Only the CURRENT thread may say "feeding": a stopped thread finishing
+        # its last pass must never flip a newer thread's flag.
+        with self._mu:
+            if self._stop is stop:
+                self._feeding = value
+
+    def _run(self, stop: threading.Event) -> None:
+        try:
+            while not stop.is_set():
+                feed = self._f()
+                try:
+                    feeding = self._should_feed(feed)
+                except Exception as e:
+                    self.last_error = f"{type(e).__name__}: {e}"
+                    feeding = False
+                self._set_feeding(stop, feeding)
+                if not feeding:
+                    stop.wait(self._idle_s)
+                    continue
+                try:
+                    with self._step_lock:
+                        if stop.is_set():
+                            break
+                        reason = feed.step()      # KinectFeed.step never raises
+                except Exception as e:            # a stand-in that does: nap, go on
+                    self.last_error = f"{type(e).__name__}: {e}"
+                    stop.wait(self._idle_s)
+                    continue
+                self.steps += 1
+                if reason == "":
+                    self.published += 1
+                stop.wait(self._poll_s)
+        except Exception as e:                    # pragma: no cover - defensive
+            self.last_error = f"{type(e).__name__}: {e}"
+        finally:
+            self._set_feeding(stop, False)
+
+    def status(self) -> dict:
+        return {"alive": self.alive(), "feeding": self.running(),
+                "starts": self.starts, "steps": self.steps,
+                "published": self.published, "last_error": self.last_error}
+
+
+PUMP = KinectPump(gate=_camera_on)
+
+
+def start_pump() -> bool:
+    """Start the Kinect pump (idempotent: never a second thread). The hand
+    tracker launcher calls this when it starts the tracker. Never raises."""
+    try:
+        return PUMP.start()
+    except Exception:
+        return False
+
+
+def stop_pump() -> bool:
+    """Stop the Kinect pump (the launcher, when tracking stops). Never raises."""
+    try:
+        return PUMP.stop()
+    except Exception:
+        return False
+
+
+def pump_running() -> bool:
+    """True while the pump is feeding the tracker Kinect frames itself, so the
+    face loop need not call publish_kinect() (nor nap for it). Never raises."""
+    try:
+        return PUMP.running()
+    except Exception:
+        return False
+
+
+def publish_kinect() -> str:
+    """The ONE call the face-tracking loop makes per pass. A no-op ("pump")
+    while the pump feeds the tracker (2026-11-17). Never raises."""
+    try:
+        if PUMP.running():
+            return "pump"
+        with _STEP_LOCK:
+            return FEED.step()
     except Exception:
         return "error"
 
 
 def feed_status() -> dict:
     try:
-        return FEED.status()
+        st = FEED.status()
+        try:
+            st["pump"] = PUMP.status()
+        except Exception:
+            pass
+        return st
     except Exception:
         return {"selected": False, "depth_wanted": False, "depth_active": False}
 

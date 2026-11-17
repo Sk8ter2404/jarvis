@@ -292,3 +292,80 @@ def plan_return_drain(items: list, *, now: float, stale_s: float,
         return out, dropped, folded
     except Exception:
         return list(items), [], []
+
+
+# ── "Did anything happen while I was away?" (2026-11-17) ────────────────────
+# Live 16:02:13: "did you log anything while I was at school today?" went to
+# the brain, which said "I've checked the logs, sir - nothing worth noting"
+# with no action (the validator blocked it), then ran agents_status (Claude
+# chats). The real away recap only came 28 s later, from the queue drain
+# (16:02:41 "While you were away, sir: ..."). bobert_companion.
+# _away_recap_shortcut answers these questions from the queue, before the
+# model is called. Both halves are needed: an away clause ("while I was at
+# school / away / gone / out") AND a generic ask ("did you log anything", "did
+# anything happen", "what happened", "anything come up"). A question naming
+# its own subject (Teams, email, a print, the server, ...) is left to the
+# router and the brain: it has its own action.
+_AWAY_CLAUSE_RE = re.compile(
+    r"\b(?:while|when)\s+i\s*(?:was|were|'?ve\s+been|have\s+been)\s+"
+    r"(?:away|gone|out|asleep|sleeping|at\s+(?:school|work|class|the\s+gym|"
+    r"uni|college|the\s+store))\b"
+    r"|\bsince\s+i\s+(?:left|got\s+back|was\s+gone)\b", re.IGNORECASE)
+_AWAY_ASK_RE = re.compile(
+    r"\b(?:did|have)\s+you\s+(?:log|logged|note|noted|record|recorded|catch|"
+    r"caught|notice|noticed|see|seen)\s+anything\b"
+    r"|\b(?:did|has)\s+anything\s+(?:happen|happened|come\s+up|change|"
+    r"changed|go\s+on)\b"
+    r"|\banything\s+(?:happen|happened|come\s+up|new|i\s+should\s+know|"
+    r"to\s+report|worth\s+knowing)\b"
+    r"|\bwhat\s+(?:happened|went\s+on|did\s+i\s+miss|came\s+up)\b",
+    re.IGNORECASE)
+_AWAY_OWN_SUBJECT_RE = re.compile(
+    r"\b(?:teams|e-?mails?|mail|inbox|messages?|texts?|notifications?|calls?|"
+    r"voicemail|discord|slack|tv|show|episode|print|prints|printer|printing|"
+    r"server|unraid|plex|backup|download|downloads|stock|price|game|score|"
+    r"weather|news|package|delivery|door|camera|cameras)\b", re.IGNORECASE)
+
+AWAY_NOTHING_WAITING_LINE = (
+    "Nothing was waiting for you from while you were away, sir.")
+AWAY_STILL_HELD_LINE = (
+    "A few notices are still waiting, sir - I'll read them out in a moment.")
+AWAY_RECAP_REPEAT_S = 3 * 3600.0   # a recap said this recently is said again
+
+
+def is_away_recap_ask(text) -> bool:
+    """True for a generic "did anything happen while I was away" question:
+    an away clause plus a generic ask, and no subject of its own (see
+    _AWAY_OWN_SUBJECT_RE). Never raises."""
+    try:
+        t = " ".join(str(text or "").replace("\u2019", "'").split())
+        if not t:
+            return False
+        return bool(_AWAY_CLAUSE_RE.search(t) and _AWAY_ASK_RE.search(t)
+                    and not _AWAY_OWN_SUBJECT_RE.search(t))
+    except Exception:
+        return False
+
+
+def away_answer_line(*, spoke: bool, still_queued: bool = False,
+                     last_recap: str = "", last_recap_age_s=None) -> str:
+    """What JARVIS says after draining the queue for an away question.
+    '' when the drain spoke (the lines themselves were the answer). Else the
+    recap he already gave within AWAY_RECAP_REPEAT_S, word for word; else
+    "still waiting" when lines are held on the queue (room talk, a hold);
+    else the honest "nothing was waiting". Never raises."""
+    try:
+        if spoke:
+            return ""
+        recap = str(last_recap or "").strip()
+        try:
+            age = float(last_recap_age_s)
+        except (TypeError, ValueError):
+            age = None
+        if recap and age is not None and 0 <= age <= AWAY_RECAP_REPEAT_S:
+            return recap
+        if still_queued:
+            return AWAY_STILL_HELD_LINE
+        return AWAY_NOTHING_WAITING_LINE
+    except Exception:
+        return AWAY_NOTHING_WAITING_LINE

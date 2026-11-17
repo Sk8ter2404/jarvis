@@ -76,6 +76,24 @@ class WriterTests(unittest.TestCase):
         self.assertIsNone(hf.unpack_header(b"NOTMAGIC" + bytes(56)))
         self.assertIsNone(hf.unpack_header(b"short"))
 
+    def test_each_frame_says_which_camera_it_came_from(self):
+        # 2026-11-17: the tracker's size / score limits follow the camera per
+        # frame (a Kinect hologram can borrow the Kinect mid-run).
+        self.heartbeat()
+        self.assertTrue(self.w.publish(self.frame(1)))            # webcam paths: default
+        shm = self.attach()
+        self.assertEqual(hf.unpack_header(shm.buf)["source"], hf.SOURCE_WEBCAM)
+        self.assertEqual(hf.frame_source(shm.buf), "webcam")
+        self.clock.t += 0.05
+        self.assertTrue(self.w.publish(self.frame(2), source=hf.SOURCE_KINECT))
+        self.assertEqual(hf.frame_source(shm.buf), "kinect")
+        self.assertIsNotNone(hf.read_frame(shm.buf, 1))           # readers that ignore it still work
+        # an older writer (field = 0, the old "reserved") and junk say nothing
+        self.assertEqual(hf.frame_source(hf.pack_header(3, 0)), "")
+        self.assertEqual(hf.frame_source(hf.pack_header(3, 0, source=99)), "")
+        self.assertEqual(hf.frame_source(b"short"), "")
+        self.assertEqual(hf.unpack_header(hf.pack_header(3, 0, source=2))["source"], 2)
+
     def test_nothing_is_copied_without_a_tracker(self):
         self.assertFalse(self.w.active())
         self.assertFalse(self.w.publish(self.frame()))

@@ -40,6 +40,25 @@ PROTOCOL  (JSON text frames, ~30/s while frames arrive)
   "z": the palm's median depth in metres (null when the palm has no valid
   depth: out of 0.5-4.5 m range or shadowed). No plane, no "z" keys at all.
 
+CAMERA, LIGHT AND CONFIDENCES (2026-11-17)
+  * --camera webcam|kinect: the camera the tracker starts with; it picks the
+    gesture engine's size / score limits (tools/handtrack_gestures.py
+    CAMERA_LIMITS). Each frame's header says which camera it came from
+    (core/handtrack_frames.py "source") and that wins when present, so a
+    Kinect hologram opened while the tracker runs on the webcam is handled.
+  * Low light: the mean luma of each (already downscaled) frame is smoothed;
+    below --low-light-luma (80; 0 = off) a gamma lift + CLAHE on the L channel
+    is applied to the picture MediaPipe sees (never to the JPEG the page
+    shows), until the luma is back over it by LOW_LIGHT_HYST.
+  * --det-conf / --presence-conf / --track-conf: MediaPipe's three
+    confidences (0.5 each by default, as before; JARVIS passes
+    HAND_TRACK_DET_CONF / _PRESENCE_CONF / _TRACKING_CONF).
+  * Every STATS_EVERY_S (30 s) one "stats" line in the tracker log: the real
+    input fps, the largest gap between frames, how many frames had a hand,
+    the mean luma and how often the boost was on, the camera.
+  Live 11-17 16:03-16:11 (desktop, Kinect, dusk) none of that was knowable:
+  hand_tracker.log had no rate, no light level and no timestamps.
+
 LIFECYCLE
   * Binds 127.0.0.1 only (--host must be a loopback address) and accepts
     browser connections only from a localhost origin.
@@ -76,6 +95,17 @@ DEFAULT_MODEL = r"C:\JARVIS-models\handtrack\hand_landmarker.task"
 LOOPBACK = ("127.0.0.1", "::1", "localhost")
 ORIGIN_RE = re.compile(r"^https?://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?$")
 JPEG_QUALITY = 70
+
+# Low light (2026-11-17, see CAMERA, LIGHT AND CONFIDENCES).
+LOW_LIGHT_LUMA = 80.0            # smoothed mean luma (0-255) under this: boost
+LOW_LIGHT_HYST = 10.0            # ... until it is back over LUMA + this
+LOW_LIGHT_GAMMA = 0.6            # out = 255 * (in / 255) ** gamma (lifts shadows)
+LOW_LIGHT_CLAHE_CLIP = 2.0
+LOW_LIGHT_CLAHE_TILE = 8
+LUMA_EMA = 0.2                   # smoothing of the per-frame luma
+LUMA_STEP = 4                    # luma is measured on every 4th pixel each way
+STATS_EVERY_S = 30.0
+CONF_MIN, CONF_MAX = 0.05, 0.95
 
 
 def log(msg: str) -> None:
@@ -161,6 +191,101 @@ def file_age(path: Optional[str]) -> Optional[float]:
         return max(0.0, time.time() - os.stat(path).st_mtime)
     except OSError:
         return None
+
+
+def mean_luma(frame) -> float:
+    """Mean Rec.601 luma (0-255) of a BGR uint8 frame, measured on every
+    LUMA_STEP-th pixel each way (cheap: 160x90 samples of a 640x360 frame)."""
+    sub = frame[::LUMA_STEP, ::LUMA_STEP]
+    return float(0.114 * sub[..., 0].mean() + 0.587 * sub[..., 1].mean()
+                 + 0.299 * sub[..., 2].mean())
+
+
+def clamp_conf(v) -> float:
+    try:
+        f = float(v)
+    except Exception:
+        return 0.5
+    if f != f:                                   # NaN
+        return 0.5
+    return min(CONF_MAX, max(CONF_MIN, f))
+
+
+class LowLight:
+    """Smoothed luma + hysteresis + the boost itself (gamma LUT, then CLAHE on
+    LAB's L). ``on_luma`` <= 0 turns it off. cv2 / numpy are passed in / taken
+    lazily so the gesture tests never need them."""
+
+    def __init__(self, on_luma: float = LOW_LIGHT_LUMA, hyst: float = LOW_LIGHT_HYST,
+                 gamma: float = LOW_LIGHT_GAMMA):
+        self.on_luma = float(on_luma)
+        self.hyst = float(hyst)
+        self.gamma = float(gamma)
+        self.ema: Optional[float] = None
+        self.active = False
+        self._lut = None
+        self._clahe = None
+
+    def update(self, luma: float) -> bool:
+        """Feed one frame's luma; True while the boost should run."""
+        self.ema = luma if self.ema is None else (1 - LUMA_EMA) * self.ema + LUMA_EMA * luma
+        if self.on_luma <= 0:
+            self.active = False
+        elif self.active:
+            self.active = self.ema <= self.on_luma + self.hyst
+        else:
+            self.active = self.ema < self.on_luma
+        return self.active
+
+    def apply(self, bgr, cv2):
+        """The boosted copy of ``bgr`` (the input is left untouched)."""
+        import numpy as np
+        if self._lut is None:
+            x = np.arange(256, dtype=np.float64) / 255.0
+            self._lut = np.clip(np.round(255.0 * x ** self.gamma), 0, 255).astype(np.uint8)
+        if self._clahe is None:
+            self._clahe = cv2.createCLAHE(clipLimit=LOW_LIGHT_CLAHE_CLIP,
+                                          tileGridSize=(LOW_LIGHT_CLAHE_TILE,
+                                                        LOW_LIGHT_CLAHE_TILE))
+        lifted = cv2.LUT(bgr, self._lut)
+        lab = cv2.cvtColor(lifted, cv2.COLOR_BGR2LAB)
+        lab[:, :, 0] = self._clahe.apply(np.ascontiguousarray(lab[:, :, 0]))
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
+class Stats:
+    """The 30 s summary line (input fps, gaps, hands, light, camera)."""
+
+    def __init__(self, now: float):
+        self.reset(now)
+
+    def reset(self, now: float) -> None:
+        self.t0 = now
+        self.frames = 0
+        self.hand_frames = 0
+        self.boosted = 0
+        self.luma_sum = 0.0
+        self.max_gap = 0.0
+        self.last_at: Optional[float] = None
+
+    def frame(self, now: float, luma: float, boosted: bool, hands: int) -> None:
+        if self.last_at is not None:
+            self.max_gap = max(self.max_gap, now - self.last_at)
+        self.last_at = now
+        self.frames += 1
+        self.luma_sum += luma
+        self.boosted += 1 if boosted else 0
+        self.hand_frames += 1 if hands else 0
+
+    def line(self, now: float, camera: str) -> str:
+        span = max(1e-6, now - self.t0)
+        n = self.frames
+        pct = (lambda k: 0 if n == 0 else int(round(100.0 * k / n)))
+        luma = "n/a" if n == 0 else f"{self.luma_sum / n:.0f}"
+        return (f"stats {span:.0f}s: input {n / span:.1f} fps ({n} frames, "
+                f"max gap {self.max_gap * 1000:.0f} ms), hands in {pct(self.hand_frames)}%, "
+                f"mean luma {luma} (low-light boost {pct(self.boosted)}%), "
+                f"camera {camera}")
 
 
 def hands_message(ts_ms: int, seq: int, w: int, h: int, hands: list,
@@ -310,7 +435,11 @@ class Tracker:
         self.args = args
         self.frames = _load_frames_module()
         self.depthmod = _load_depth_module()
-        self.engine = hg.GestureEngine(invert_palm=args.invert_palm)
+        self.camera = getattr(args, "camera", "webcam") or "webcam"
+        self.engine = hg.GestureEngine(invert_palm=args.invert_palm, camera=self.camera)
+        self.lowlight = LowLight(on_luma=getattr(args, "low_light_luma", LOW_LIGHT_LUMA))
+        self.luma = 0.0                   # smoothed (heartbeat / stats)
+        self.stats = Stats(time.monotonic())
         self.hub = Hub(args.host, args.port)
         self.stop = threading.Event()
         self.shm = None
@@ -354,13 +483,17 @@ class Tracker:
             base_options=BaseOptions(model_asset_path=self.args.model),
             running_mode=vision.RunningMode.VIDEO,
             num_hands=2,
-            min_hand_detection_confidence=0.5,
-            min_hand_presence_confidence=0.5,
-            min_tracking_confidence=0.5,
+            min_hand_detection_confidence=clamp_conf(self.args.det_conf),
+            min_hand_presence_confidence=clamp_conf(self.args.presence_conf),
+            min_tracking_confidence=clamp_conf(self.args.track_conf),
         )
         self.landmarker = vision.HandLandmarker.create_from_options(opts)
         log(f"model loaded ({os.path.basename(self.args.model)}), "
-            f"mediapipe {mp.__version__}, opencv {cv2.__version__}")
+            f"mediapipe {mp.__version__}, opencv {cv2.__version__}; confidences "
+            f"det {clamp_conf(self.args.det_conf):.2f} presence "
+            f"{clamp_conf(self.args.presence_conf):.2f} tracking "
+            f"{clamp_conf(self.args.track_conf):.2f}; camera {self.camera}; "
+            f"low-light boost under luma {self.lowlight.on_luma:.0f}")
 
     def _attach(self) -> None:
         now = time.monotonic()
@@ -443,6 +576,8 @@ class Tracker:
                   "hands": self.hands_now, "clients": self.hub.client_count(),
                   "attached": self.shm is not None, "port": self.args.port,
                   "depth": self.depth_fresh(),
+                  "camera": self.camera, "luma": round(self.luma, 1),
+                  "low_light": bool(self.lowlight.active),
                   "up_s": round(time.time() - self.started, 1)}
         try:
             os.makedirs(os.path.dirname(self.args.alive) or ".", exist_ok=True)
@@ -506,6 +641,7 @@ class Tracker:
                     break
                 self._attach()
                 self._poll_depth()
+                self._maybe_stats(now)
                 got = None
                 if self.shm is not None:
                     got = self.frames.read_frame(self.shm.buf, last_seq)
@@ -516,6 +652,7 @@ class Tracker:
                 seq, ts_ms, frame = got
                 last_seq = seq
                 self._last_frame_at = now
+                self._use_camera(self._frame_camera())
                 self._process(seq, ts_ms, frame)
         except Exception as e:
             reason = f"crashed: {type(e).__name__}: {e}"
@@ -524,6 +661,31 @@ class Tracker:
         log(f"exiting: {reason}")
         self._cleanup()
         return 0
+
+    def _frame_camera(self) -> str:
+        """The newest frame's camera from its header ("" = it does not say)."""
+        try:
+            fn = getattr(self.frames, "frame_source", None)
+            return fn(self.shm.buf) if fn is not None and self.shm is not None else ""
+        except Exception:
+            return ""
+
+    def _use_camera(self, kind: str) -> None:
+        """Follow the camera the frames come from (the --camera flag when they
+        do not say). Logs each change once."""
+        kind = kind or getattr(self.args, "camera", "webcam") or "webcam"
+        if kind == self.camera:
+            return
+        self.camera = kind
+        if self.engine.set_camera(kind):
+            lim = self.engine.limits
+            log(f"camera now {kind}: trigger limits size {lim['size_on']}/"
+                f"{lim['size_off']}, score {lim['score_on']}/{lim['score_off']}")
+
+    def _maybe_stats(self, now: float) -> None:
+        if now - self.stats.t0 >= STATS_EVERY_S:
+            log(self.stats.line(now, self.camera))
+            self.stats.reset(now)
 
     def _idle(self, now: float) -> None:
         """No new frame: after 0.5 s tell clients the hands are gone (once),
@@ -545,7 +707,18 @@ class Tracker:
         H, W = frame.shape[:2]                  # the frame's real size (aspect kept)
         self._last_wh = (W, H)
         mirrored = cv2.flip(frame, 1)
-        rgb = cv2.cvtColor(mirrored, cv2.COLOR_BGR2RGB)
+        # Low light (2026-11-17): boost only the picture MediaPipe sees.
+        luma = mean_luma(frame)
+        boosted = self.lowlight.update(luma)
+        self.luma = self.lowlight.ema or 0.0
+        seen = mirrored
+        if boosted:
+            try:
+                seen = self.lowlight.apply(mirrored, cv2)
+            except Exception as e:                 # never lose the frame over it
+                log(f"low-light boost failed: {type(e).__name__}: {e}")
+                seen = mirrored
+        rgb = cv2.cvtColor(seen, cv2.COLOR_BGR2RGB)
         image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         ms = max(self._last_ts_ms + 1, int(time.monotonic() * 1000))
         self._last_ts_ms = ms
@@ -586,6 +759,7 @@ class Tracker:
             if ok:
                 self.hub.broadcast(jpeg=buf.tobytes())
         self.processed += 1
+        self.stats.frame(now, luma, boosted, len(payload))
         self._fps_n += 1
         if now - self._fps_t0 >= 2.0:
             self.fps = self._fps_n / (now - self._fps_t0)
@@ -633,6 +807,17 @@ def parse_args(argv=None):
     p.add_argument("--grace-s", type=float, default=30.0)
     p.add_argument("--invert-palm", action="store_true",
                    help="swap palm/back-of-hand if the camera reports it reversed")
+    p.add_argument("--camera", choices=("webcam", "kinect"), default="webcam",
+                   help="the camera the frames come from at start (size / score "
+                        "limits); each frame's header can say otherwise")
+    p.add_argument("--det-conf", type=float, default=0.5,
+                   help="MediaPipe min_hand_detection_confidence")
+    p.add_argument("--presence-conf", type=float, default=0.5,
+                   help="MediaPipe min_hand_presence_confidence")
+    p.add_argument("--track-conf", type=float, default=0.5,
+                   help="MediaPipe min_tracking_confidence")
+    p.add_argument("--low-light-luma", type=float, default=LOW_LIGHT_LUMA,
+                   help="boost frames whose smoothed mean luma is under this (0 = off)")
     return p.parse_args(argv)
 
 

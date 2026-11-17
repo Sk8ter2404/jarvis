@@ -51,8 +51,21 @@ export const T = Object.freeze({
   // Exploded: pinch a part to pull it out, hold it this long for its info.
   INFO_HOLD_S: 1.0,
   PART_PICK_PX: 70,
-  // A pinch that stopped for this long counts as released (jitter guard).
-  PINCH_RELEASE_S: 0.15,
+  // A pinch (or a fist) that stopped for this long counts as released (jitter
+  // guard). 2026-11-17: was 0.15 - about ONE frame at the ~8 fps the Kinect
+  // fed the tracker at dusk (live 11-17 16:03-16:11), so a held reactor or
+  // part fell out of his hand on one bad frame.
+  PINCH_RELEASE_S: 0.35,
+  // 2026-11-17: a grab / pull survives its hand being MISSING for this long
+  // (it used to end on the first frame without it). The tracker keeps a lost
+  // track TRACK_DROP_S (0.45 s, tools/handtrack_gestures.py) before it sends
+  // its own fist_release, so the page decides first.
+  HAND_LOST_S: 0.4,
+  // 2026-11-17: a grab / pull follows the hand NEAREST its last palm (within
+  // this, normalized) that is still a fist / pinch, not strictly the one with
+  // the same Left/Right label: in dim light MediaPipe flips the label of a
+  // hand that has not moved (9 releases on the other side, live 11-17).
+  REASSOC_MAX: 0.2,
   // Two-hand scale: both hands pinching, distance ratio drives scale.
   SCALE_MIN: 0.4,
   SCALE_MAX: 3.0,
@@ -120,8 +133,9 @@ export class GestureRouter {
   constructor(scene, opts = {}) {
     this.scene = scene;
     this.hands = new Map();          // side -> latest hand
-    this.grab = null;                // {side}
-    this.pulled = null;              // {side, part, heldS, shown, lostS}
+    this.list = [];                  // the latest hands, as sent (two may share a label)
+    this.grab = null;                // {side, palm, lostS, pp}
+    this.pulled = null;              // {side, palm, part, heldS, shown, lostS}
     this.lockUntil = 0;
     this.now = 0;                    // seconds, advanced by update()
     this.twoHand = null;             // {d0, s0}
@@ -134,6 +148,7 @@ export class GestureRouter {
   update(hands, dt) {
     const sc = this.scene;
     this.now += dt;
+    this.list = (hands || []).slice();
     const seen = new Set();
     for (const h of hands || []) {
       seen.add(h.side);
@@ -151,13 +166,18 @@ export class GestureRouter {
 
     // Fist: the reactor follows the grabbing hand's palm.
     if (this.grab) {
-      const h = this.hands.get(this.grab.side);
-      // The hand that grabbed must still be a fist; opening it (or losing it)
-      // for T.PINCH_RELEASE_S lets go even if fist_release never arrives.
-      if (h && h.state === "fist") this.grab.lostS = 0;
-      else this.grab.lostS = (this.grab.lostS || 0) + dt;
-      if (!h || this.grab.lostS >= T.PINCH_RELEASE_S) { this._endGrab(); }
-      else if (h.palm && h.state === "fist") {
+      const g = this.grab;
+      const h = this._holderHand(g, "fist");
+      // The hand that grabbed must still be a fist; opening it for
+      // T.PINCH_RELEASE_S, or losing it for T.HAND_LOST_S, lets go even if
+      // fist_release never arrives (2026-11-17: losing it used to let go at once).
+      if (h && h.state === "fist") {
+        g.lostS = 0;
+        g.side = h.side;                       // follow a label flip
+        if (h.palm) g.palm = h.palm.slice();
+      } else g.lostS = (g.lostS || 0) + dt;
+      if (g.lostS >= (h ? T.PINCH_RELEASE_S : T.HAND_LOST_S)) { this._endGrab(); }
+      else if (h && h.palm && h.state === "fist") {
         const p = sc.toScreen(h.palm[0], h.palm[1]);
         sc.setReactorTarget(p.x, p.y);
         // Push / pull: the fist's depth (the tracker's "z", metres) moves the
@@ -173,16 +193,18 @@ export class GestureRouter {
     // Pulled part follows the pinch point; hold = info; release on un-pinch.
     if (this.pulled) {
       const pl = this.pulled;
-      const h = this.hands.get(pl.side);
+      const h = this._holderHand(pl, "pinch");
       if (h && h.state === "pinch") {
         pl.lostS = 0;
+        pl.side = h.side;                      // follow a label flip
+        if (h.palm) pl.palm = h.palm.slice();
         const pp = sc.toScreen(...pinchPoint(h.lm));
         sc.movePart(pl.part, pp.x, pp.y);
         pl.heldS += dt;
         if (!pl.shown && pl.heldS >= T.INFO_HOLD_S) { pl.shown = true; sc.showInfo(pl.part); }
       } else {
         pl.lostS += dt;
-        if (pl.lostS >= T.PINCH_RELEASE_S) {
+        if (pl.lostS >= (h ? T.PINCH_RELEASE_S : T.HAND_LOST_S)) {
           sc.releasePart(pl.part);
           if (pl.shown) sc.showInfo(null);
           this.pulled = null;
@@ -190,8 +212,9 @@ export class GestureRouter {
       }
     }
 
-    // Two-hand scale: both hands pinching, nothing else holding a hand.
-    const L = [...this.hands.values()].filter(h => h.state === "pinch");
+    // Two-hand scale: both hands pinching, nothing else holding a hand. From
+    // the list as sent (2026-11-17): two hands can briefly share a label.
+    const L = this.list.filter(h => h.state === "pinch");
     if (L.length === 2 && sc.reactorVisible && !this.pulled && !this.grab && !sc.menuOpen) {
       const d = dist(pinchPoint(L[0].lm), pinchPoint(L[1].lm));
       if (!this.twoHand) this.twoHand = { d0: d, s0: sc.scale || 1 };
@@ -231,14 +254,22 @@ export class GestureRouter {
         const r = sc.reactorScreen();
         const reach = Math.max(r.r * T.GRAB_RADII, T.GRAB_MIN_PX);
         if (Math.hypot(pos.x - r.x, pos.y - r.y) <= reach) {
-          this.grab = { side: ev.side };
+          this.grab = { side: ev.side, palm: ev.pos ? ev.pos.slice() : null, lostS: 0 };
           sc.setReactorTarget(pos.x, pos.y);
         }
         break;
       }
-      case "fist_release":
+      case "fist_release": {
+        // 2026-11-17: the OTHER hand letting go of its own fist, far from the
+        // held spot, while the holder is still a fist, is not this grab's end.
+        const g = this.grab;
+        if (g && ev.pos && g.palm && dist(ev.pos, g.palm) > T.REASSOC_MAX) {
+          const h = this._holderHand(g, "fist");
+          if (h && h.state === "fist") break;
+        }
         this._endGrab();
         break;
+      }
 
       case "point_flick": {
         if (!sc.reactorVisible) break;
@@ -275,13 +306,38 @@ export class GestureRouter {
         // The hand that pinched: the event's side, else the nearest pinching one.
         const side = (ev.side === "Left" || ev.side === "Right") ? ev.side
           : ([...this._pinching][0] || "Right");
+        const hand = this.hands.get(side);
+        const palm = hand && hand.palm ? hand.palm.slice() : (ev.pos ? ev.pos.slice() : null);
         sc.pullPart(part);
-        this.pulled = { side, part, heldS: 0, shown: false, lostS: 0 };
+        this.pulled = { side, palm, part, heldS: 0, shown: false, lostS: 0 };
         break;
       }
       default:
         this.log("unknown gesture " + ev.name);
     }
+  }
+
+  // The hand now holding a grab / pull (2026-11-17). First choice: the hand
+  // nearest the holder's last palm that is still in ``state`` (a fist / a
+  // pinch), within T.REASSOC_MAX - that survives a Left/Right label flip and
+  // two hands briefly sharing one label. Then the nearest hand in any state
+  // there (it opened: the release timer runs). Then the holder's label (it
+  // moved far while unseen). null = no hand at all (the lost timer runs).
+  _holderHand(holder, state) {
+    const list = this.list || [];
+    if (holder.palm) {
+      let best = null, bestD = Infinity, any = null, anyD = Infinity;
+      for (const h of list) {
+        if (!h || !h.palm) continue;
+        const d = dist(h.palm, holder.palm);
+        if (h.state === state && d < bestD) { best = h; bestD = d; }
+        if (d < anyD) { any = h; anyD = d; }
+      }
+      if (best && bestD <= T.REASSOC_MAX) return best;
+      if (any && anyD <= T.REASSOC_MAX) return any;
+    }
+    for (const h of list) if (h && h.side === holder.side) return h;
+    return null;
   }
 
   // Let go of a fist grab (and end its push / pull if one began).

@@ -53,6 +53,24 @@ talking with his hands, a classmate's hand in frame)
     only runs while the hand is ok. State transitions (pinch_start/end,
     fist_grab/release) and the two-hand clap / explode are not gated: the
     holo page pairs them.
+    PER CAMERA (2026-11-17): those numbers are the WEBCAM's. The Kinect's
+    colour view is much wider (84 x 54 deg), so the same hand at the same
+    distance is ~0.6x as tall in its frame; live 11-17 on the Kinect, 51
+    pinch_start gave 1 pinch_hold and 0 palm_hold. CAMERA_LIMITS["kinect"]
+    is size 0.06 / 0.045 and score 0.70 / 0.55 (dim light lowers the
+    handedness score too). The tracker passes the camera (--camera, and per
+    frame from the frame header) via GestureEngine(camera=...) / set_camera().
+
+TRACKING (2026-11-17)
+    A hand is matched to its track by palm distance; a different Left/Right
+    label costs 1.5 hand sizes, but only 0.25 while the palm is within
+    SIDE_FLIP_NEAR_HS (1 hand size) of the track: MediaPipe flips the label
+    of a hand that has not moved in dim light (9 releases with the side
+    swapped, live 11-17), and the same track id must survive that. A track
+    is kept TRACK_DROP_S (0.45 s, was 0.25) without a sighting, and a stale
+    track whose id is taken by a new hand ends its fist / pinch with
+    fist_release / pinch_end first (38 fist_grab with no release between,
+    live 11-17).
 
 EVENTS  (each fires once, then needs the gesture to end before it can re-arm)
     palm_hold    open palm facing the camera, fingers spread, held PALM_HOLD_S
@@ -113,13 +131,36 @@ PINCH_ON, PINCH_OFF = 0.75, 0.50
 SPREAD_ON_DEG, SPREAD_OFF_DEG = 20.0, 14.0
 FACING_MIN_CROSS = 0.20
 STATE_DEBOUNCE_S = 0.10
-TRACK_DROP_S = 0.25
+# 2026-11-17: was 0.25 - two missed frames at the Kinect's old ~8 fps. The
+# holo page keeps a grab through a ~0.4 s gap (hud/holo/gestures.js
+# HAND_LOST_S); this must not end it earlier with a fist_release of its own.
+TRACK_DROP_S = 0.45
+SIDE_FLIP_COST = 1.5             # a different Left/Right label, far from the track
+SIDE_FLIP_NEAR_HS = 1.0          # within this many hand sizes a label flip is cheap
+SIDE_FLIP_NEAR_COST = 0.25
 
 # Recognition (see RECOGNITION). Size = hs / frame height: the owner at a
 # laptop webcam (~0.6 m) is ~0.15-0.20, ~1.2 m away ~0.09, 2 m back ~0.05.
 EVENT_MIN_SCORE_ON, EVENT_MIN_SCORE_OFF = 0.80, 0.60
 EVENT_MIN_SIZE_ON, EVENT_MIN_SIZE_OFF = 0.10, 0.075
 EVENT_SETTLE_S = 0.40
+# Per camera kind (2026-11-17, see RECOGNITION). "webcam" = the numbers above,
+# unchanged. "kinect": the wide colour view (84.1 x 53.8 deg vs ~40 deg tall
+# for a 16:9 webcam) makes a hand at 1.2 m ~0.065 of the frame height, under
+# even the webcam's 0.075 OFF floor - so the same physical hand gets the same
+# chance. Any other kind is the webcam's.
+CAMERA_LIMITS = {
+    "webcam": {"score_on": EVENT_MIN_SCORE_ON, "score_off": EVENT_MIN_SCORE_OFF,
+               "size_on": EVENT_MIN_SIZE_ON, "size_off": EVENT_MIN_SIZE_OFF},
+    "kinect": {"score_on": 0.70, "score_off": 0.55,
+               "size_on": 0.06, "size_off": 0.045},
+}
+
+
+def camera_limits(camera: str) -> dict:
+    """The RECOGNITION limits for a camera kind ("webcam" for anything else)."""
+    return dict(CAMERA_LIMITS.get(str(camera or "").strip().lower(),
+                                  CAMERA_LIMITS["webcam"]))
 
 PALM_HOLD_S = 1.5
 PALM_STILL_WINDOW_S = 0.6
@@ -226,8 +267,12 @@ class _Track:
 class GestureEngine:
     """Feed it every frame; it returns hand infos and gesture events."""
 
-    def __init__(self, invert_palm: bool = False):
+    def __init__(self, invert_palm: bool = False, camera: str = "webcam"):
         self.invert_palm = invert_palm
+        self.camera = "webcam"
+        self.limits = camera_limits("webcam")
+        self.set_camera(camera)
+        self._replaced: List[_Track] = []    # stale tracks _match gave away (this frame)
         self._tracks: List[_Track] = []
         self._pair: deque = deque()      # (t, d_hs, mx, my, stateA, stateB, nofist)
         self._clap_until = 0.0
@@ -241,6 +286,18 @@ class GestureEngine:
         self._tracks.clear()
         self._pair.clear()
 
+    def set_camera(self, camera: str) -> bool:
+        """Use ``camera``'s RECOGNITION limits ("webcam" / "kinect"; anything
+        else = webcam). True when the kind changed."""
+        kind = str(camera or "").strip().lower()
+        if kind not in CAMERA_LIMITS:
+            kind = "webcam"
+        if kind == self.camera:
+            return False
+        self.camera = kind
+        self.limits = camera_limits(kind)
+        return True
+
     def update(self, t: float, hands: List[dict], w: int, h: int
                ) -> Tuple[List[dict], List[dict]]:
         events: List[dict] = []
@@ -252,6 +309,11 @@ class GestureEngine:
             except Exception:
                 analyses.append(None)
         matched = self._match(t, hands, analyses)
+        # A stale track whose id a new hand took ends its fist / pinch first,
+        # so the page never sees two fist_grab in a row (live 11-17: 38).
+        for old in self._replaced:
+            self._end_holds(old, w, h, events)
+        self._replaced = []
         infos: List[dict] = []
         seen = set()
         for hd, a, tr in zip(hands, analyses, matched):
@@ -327,7 +389,10 @@ class GestureEngine:
                 scale = max(tr.hs, a["hs"], 1e-6)
                 cost = _dist(a["palm"], tr.palm) / scale
                 if tr.side != hands[hi].get("side"):
-                    cost += 1.5
+                    # A label flip on a hand that has not moved is the SAME
+                    # hand (dim light, live 11-17): cheap within 1 hand size.
+                    cost += (SIDE_FLIP_NEAR_COST if cost <= SIDE_FLIP_NEAR_HS
+                             else SIDE_FLIP_COST)
                 cands.append((cost, hi, tr))
         cands.sort(key=lambda c: c[0])
         used_tracks = set()
@@ -345,20 +410,25 @@ class GestureEngine:
             if not free:
                 continue
             tr = _Track(free[0], hands[hi].get("side", ""), t)
-            # a stale track holding the id is replaced
+            # a stale track holding the id is replaced (its holds end first:
+            # update() emits them from self._replaced)
+            self._replaced.extend(x for x in self._tracks if x.id == tr.id)
             self._tracks = [x for x in self._tracks if x.id != tr.id]
             self._tracks.append(tr)
             tr.hs, tr.palm = a["hs"], a["palm"]
             out[hi] = tr
         return out
 
-    def _drop_track(self, tr: _Track, t: float, w: int, h: int, events: list):
+    def _end_holds(self, tr: _Track, w: int, h: int, events: list) -> None:
         if tr.grabbing:
             events.append(self._ev("fist_release", tr.side, tr.grab_pos, w, h))
             tr.grabbing = False
         if tr.pinch_on:
             events.append(self._ev("pinch_end", tr.side, tr.grab_pos, w, h))
             tr.pinch_on = False
+
+    def _drop_track(self, tr: _Track, t: float, w: int, h: int, events: list):
+        self._end_holds(tr, w, h, events)
         self._tracks = [x for x in self._tracks if x.id != tr.id]
 
     # ── one track, one frame ────────────────────────────────────────────
@@ -374,10 +444,11 @@ class GestureEngine:
         # RECOGNITION: score + size with hysteresis (entering is stricter)
         score = float(hd.get("score", 0.0) or 0.0)
         size = tr.hs / max(1, h)
+        lim = self.limits                       # per camera kind (2026-11-17)
         if tr.ok:
-            tr.ok = score >= EVENT_MIN_SCORE_OFF and size >= EVENT_MIN_SIZE_OFF
+            tr.ok = score >= lim["score_off"] and size >= lim["size_off"]
         else:
-            tr.ok = score >= EVENT_MIN_SCORE_ON and size >= EVENT_MIN_SIZE_ON
+            tr.ok = score >= lim["score_on"] and size >= lim["size_on"]
         settled = tr.ok and t - tr.first_t >= EVENT_SETTLE_S
         # finger flags with hysteresis
         for i, r in enumerate(a["ratios"]):

@@ -110,6 +110,9 @@ class ProcessTests(unittest.TestCase):
         self.t._process(seq, 1700000000000 + seq, self.frame)
 
     def test_frame_is_mirrored_before_detection(self):
+        # exact pixels: the low-light boost (2026-11-17; this frame is dark)
+        # is covered by LowLightTests
+        self.t.lowlight.on_luma = 0
         self.process()
         seen = self.lm.images[0]                             # RGB, flipped
         self.assertEqual(seen.shape, (480, 640, 3))
@@ -503,6 +506,200 @@ class HubTests(unittest.TestCase):
         hub.broadcast('{"type":"hands","hands":[]}')
         hub.broadcast('{"type":"gesture","name":"clap"}')
         self.assertEqual(hub.last_hands_text, '{"type":"hands","hands":[]}')
+
+
+class FlagTests(unittest.TestCase):
+    """2026-11-17: camera kind, MediaPipe confidences and the low-light level
+    come in on the command line (core/hand_tracker_launcher.build_argv)."""
+
+    def test_defaults_are_the_old_behaviour(self):
+        a = svc.parse_args([])
+        self.assertEqual(a.camera, "webcam")
+        self.assertEqual((a.det_conf, a.presence_conf, a.track_conf), (0.5, 0.5, 0.5))
+        self.assertEqual(a.low_light_luma, 80.0)
+        self.assertEqual(svc.Tracker(a).engine.camera, "webcam")
+
+    def test_the_launchers_command_line_parses(self):
+        from core import hand_tracker_launcher as htl
+        argv = htl.build_argv("py", "s.py", "m", 8793, 1, "a", "j", camera="kinect",
+                              det_conf=0.4, presence_conf=0.45, track_conf=0.3)
+        a = svc.parse_args(argv[3:])                     # past python -u script
+        self.assertEqual(a.camera, "kinect")
+        self.assertEqual((a.det_conf, a.presence_conf, a.track_conf), (0.4, 0.45, 0.3))
+        self.assertEqual(svc.Tracker(a).engine.camera, "kinect")
+
+    def test_confidences_are_clamped(self):
+        self.assertEqual(svc.clamp_conf(0.0), svc.CONF_MIN)
+        self.assertEqual(svc.clamp_conf(3), svc.CONF_MAX)
+        self.assertEqual(svc.clamp_conf("x"), 0.5)
+        self.assertEqual(svc.clamp_conf(float("nan")), 0.5)
+        self.assertEqual(svc.clamp_conf(0.4), 0.4)
+
+    def test_load_model_hands_the_confidences_to_mediapipe(self):
+        seen = {}
+
+        class Opts:
+            def __init__(self, **kw):
+                seen.update(kw)
+        vision = types.SimpleNamespace(
+            HandLandmarkerOptions=Opts, RunningMode=types.SimpleNamespace(VIDEO="V"),
+            HandLandmarker=types.SimpleNamespace(create_from_options=lambda o: "lm"))
+        tasks_py = types.SimpleNamespace(BaseOptions=lambda **kw: kw, vision=vision)
+        mp = types.SimpleNamespace(__version__="fake")
+        fake_cv2 = types.SimpleNamespace(__version__="fake")
+        with tempfile.TemporaryDirectory() as d:
+            model = os.path.join(d, "m.task")
+            open(model, "wb").close()
+            a = svc.parse_args(["--model", model, "--det-conf", "0.4",
+                                "--presence-conf", "0.35", "--track-conf", "0.3"])
+            t = svc.Tracker(a)
+            with mock.patch.dict(sys.modules, {
+                    "cv2": fake_cv2, "mediapipe": mp,
+                    "mediapipe.tasks": types.SimpleNamespace(python=tasks_py),
+                    "mediapipe.tasks.python": tasks_py}), \
+                    mock.patch.object(svc, "log"):
+                t.load_model()
+        self.assertEqual(seen["min_hand_detection_confidence"], 0.4)
+        self.assertEqual(seen["min_hand_presence_confidence"], 0.35)
+        self.assertEqual(seen["min_tracking_confidence"], 0.3)
+        self.assertEqual(seen["num_hands"], 2)
+
+
+class CameraFollowTests(unittest.TestCase):
+    def setUp(self):
+        self.t = svc.Tracker(svc.parse_args(["--camera", "webcam"]))
+
+    def shm_with(self, source):
+        hf = self.t.frames
+        return types.SimpleNamespace(buf=memoryview(bytearray(
+            hf.pack_header(1, 0, 640, 360, 3, source=source))))
+
+    def test_each_frame_header_decides_the_limits(self):
+        hf = self.t.frames
+        with mock.patch.object(svc, "log") as lg:
+            self.t.shm = self.shm_with(hf.SOURCE_KINECT)
+            self.t._use_camera(self.t._frame_camera())
+            self.assertEqual(self.t.engine.camera, "kinect")
+            self.assertEqual(self.t.engine.limits["size_on"], 0.06)
+            self.t._use_camera(self.t._frame_camera())       # no change, no log
+            self.assertEqual(lg.call_count, 1)
+            self.t.shm = self.shm_with(hf.SOURCE_WEBCAM)
+            self.t._use_camera(self.t._frame_camera())
+            self.assertEqual(self.t.engine.camera, "webcam")
+
+    def test_a_frame_that_does_not_say_uses_the_flag(self):
+        t = svc.Tracker(svc.parse_args(["--camera", "kinect"]))
+        t.shm = types.SimpleNamespace(buf=memoryview(bytearray(
+            t.frames.pack_header(1, 0))))                     # an older writer: 0
+        t._use_camera(t._frame_camera())
+        self.assertEqual(t.engine.camera, "kinect")
+        t.shm = None
+        self.assertEqual(t._frame_camera(), "")
+
+
+@unittest.skipIf(cv2 is None, "needs numpy + cv2")
+class LowLightTests(unittest.TestCase):
+    """2026-11-17, live 11-17 16:03 dusk on the Kinect: no light level was ever
+    logged. Below a mean luma of ~80 the detector gets a lifted picture."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.t = svc.Tracker(svc.parse_args(["--alive", os.path.join(self.dir.name, "a")]))
+        self.hub = FakeHub()
+        self.t.hub = self.hub
+        self.lm = FakeLandmarker()
+        self.t.landmarker = self.lm
+        self.t._cv2, self.t._mp = cv2, FakeMp
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    @staticmethod
+    def scene(level):
+        rng = np.random.RandomState(3)
+        f = rng.randint(0, 40, (360, 640, 3)).astype(np.uint8)
+        f[100:200, 200:300] = 90                          # a "hand" a bit brighter
+        return np.clip(f.astype(np.int32) * level // 10, 0, 255).astype(np.uint8)
+
+    def test_mean_luma(self):
+        f = np.zeros((360, 640, 3), np.uint8)
+        self.assertEqual(svc.mean_luma(f), 0.0)
+        f[:] = (255, 255, 255)
+        self.assertAlmostEqual(svc.mean_luma(f), 255.0, delta=0.5)
+        f[:] = (0, 0, 255)                                 # BGR red
+        self.assertAlmostEqual(svc.mean_luma(f), 0.299 * 255, delta=0.5)
+
+    def test_hysteresis(self):
+        ll = svc.LowLight(on_luma=80, hyst=10)
+        self.assertTrue(ll.update(40))
+        for _ in range(40):
+            ll.update(85)                                  # between 80 and 90: stays on
+        self.assertTrue(ll.active)
+        for _ in range(40):
+            ll.update(120)
+        self.assertFalse(ll.active)
+        for _ in range(40):
+            ll.update(85)                                  # off stays off over 80
+        self.assertFalse(ll.active)
+        off = svc.LowLight(on_luma=0)
+        self.assertFalse(off.update(1.0))
+
+    def test_a_dim_frame_is_lifted_for_the_detector_only(self):
+        dim = self.scene(10)
+        self.hub.frames_wanted = True
+        self.t._process(1, 0, dim)
+        seen = self.lm.images[0]                           # RGB the detector got
+        mirrored = cv2.flip(dim, 1)
+        self.assertGreater(float(seen.mean()), float(mirrored.mean()) + 10)
+        self.assertTrue(self.t.lowlight.active)
+        jpg = cv2.imdecode(np.frombuffer(self.hub.jpegs[0], np.uint8), cv2.IMREAD_COLOR)
+        self.assertLess(abs(float(jpg.mean()) - float(mirrored.mean())), 3.0)   # the page: as shot
+        self.assertFalse((dim != self.scene(10)).any())    # the input is untouched
+
+    def test_a_bright_frame_goes_through_unchanged(self):
+        bright = self.scene(40)                            # mean luma well over 80
+        self.t._process(1, 0, bright)
+        seen = self.lm.images[0]
+        want = cv2.cvtColor(cv2.flip(bright, 1), cv2.COLOR_BGR2RGB)
+        self.assertTrue((seen == want).all())
+        self.assertFalse(self.t.lowlight.active)
+
+    def test_a_failing_boost_never_loses_the_frame(self):
+        self.t.lowlight.apply = mock.Mock(side_effect=RuntimeError("cv2 says no"))
+        with mock.patch.object(svc, "log"):
+            self.t._process(1, 0, self.scene(10))
+        self.assertEqual(len(self.lm.images), 1)
+        self.assertEqual(self.hub.texts[-1]["type"], "hands")
+
+    def test_the_heartbeat_and_the_stats_line_carry_the_light(self):
+        self.lm.hands = [make_hand("open")]
+        for i in range(10):
+            self.t._process(i + 1, 0, self.scene(10))
+        self.t._last_beat = 0.0
+        self.t._beat(time.monotonic())
+        with open(self.t.args.alive, encoding="utf-8") as f:
+            d = json.load(f)
+        self.assertEqual(d["camera"], "webcam")
+        self.assertTrue(d["low_light"])
+        self.assertLess(d["luma"], 80)
+        line = self.t.stats.line(self.t.stats.t0 + 30.0, "kinect")
+        self.assertIn("input 0.3 fps (10 frames", line)
+        self.assertIn("hands in 100%", line)
+        self.assertIn("low-light boost 100%", line)
+        self.assertIn("camera kinect", line)
+        self.assertRegex(line, r"mean luma \d+ ")
+        with mock.patch.object(svc, "log") as lg:
+            self.t._maybe_stats(self.t.stats.t0 + 1.0)      # not yet
+            self.assertEqual(lg.call_count, 0)
+            self.t._maybe_stats(self.t.stats.t0 + svc.STATS_EVERY_S)
+            self.assertEqual(lg.call_count, 1)
+            self.assertIn("stats 30s:", lg.call_args[0][0])
+        self.assertEqual(self.t.stats.frames, 0)            # a fresh window
+
+    def test_an_empty_window_still_logs_honestly(self):
+        st = svc.Stats(0.0)
+        self.assertIn("input 0.0 fps (0 frames", st.line(30.0, "webcam"))
+        self.assertIn("mean luma n/a", st.line(30.0, "webcam"))
 
 
 class SourceTests(unittest.TestCase):

@@ -580,5 +580,113 @@ class PalmHoldAtWebcamRatesTests(unittest.TestCase):
         self.assertEqual(self._hold(15, seconds=1.4), [])
 
 
+class CameraLimitTests(unittest.TestCase):
+    """2026-11-17: the size / score limits follow the camera. Live 11-17 on the
+    Kinect's wide view: 51 pinch_start, 1 pinch_hold, 0 palm_hold."""
+
+    def _palm(self, seconds, **kw):
+        return RecognitionTests._palm(self, seconds, **kw)
+
+    def test_webcam_numbers_are_unchanged(self):
+        self.assertEqual(hg.camera_limits("webcam"),
+                         {"score_on": 0.80, "score_off": 0.60,
+                          "size_on": 0.10, "size_off": 0.075})
+        self.assertEqual(hg.camera_limits("bogus"), hg.camera_limits("webcam"))
+        self.assertEqual(hg.GestureEngine().camera, "webcam")
+
+    def test_kinect_limits(self):
+        k = hg.camera_limits("kinect")
+        self.assertEqual((k["size_on"], k["size_off"]), (0.06, 0.045))
+        self.assertEqual((k["score_on"], k["score_off"]), (0.70, 0.55))
+
+    def test_a_hand_too_small_for_the_webcam_counts_on_the_kinect(self):
+        # hs 30 px of 480 = 0.0625: the webcam test above refuses it
+        ev, infos = run(hg.GestureEngine(camera="kinect"), self._palm(4.0, hs=30.0))
+        self.assertIn("palm_hold", names(ev))
+        self.assertTrue(infos[0]["ok"])
+        seq = frames(1.0, lambda i, t: [make_hand("pinch", hs=30.0)])
+        ev, _ = run(hg.GestureEngine(camera="kinect"), seq)
+        self.assertEqual(names(ev), ["pinch_start", "pinch_hold"])
+
+    def test_the_kinect_still_refuses_a_tiny_or_unsure_hand(self):
+        ev, _ = run(hg.GestureEngine(camera="kinect"), self._palm(4.0, hs=20.0))
+        self.assertNotIn("palm_hold", names(ev))
+        ev, _ = run(hg.GestureEngine(camera="kinect"), self._palm(4.0, score=0.6))
+        self.assertNotIn("palm_hold", names(ev))
+        ev, _ = run(hg.GestureEngine(camera="kinect"), self._palm(4.0, score=0.75))
+        self.assertIn("palm_hold", names(ev))            # 0.75: unsure for a webcam only
+
+    def test_set_camera_switches_mid_run(self):
+        eng = hg.GestureEngine()
+        self.assertTrue(eng.set_camera("Kinect"))
+        self.assertEqual(eng.camera, "kinect")
+        self.assertFalse(eng.set_camera("kinect"))
+        self.assertTrue(eng.set_camera("nonsense"))      # back to the webcam's
+        self.assertEqual(eng.limits, hg.camera_limits("webcam"))
+
+
+class TrackStabilityTests(unittest.TestCase):
+    """2026-11-17, live 11-17 16:03-16:11 on the Kinect at dusk: 38 fist_grab
+    with no release between, 9 releases on the other side than the grab."""
+
+    def test_a_label_flip_in_place_keeps_the_track_and_the_grab(self):
+        fist = make_hand("fist", side="Right")
+        flipped = dict(fist, side="Left")                 # same landmarks, label flipped
+        seq = frames(0.5, lambda i, t: [fist])
+        seq += [(0.5 + t, h) for t, h in frames(0.5, lambda i, t: [flipped])]
+        eng = hg.GestureEngine()
+        ev, infos = run(eng, seq[:15])
+        tid = infos[0]["id"]
+        ev2, infos = run(eng, seq[15:])
+        self.assertEqual(infos[0]["id"], tid)
+        self.assertEqual(names(ev + ev2), ["fist_grab"])  # no release, no second grab
+        self.assertEqual(infos[0]["side"], "Left")
+
+    def test_a_far_hand_with_the_other_label_is_a_new_track(self):
+        eng = hg.GestureEngine()
+        _, infos = run(eng, frames(0.3, lambda i, t: [make_hand("open", cx=120.0)]))
+        a = infos[0]["id"]
+        _, infos = run(eng, [(0.3 + t, h) for t, h in frames(0.2, lambda i, t: [
+            make_hand("open", cx=120.0), make_hand("open", side="Left", cx=520.0)])])
+        self.assertEqual(infos[0]["id"], a)
+        self.assertNotEqual(infos[1]["id"], a)
+
+    def test_a_short_loss_keeps_the_grab(self):
+        fist = make_hand("fist")
+        seq = frames(0.5, lambda i, t: [fist])
+        seq += [(0.5 + t, h) for t, h in frames(0.35, lambda i, t: [])]
+        seq += [(0.85 + t, h) for t, h in frames(0.5, lambda i, t: [fist])]
+        ev, _ = run(hg.GestureEngine(), seq)
+        self.assertEqual(names(ev), ["fist_grab"])
+
+    def test_a_long_loss_releases_once(self):
+        fist = make_hand("fist")
+        seq = frames(0.5, lambda i, t: [fist])
+        seq += [(0.5 + t, h) for t, h in frames(0.7, lambda i, t: [])]
+        ev, _ = run(hg.GestureEngine(), seq)
+        self.assertEqual(names(ev), ["fist_grab", "fist_release"])
+
+    def test_a_stale_track_releases_before_its_id_is_reused(self):
+        # The old bug: the hand came back after the drop time on the SAME
+        # frame that would have dropped the stale track; _match gave its id to
+        # the new track silently - fist_grab, fist_grab.
+        fist = make_hand("fist")
+        seq = frames(0.3, lambda i, t: [fist])
+        seq.append((0.3 + hg.TRACK_DROP_S + 0.1, [fist]))   # first frame after the gap
+        seq += [(0.9 + t, h) for t, h in frames(0.3, lambda i, t: [fist])]
+        ev, _ = run(hg.GestureEngine(), seq)
+        self.assertEqual(names(ev), ["fist_grab", "fist_release", "fist_grab"])
+        pinch = make_hand("pinch")
+        seq = frames(0.3, lambda i, t: [pinch])
+        seq.append((0.3 + hg.TRACK_DROP_S + 0.1, [pinch]))
+        ev, _ = run(hg.GestureEngine(), seq)
+        self.assertEqual(names(ev), ["pinch_start", "pinch_end", "pinch_start"])
+
+    def test_drop_time_covers_the_pages_grace(self):
+        # the page keeps a grab ~0.4 s through a lost hand (gestures.js
+        # HAND_LOST_S); the engine must not end it sooner itself
+        self.assertGreaterEqual(hg.TRACK_DROP_S, 0.4)
+
+
 if __name__ == "__main__":
     unittest.main()

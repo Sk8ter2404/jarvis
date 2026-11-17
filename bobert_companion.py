@@ -7011,6 +7011,21 @@ def _hud_camera_preview_downscale(frame: "np.ndarray", width: int) -> "np.ndarra
 from core import camera_tiles as _camera_tiles  # noqa: E402
 from core import handtrack_frames as _handtrack_frames  # noqa: E402
 from core import handtrack_depth as _handtrack_depth  # noqa: E402
+
+
+def _handtrack_pump_running() -> bool:
+    """True while core.handtrack_depth's own Kinect pump thread steps the
+    hand-tracker feed (its pump_running(); 2026-11-17 hook for the
+    hand-tracking builder) - the face-tracking loop then skips its per-pass
+    publish_kinect(). getattr-guarded: False before that function exists,
+    and on any error (the loop steps the feed as before). Never raises."""
+    try:
+        return bool(getattr(_handtrack_depth, "pump_running",
+                            lambda: False)() is True)
+    except Exception:
+        return False
+
+
 _HUD_PERCAM_PREVIEW_KEYS = _camera_tiles.PREVIEW_KEYS
 _hud_percam_last_write: dict[str, float] = {}
 # Keys this process has written since the last cleanup - the per-camera twin
@@ -13393,7 +13408,12 @@ def _face_tracking_thread_body():
             # get_color_bgr(require_new=False) the preview composite below
             # uses, on THIS thread, never from the Kinect pump. At most ~15
             # frames/s, a no-op for any other setting, never raises.
-            if not camera_off:
+            # 2026-11-17: once core.handtrack_depth runs its own Kinect pump
+            # thread (pump_running(), the hand-tracking builder's change), that
+            # thread steps the feed and this pass must not step it too. The
+            # 11-17 review measured ~7-10 fps here: one step per pass of a loop
+            # that also reads the webcam and sleeps 50 ms.
+            if not camera_off and not _handtrack_pump_running():
                 _handtrack_depth.publish_kinect()
 
             # Read all cameras, run face detection on each
@@ -18203,6 +18223,8 @@ _TURN_FLAG_KEYS = (
     # v3.0.11 lane V: camera asks and retries, physical claims, the repeated
     # lead line, the last line said back.
     "CAMERA_ASK_ROUTE", "LOOK_RETRY_ROUTE", "ACTION_FIT_CAMERA_ASK_ENFORCE",
+    # 2026-11-17: game mode ON needs a game / mode / power word, in shadow too.
+    "ACTION_FIT_GAME_MODE_ENFORCE",
     "CAMERA_CLAIM_CHECK", "CHAIN_LEAD_DEDUPE", "REPEAT_LAST_LINE",
     # v3.0.10 lane F: print finish / milestone lines, media AEC bounds, the
     # adaptive TV floor, the requeue supersede pass.
@@ -44763,6 +44785,29 @@ def _front_browser_page() -> str | None:
     return None
 
 
+# YouTube searches / plays whose whole query can be the site's own name.
+_YOUTUBE_QUERY_ACTIONS = frozenset({
+    "youtube_search_direct", "youtube_direct", "youtube", "youtube_play"})
+
+
+def _youtube_home_alias(name: str, arg: str) -> tuple:
+    """(open_url, https://www.youtube.com) for a YouTube search or play whose
+    whole query is "YouTube" (core.actions.is_bare_youtube_query). Live
+    2026-11-17 16:12:48: "open YouTube." -> [ACTION: youtube_search_direct,
+    YouTube] played a random Short; he wanted the home page. (name, arg)
+    otherwise, and when open_url is not registered. Never raises."""
+    try:
+        if name in _YOUTUBE_QUERY_ACTIONS and "open_url" in ACTIONS:
+            from core import actions as _ca_yt
+            if _ca_yt.is_bare_youtube_query(arg):
+                print(f"  [route] {name}({arg}) -> open_url YouTube home "
+                      f"(the query is only the site's name)")
+                return "open_url", _ca_yt.YOUTUBE_HOME_URL
+    except Exception:
+        pass
+    return name, arg
+
+
 def _youtube_play_alias(name: str, arg: str) -> str:
     """``youtube_play`` for the model's YouTube SEARCH when this turn's own
     words asked to PLAY (core.dispatcher.youtube_search_means_play; live
@@ -45126,6 +45171,48 @@ def _action_fit_canonical_pair(name, arg) -> tuple:
     return (canon, "") if canon else (name, arg)
 
 
+# ── Game mode by mishearing (2026-11-17, ACTION_FIT_GAME_MODE_ENFORCE) ──────
+# Live on the Dell 11-17 12:46: "Jarvis is running on Quinn36B" made the brain
+# run game_mode_on (it swaps the brain down and stops the cameras / Kinect).
+# action-fit logged "would block game_mode_on: ... sir said nothing about a
+# game, a mode or power" but ACTION_FIT_MODE is 'shadow', so it ran. Rule 2
+# (core.action_fit._MODE_WORD_RE) is now ENFORCED for game mode ON only
+# (game_mode_on and its alias low_power_mode, the same handler). "performance"
+# also asks for it here ("boost performance"); rule 2's own word list lacks it.
+_GAME_MODE_ON_GUARDED = frozenset({"game_mode_on", "low_power_mode"})
+_GAME_MODE_EXTRA_WORD_RE = re.compile(r"\bperformance\b", re.I)
+_GAME_MODE_SKIPPED_LINE = (
+    "I skipped game mode, sir - you said nothing about a game, gaming or "
+    "power, and it would swap my brain and stop the cameras. Say 'game "
+    "mode' if you want it.")
+
+
+def _game_mode_fit_refusal(rule, name, user_text, reason,
+                           reply_names=()) -> "str | None":
+    """ACTION_FIT_GAME_MODE_ENFORCE (default True): for a rule-2 misfit
+    (core.action_fit.RULE_MODE_SWAP) of game mode ON, the result to record
+    instead of running it, even in 'shadow'. A lone action is a terminal
+    failure whose line JARVIS says (he skipped it, and why); beside other
+    actions it is a plain refusal (failure_result) so their results are
+    still read back. "fits" when sir's words say "performance" (the rule
+    then holds off entirely). None: not this rule / action, or the flag is
+    off (the generic shadow/on handling decides). Never raises."""
+    try:
+        if not _action_fit_flag("ACTION_FIT_GAME_MODE_ENFORCE"):
+            return None
+        if rule != _action_fit.RULE_MODE_SWAP:
+            return None
+        if str(name or "").strip().lower() not in _GAME_MODE_ON_GUARDED:
+            return None
+        if _GAME_MODE_EXTRA_WORD_RE.search(str(user_text or "")):
+            return "fits"
+        if len(tuple(reply_names or ())) > 1:
+            return _action_fit.failure_result(reason)
+        return _TERMINAL_FAILURE_PREFIX + _GAME_MODE_SKIPPED_LINE
+    except Exception:
+        return None
+
+
 def _action_fit_refusal(name: str, arg: str, reply_names=()) -> "str | None":
     """The 'on'-mode failure result for an action that misfits the owner's
     words this turn, else None. 'shadow' logs "[action-fit] would block"
@@ -45171,6 +45258,15 @@ def _action_fit_refusal(name: str, arg: str, reply_names=()) -> "str | None":
         if not reason:
             return None
         shown = f"{name}({arg})" if arg else name
+        # 2026-11-17 (ACTION_FIT_GAME_MODE_ENFORCE): rule 2 for game mode ON
+        # only, enforced in 'shadow' too - see _game_mode_fit_refusal.
+        game = _game_mode_fit_refusal(rule, fit_name, user_text, reason,
+                                      reply_names)
+        if game == "fits":
+            return None
+        if game:
+            print(f"  [action-fit] blocked {shown}: {reason}")
+            return game
         enforced = ((robot_on and rule == _action_fit.RULE_ROBOT_SPEECH)
                     or (ack_on and rule == _action_fit.RULE_ACK_REPEAT)
                     or (camera_on and rule == _action_fit.RULE_CAMERA_ASK))
@@ -45528,6 +45624,7 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
         # (2026-10-05): find by name, guard, click, verify - spoken word for
         # word. A coordinate click stays the silent "click".
         name = _click_alias(name, arg)
+        name, arg = _youtube_home_alias(name, arg)   # 2026-11-17
         name = _youtube_play_alias(name, arg)
         _aliases_on = _action_aliases_on()
         if _aliases_on and name not in ACTIONS:
@@ -50708,6 +50805,92 @@ def _note_spoken_question(msg: str) -> None:
         print(f"  [pending] could not record the spoken question: {_e}")
 
 
+# ── The away question answered from the queue (2026-11-17) ─────────────────
+# Live 16:02:13 "did you log anything while I was at school today?": the brain
+# said "I've checked the logs" with no action, then ran agents_status; the
+# real recap waited in the queue until 16:02:41. _away_recap_shortcut drains
+# the queue at once instead (core/owner_presence.is_away_recap_ask).
+# _pending_drain_spoken[0]: a list collecting the lines a drain speaks while
+# the shortcut runs (None otherwise). _last_away_recap[0]: (time.time(), line)
+# of the last "While you were away" recap spoken, or None.
+_pending_drain_spoken: list = [None]
+_last_away_recap: list = [None]
+
+
+def _note_pending_spoken(item, msg) -> None:
+    """Called by _speak_pending for each line it spoke. Never raises."""
+    try:
+        if _pending_drain_spoken[0] is not None:
+            _pending_drain_spoken[0].append(str(msg))
+        src = str((item or {}).get("source") or "")
+        if src == _owner_presence_mod._RECAP_SOURCE:
+            _last_away_recap[0] = (time.time(), str(msg))
+    except Exception:
+        pass
+
+
+def _pending_queue_nonempty() -> bool:
+    """Peek (no claim): is anything still on the speech queue? False on any
+    error. Never raises."""
+    try:
+        with open(PENDING_SPEECH_PATH, "r", encoding="utf-8") as f:
+            raw = f.read().strip()
+        if not raw:
+            return False
+        items, _ = json.JSONDecoder().raw_decode(raw)
+        return bool(items)
+    except Exception:
+        return False
+
+
+def _away_recap_shortcut(text: str) -> bool:
+    """AWAY_RECAP_ROUTE (default True, 2026-11-17): "did anything happen while
+    I was away / did you log anything while I was at school" drains the
+    speech queue now (_speak_pending: the "While you were away" recap and
+    every line that waited), with no brain call. When the drain says
+    nothing: the recap he already heard in the last 3 h again, "still
+    waiting" while a hold keeps lines queued, or the honest "nothing was
+    waiting" (core/owner_presence.away_answer_line). False when off or the
+    line is no such question. Never raises."""
+    try:
+        if not globals().get("AWAY_RECAP_ROUTE", True):
+            return False
+        if not _owner_presence_mod.is_away_recap_ask(text):
+            return False
+    except Exception:
+        return False
+    try:
+        print("  [away-recap] an away question - the queued lines, no brain")
+        _last_user_text[0] = text
+        _last_turn_ctx_at[0] = time.monotonic()   # TTS_TURN_CONTEXT_TTL_S
+        _pending_drain_spoken[0] = []
+        try:
+            spoke = bool(_speak_pending())
+        except Exception as _e:
+            print(f"  [away-recap] drain failed: {type(_e).__name__}")
+            spoke = False
+        said = list(_pending_drain_spoken[0] or [])
+        _pending_drain_spoken[0] = None
+        last = _last_away_recap[0]
+        line = _owner_presence_mod.away_answer_line(
+            spoke=spoke and bool(said),
+            still_queued=(not said) and _pending_queue_nonempty(),
+            last_recap=last[1] if last else "",
+            last_recap_age_s=(time.time() - last[0]) if last else None)
+        if line:
+            print(f"  JARVIS: {line}")
+            _append_turn(text, line)
+            _speak(line)
+        else:
+            _append_turn(text, " ".join(said))
+        set_state("idle")
+        return True
+    except Exception as _e:
+        _pending_drain_spoken[0] = None
+        print(f"  [away-recap] failed: {type(_e).__name__}")
+        return False
+
+
 def _speak_pending(only_sources=None):
     """If skills (like the timer) have queued reminders, speak them now.
 
@@ -50967,6 +51150,9 @@ def _speak_pending(only_sources=None):
                 _last_line_queued[0] = None
             _mark_speech_spoken(_dkey)
             spoke_any = True
+            # 2026-11-17 (_away_recap_shortcut): what the drain said, for the
+            # turn's history, and the last away recap, to say it again.
+            _note_pending_spoken(item, msg)
             # A queued line that asks something (a pattern offer, the recap's
             # closing question) goes into the conversation so the owner's
             # answer has its question (_note_spoken_question) — and so does
@@ -51614,6 +51800,10 @@ def _run_voice_shortcuts(text: str) -> bool:
     # (REPEAT_LAST_LINE); asking for the old one reads it first.
     _last_line_turn[0] += 1
     if _repeat_last_line_shortcut(text):
+        return True
+    # "Did anything happen while I was away?" - the queued recap, not the
+    # brain (2026-11-17, AWAY_RECAP_ROUTE).
+    if _away_recap_shortcut(text):
         return True
     # A plain "set an alarm for <time>" / "wake me up at <time>": the alarm
     # skill itself, never the brain's reading of the time.
@@ -53006,6 +53196,12 @@ def _handle_sleep_standby(injected_text: str | None):
             return None
         if not _input_backoff_quiet():   # R10: see _capture_utterance
             print(f"{_label}… (say 'JARVIS' to wake)")
+        # BOOT ORDER (2026-11-17): in wake-word mode JARVIS boots ASLEEP, so
+        # the awake "Listening…" lines never ran and the first camera open
+        # waited the whole CAMERA_FIRST_OPEN_WAIT_S cap (live on the Dell
+        # 11-17 12:32). This standby/sleeping listen is the main loop
+        # listening too. Only the event: no resume_face_tracking() here.
+        _boot_listening.set()
         set_state("idle")
         _tt_rec_since = _tt("now")
         # yield_to_work: a typed command or a reminder queued while this idle
