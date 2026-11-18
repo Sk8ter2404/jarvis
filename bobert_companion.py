@@ -1335,6 +1335,9 @@ from core import yes_no as _yes_no  # noqa: E402
 # A yes to JARVIS's own offer carries the offer out (2026-10-02) - see
 # _note_open_offer / _take_open_offer and core/offer_reply.py.
 from core import offer_reply as _offer_reply  # noqa: E402
+# A launch name nothing could start, checked against JARVIS's own windows and
+# the installed apps (v3.0.26) - see _feature_offer_route / _followup_extra.
+from core import misheard_names as _misheard_names  # noqa: E402
 # Goodbye lines spoken before _act_shutdown_jarvis terminates the process.
 # Picked randomly so repeated shutdowns don't feel scripted.
 SHUTDOWN_GOODBYE_LINES = (
@@ -18240,6 +18243,9 @@ _TURN_FLAG_KEYS = (
     "PENDING_SOURCE_POLICY", "PENDING_GREETING_FIRST",
     "ARRIVAL_NEWS_WAIT_FOR_BRAIN", "ARRIVAL_NEWS_WINDOW_AFTER_WARMUP",
     "ARRIVAL_SAY_WHAT_FAILED", "CLAP_MEDIA_WIDE",
+    # v3.0.26 (ovh-b): a launch name nothing could start is checked against
+    # JARVIS's own windows and the installed apps.
+    "LAUNCH_NOT_FOUND_SUGGEST",
 )
 
 
@@ -23673,6 +23679,24 @@ def _search_results_route(text, offer_yes: str = ""):
             return None
         print(f"  [route] search results {why}: read_search_results")
         return "[ACTION: read_search_results]"
+    except Exception:
+        return None
+
+
+def _feature_offer_route(offer_yes: str = ""):
+    """The token of JARVIS's own window when this turn said yes to
+    launch_app's "Shall I open the holo HUD instead?" (core.misheard_names,
+    v3.0.26; live 2026-11-17 17:12:41 "open hollow hood"), else None. Only
+    that exact offer, and only while its action is registered. The token runs
+    through parse_and_run_actions like any route, every gate included. Never
+    raises."""
+    try:
+        tok = _misheard_names.offer_token(offer_yes) if offer_yes else ""
+        m = _ROUTE_TOKEN_RE.match(tok) if tok else None
+        if not m or m.group(1) not in ACTIONS:
+            return None
+        print(f"  [route] yes to the feature offer -> {m.group(1)}")
+        return tok
     except Exception:
         return None
 
@@ -46396,6 +46420,9 @@ def _followup_extra(action_results) -> str:
            "else instead.\n" if _screen_target_stuck(action_results) else
            "- If the result shows an error or dead end, try an alternative "
            "approach.\n") +
+        # v3.0.26 (LAUNCH_NOT_FOUND_SUGGEST): live 2026-11-17 17:12:59 this
+        # round offered "Hollow Knight" for a not-found "Hollow Hood".
+        _misheard_names.followup_rule(action_results) +
         "- If a result begins with a JARVIS-voice failure line (e.g. "
         "\"Windows is being precious about that one, sir.\" / \"It seems "
         "the internet has opinions today, sir.\") followed by "
@@ -53725,6 +53752,10 @@ def _turn_check_escalate(user_text, verdict, failed_texts, barge_seq0,
                   "read-back")
             conversation_history.append({"role": "assistant",
                                          "content": " ".join(_terminal)})
+            # ... said last, so an offer it ends on is the open one (v3.0.26,
+            # as in the main follow-up loop).
+            if _offer_reply.offer_text(" ".join(_terminal)):
+                texts.append(" ".join(_terminal))
         # One read-back, only for real results the owner should hear (never
         # a synthetic "_" result: that would ask for a round we don't run).
         info = [] if _terminal else [
@@ -54108,6 +54139,10 @@ def _run_llm_dispatch_body(text: str) -> str:
     # A skill's utterance route (see _UTTERANCE_ROUTES) claims an exact request
     # before the glance check and the LLM: its action token IS the reply.
     _route_reply = _utterance_route_reply(text)
+    # A yes to launch_app's "Shall I open the holo HUD instead?" (v3.0.26):
+    # the feature it named, without the brain.
+    if _route_reply is None and _offer_yes:
+        _route_reply = _feature_offer_route(_offer_yes)
     # "What are the results?" / yes to "shall I read them?" after a web
     # search: the action is known, only its wording is the model's.
     if _route_reply is None:
@@ -54367,6 +54402,10 @@ def _run_llm_dispatch_body(text: str) -> str:
     _lg_guard = _loop_guard.LoopGuard() if _lg_mode != "off" else None
     _lg_seen = 0
     _lg_warned = False
+    # The terminal line the chain stopped on, if any (v3.0.26): it is the
+    # last thing said, so an offer it ends with ("Shall I open the holo HUD
+    # instead?", core.misheard_names) is the open one (_note_open_offer).
+    _terminal_said = ""
     for depth in range(_max_followup):
         # A TERMINAL failure (2026-10-02, core.failure_markers: "Task Manager
         # runs as administrator, sir; Windows won't let me close it from
@@ -54378,8 +54417,9 @@ def _run_llm_dispatch_body(text: str) -> str:
             if _terminal_failure_text(r)))
         if _terminal_lines:
             print("  [follow-up] terminal failure reported - stopping")
+            _terminal_said = " ".join(_terminal_lines)
             conversation_history.append({"role": "assistant",
-                                         "content": " ".join(_terminal_lines)})
+                                         "content": _terminal_said})
             break
         # A self-voiced result is neither news to report nor a failure to
         # explain: the action already said what it had to.
@@ -54588,12 +54628,18 @@ def _run_llm_dispatch_body(text: str) -> str:
             print(f"  [close-out] could not speak it: {_co_err}")
     # The offer this turn ENDED on is open for the next owner turn's yes
     # (_note_open_offer, 2026-10-02) - unless the turn ended on something
-    # else. Before the ledger records this chain's offers as closed.
-    _note_open_offer(_chain_texts,
+    # else. Before the ledger records this chain's offers as closed. A
+    # terminal line the chain stopped on was said last (v3.0.26): when it
+    # ends on an offer of its own, that is the open one. (One without an
+    # offer changes nothing: a model offer before it stays unanswerable, as
+    # _offer_is_last_said sees the terminal line said after it.)
+    _said_texts = _chain_texts + (
+        [_terminal_said] if _offer_reply.offer_text(_terminal_said) else [])
+    _note_open_offer(_said_texts,
                      skip=bool(_barged or _close or _sv_reply))
     # The chain is over: its offers are closed (NEW #13) - a later turn's
     # "Also, …" aside that repeats one is not spoken.
-    _record_turn_offers(_chain_texts)
+    _record_turn_offers(_said_texts)
     # Turn checker (TURN_CHECK_MODE, core/turn_checker.py): did this turn fail
     # in a way a retry on Claude would fix? 'off' returns at once, 'shadow'
     # only logs; 'on' may retry it once. Before the trim, so a retry's reply

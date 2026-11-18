@@ -1019,9 +1019,20 @@ STT_HOTWORDS = ""
 # dict, so the owner's own entries are kept, and private names live only there):
 # live 11-16 23:57:51 "how's the Yetsi pace doing?" (the Etsy page) ->
 # project_status.
+# v3.0.26: "holo HUD" (his name for the hologram window, holo_mode_on) as
+# Parakeet heard it on 11-17 - 16:53:44 "a hollow hood", 16:53:58 "hologram hot
+# hood", 16:11:01 "holographic hug", 17:12:41 / 17:12:54 "hollow hood / hud" -
+# every one failed. WHOLE PHRASES only: the word "hollow" (or "hot", "hood")
+# on its own is never rewritten, so "Hollow Knight" and "a hollow log" stay.
+# A user_settings.json entry mapping a phrase to itself turns one off.
 STT_REPLACEMENTS: dict = {
     "yetsi": "Etsy", "yetsy": "Etsy", "etsey": "Etsy",
     "yetsi pace": "Etsy page", "yetsy pace": "Etsy page",
+    "hollow hood": "holo HUD", "hollow hud": "holo HUD",
+    "hollow hug": "holo HUD", "hollow h u d": "holo HUD",
+    "holo hood": "holo HUD", "holo hug": "holo HUD",
+    "hologram hot hood": "hologram HUD", "hologram hood": "hologram HUD",
+    "holographic hug": "holographic HUD", "holographic hood": "holographic HUD",
 }
 SITE_SHORTCUTS: dict = {}
 
@@ -2420,6 +2431,20 @@ BRIEFING_SIR_ONCE = True
 # nothing. A question back costs one turn; a wrong app costs a window to
 # close. False: launch whatever the brain named (the old behaviour).
 UNRESOLVED_OPEN_ASK = True
+# LAUNCH_NOT_FOUND_SUGGEST (v3.0.26, core/misheard_names.py, checked in
+# core/actions._act_launch_app): live 2026-11-17 17:12:41 / 17:12:54 "open
+# hollow hood / hud" (the holo HUD, misheard) ran launch_app "Hollow Hood",
+# which no app is called, and the follow-up round offered "Hollow Knight" -
+# not installed either. True (default): a name nothing could launch is first
+# checked against JARVIS's own windows (the holo HUD, the hand menu, the
+# holographic overlay; their exact voice words, then a bounded sound-alike
+# match); a fit is OFFERED as a terminal line ("I've no app called Hollow
+# Hood, sir. Shall I open the holo HUD instead?", log "[launch-feature]"),
+# never run, and a yes opens it. Otherwise the failure line names the closest
+# installed Start-menu apps (or says none is close) and the follow-up round
+# may offer only those, the website or a web search. False: the 3.0.25 line
+# and follow-up exactly. Read live.
+LAUNCH_NOT_FOUND_SUGGEST = True
 # DECLINE_RECHECK_MODE (core/prompt_router.decline_recheck, applied in
 # bobert_companion._decline_recheck_apply): live 2026-10-28 17:26:00 "How's
 # the master sheet looking?" got a bare "I'm afraid I've no way to check that,
