@@ -2197,11 +2197,14 @@ def _with_turn_context(messages: list, turn_ctx: str) -> list:
 # the model with most of its system prompt gone. Live: 2 turns on 2026-10-01
 # read prompt_eval_count=8195. _fit_local_messages estimates every local
 # prompt and, only when it is over budget, drops the low-rank per-turn parts
-# (the cheap tail), then the oldest history, then the sections, then the rest
-# of the history. It never touches the system prompt or the final message (nor
+# (the cheap tail), then ONE routed section when that alone is enough
+# (2026-11-17), then the oldest history, then the sections, then the rest of
+# the history. It never touches the system prompt or the final message (nor
 # a follow-up round's owner request). Calibration, ranks and trim order:
 # core/prompt_budget.py. Review fixes 2026-10-02: a turn's history trim is kept
-# for good (_persist_budget_history_trim), a prompt that cannot fit still sheds
+# for good (_persist_budget_history_trim; since 2026-11-17 only when the
+# history overflowed on its own, never when routed sections caused it), a
+# prompt that cannot fit still sheds
 # everything it can, a follow-up round clips its results, and a reply whose
 # prompt_eval_count shows Ollama cut the prompt anyway is logged and shrinks
 # the next budgets (_note_prompt_window). JARVIS_LOCAL_PROMPT_BUDGET=0 turns
@@ -2220,15 +2223,17 @@ class _BudgetedMessages(list):
     Also carries what the fit did: ``fits``, ``trimmed``, ``ctx_chars`` (the
     per-turn context actually attached, for the turn-timing line) and
     ``dropped_head`` (the history messages it dropped, oldest first, for
-    _persist_budget_history_trim) and ``note`` (the ``[prompt-budget]`` line
-    for a trimmed or still-over fit, '' otherwise - printed unless the
-    caller passed log=False)."""
+    _persist_budget_history_trim), ``history_overflow`` (that trim was the
+    history's own - prompt_budget.Fit.history_overflow) and ``note`` (the
+    ``[prompt-budget]`` line for a trimmed or still-over fit, '' otherwise -
+    printed unless the caller passed log=False)."""
     num_ctx = 0
     window = 0
     fits = True
     trimmed = False
     ctx_chars = 0
     dropped_head = ()
+    history_overflow = False
     note = ""
 
 
@@ -2330,6 +2335,7 @@ def _fit_local_messages(system: str, messages: list, parts=(), *,
         out.ctx_chars = sum(len(p.text) for p in parts
                             if p.label not in dropped)
         out.dropped_head = tuple(list(messages)[:fit.dropped_history])
+        out.history_overflow = bool(fit.history_overflow)
         return out
     except Exception as _e:
         print(f"  [prompt-budget] {where}: check failed "
@@ -2348,12 +2354,26 @@ def _persist_budget_history_trim(fitted) -> int:
     (a window too small for the system prompt: a 30B-class tag, an observed
     truncation) sheds its history for that call only, so the conversation is
     whole again once the window is - and only when those messages are still
-    the front of the live list. Returns how many went. Never raises."""
+    the front of the live list.
+
+    2026-11-17 (live 16:11:01, 6 messages deleted by a turn whose overflow
+    one routed section explained): kept only when the trim was the
+    history's OWN (``history_overflow``: with every section part out, the
+    whole history still overflows, so every turn would). A trim this turn's
+    routed sections caused is for this call only - the next turn routes its
+    own sections and the conversation is whole again; it logs one
+    ``[prompt-budget] history trim not kept`` line. Returns how many went.
+    Never raises."""
     try:
         if not getattr(fitted, "fits", True):
             return 0
         gone = tuple(getattr(fitted, "dropped_head", ()) or ())
         if not gone:
+            return 0
+        if not getattr(fitted, "history_overflow", True):
+            print(f"  [prompt-budget] history trim not kept: this turn's "
+                  f"routed sections caused the overflow, so its {len(gone)} "
+                  f"oldest message(s) stay in the conversation")
             return 0
         n = _trim_conversation_history(drop_front=gone)
         if n:
@@ -27784,13 +27804,15 @@ def _call_llm(user_text: str) -> str:
         # "Wait, what? It sent that?" (v3.0.10, RECALL_ACTION_GROUNDING): the
         # actions that really ran in the last minute, so the reply cannot
         # deny one; '' on every other turn.
+        # RANK_DIRECTIVE (2026-11-17): never traded for history, dropped
+        # after every routed section.
         ("recent actions", _recall_action_note(user_text),
-         _prompt_budget.RANK_SECTION),
-        # Last, nearest the owner's words; ranked with the action grammar,
+         _prompt_budget.RANK_DIRECTIVE),
+        # Last, nearest the owner's words; ranked above the action grammar,
         # since it IS what this turn has to do.
         ("accepted offer",
          _offer_reply.directive(_offer_yes) if _offer_yes else "",
-         _prompt_budget.RANK_SECTION),
+         _prompt_budget.RANK_DIRECTIVE),
     ]
     _turn_addenda = "".join(_t for _l, _t, _r in _addenda_parts)
 
@@ -46412,6 +46434,42 @@ def _followup_extra(action_results) -> str:
     )
 
 
+def _followup_unused_sections(pc_block: str, action_results) -> set:
+    """The section names in ``pc_block`` (the turn's routed bodies, which a
+    follow-up round re-sends) that document NONE of the actions this round
+    ran. get_followup_response ranks them prompt_budget.RANK_INHERITED, so an
+    overflowing round sheds them before any history (2026-11-17: live
+    16:54:00 a follow-up dropped 17 history messages and kept SYSTEM HEALTH
+    and TASK QUEUE, ~10k characters that documented nothing it had run).
+
+    Empty - nothing demoted - when the round ran no real action: results
+    named only by a ``_`` pseudo-action (_unverified_claim, _dropped_step,
+    ...) mean the round still has to EMIT one, and the sections are where it
+    is documented. A section documents an action when its body carries an
+    ``[ACTION: name`` token or names a registered action
+    (prompt_router.documented_actions). Never raises; set() on a fault."""
+    try:
+        if not pc_block:
+            return set()
+        ran = set()
+        for item in action_results or ():
+            name = str(item[0] or "").strip().lower()
+            if name and not name.startswith("_"):
+                ran.add(name)
+        if not ran:
+            return set()
+        from core import prompt_router as _pr
+        known = set(globals().get("ACTIONS") or ())
+        out = set()
+        for head, body in _pr.split_turn_block(pc_block):
+            documented = {a.lower() for a in _pr.documented_actions(body, known)}
+            if head and not (documented & ran):
+                out.add(head)
+        return out
+    except Exception:
+        return set()
+
+
 def _fit_followup_round(local_sys: str, action_results, local_parts):
     """The local follow-up round's messages, fitted to the budget with the
     owner's request pinned (review 2026-10-02: on this round the final
@@ -46545,11 +46603,17 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
             # can shed the least important ones from an overflowing round.
             # PROMPT_SLIM_MODE: the turn's learned hints too - that system
             # prompt no longer holds the facts / topics / projects.
+            # A re-sent section that documents none of the actions this round
+            # ran ranks INHERITED (2026-11-17): an overflowing round sheds it
+            # before any history (live 16:54:00 dropped 17 history messages
+            # and kept two such sections).
             _local_parts = _turn_budget_parts(
                 _last_turn_pc_block[0],
                 _followup_addenda_parts + [
                     ("learned hints", _last_turn_hints[0],
-                     _prompt_budget.RANK_MEMORY)])
+                     _prompt_budget.RANK_MEMORY)],
+                inherited=_followup_unused_sections(_last_turn_pc_block[0],
+                                                    action_results))
         try:
             _fitted = _fit_followup_round(_local_sys, action_results,
                                           _local_parts)

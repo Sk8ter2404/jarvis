@@ -8,9 +8,10 @@ server log). Two live local turns that day read prompt_eval_count=8195: the
 model answered with most of its system prompt (identity, action grammar,
 safety rules) cut away. These tests pin the estimator against the live
 measurements and the trim order on synthetic oversized prompts: the cheap
-low-rank tail parts first, then the oldest history, then the sections, never
-the system prompt and never the current message (nor, on a follow-up round,
-the owner's request).
+low-rank tail parts first, then one routed section when that alone is enough
+(2026-11-17), then the oldest history, then the sections, never the system
+prompt and never the current message (nor, on a follow-up round, the owner's
+request).
 """
 from __future__ import annotations
 
@@ -487,6 +488,148 @@ class ReviewObservedWindowTests(unittest.TestCase):
         w.note(15800, 8195)
         self.assertFalse(w.note(13600, 13400))
         self.assertEqual(w.effective(16384), 16384)
+
+
+class OneSectionBeforeHistoryTests(unittest.TestCase):
+    """2026-11-17 (brain-03). Live 16:11:01: a turn ~1,208 tokens over the
+    16,056 budget dropped phrase rotation, long-term memory and learned
+    hints, then 6 history messages, and only THEN the 9,053-character TASK
+    QUEUE section (~2.4k tokens) - which alone covered the overflow - and the
+    monolith deleted those 6 messages from the conversation for good. One
+    routed section now goes before any history when that alone is enough
+    (the largest one), and the fit says whether a history trim was the
+    history's own (Fit.history_overflow) so the monolith keeps only those.
+    Live defaults: the 16,384 window, a voice turn's max_tokens=500."""
+
+    SYSTEM = "S" * 51000       # the cache-stable system prompt, ~13.8k est.
+    BUDGET = pb.budget_for(16384, 500)
+
+    def _live_parts(self):
+        return [
+            pb.TurnPart("HOLO MODE", "H" * 1500, pb.RANK_SECTION),
+            pb.TurnPart("TASK QUEUE", "\n" + "Q" * 9053, pb.RANK_SECTION),
+            pb.TurnPart("long-term memory", "L" * 700, pb.RANK_MEMORY),
+            pb.TurnPart("learned hints", "K" * 400, pb.RANK_MEMORY),
+            pb.TurnPart("phrase rotation", "P" * 300, pb.RANK_STYLE_HINT),
+        ]
+
+    def _fit(self, msgs, parts, budget=None, **kw):
+        return pb.fit_chat(msgs, parts,
+                           budget=self.BUDGET if budget is None else budget,
+                           measure=_measure(self.SYSTEM), attach=_ctx_attach,
+                           **kw)
+
+    def _ctx(self, parts):
+        return "".join(p.text for p in parts)
+
+    def test_the_live_turn_keeps_its_history(self):
+        msgs = _history(3, n=300) + [_msg("user", 40, "w")]
+        parts = self._live_parts()
+        measure = _measure(self.SYSTEM)
+        full = measure(_ctx_attach(msgs, self._ctx(parts)))
+        # Preconditions: over budget by about the live amount; the history
+        # alone fits; dropping TASK QUEUE (+ the cheap tail) alone fits.
+        self.assertGreater(full - self.BUDGET, 1000)
+        self.assertLessEqual(measure(_ctx_attach(msgs, "")), self.BUDGET)
+        fit = self._fit(msgs, parts)
+        self.assertTrue(fit.fits, fit)
+        self.assertEqual(fit.dropped_history, 0, fit)
+        self.assertEqual(fit.messages[:-1], msgs[:-1],
+                         "history must go out byte-for-byte unchanged")
+        self.assertIn("TASK QUEUE", fit.dropped_parts)
+        self.assertNotIn("HOLO MODE", fit.dropped_parts)
+        self.assertIn("H" * 1500, fit.messages[-1]["content"])
+        self.assertNotIn("Q" * 50, fit.messages[-1]["content"])
+        self.assertFalse(fit.history_overflow)
+        note = pb.describe(fit, "turn", num_ctx=16384)
+        self.assertNotIn("history", note)
+        self.assertIn("TASK QUEUE", note)
+
+    def test_the_largest_section_that_is_enough_goes(self):
+        msgs = _history(2, n=200) + [_msg("user", 40, "w")]
+        parts = [pb.TurnPart("SMALL", "A" * 3000, pb.RANK_SECTION),
+                 pb.TurnPart("BIG", "B" * 6000, pb.RANK_SECTION)]
+        measure = _measure(self.SYSTEM)
+        full = measure(_ctx_attach(msgs, self._ctx(parts)))
+        # Either one alone would do.
+        fit = self._fit(msgs, parts, budget=full - 300)
+        self.assertTrue(fit.fits, fit)
+        self.assertEqual(fit.dropped_parts, ("BIG",))
+        self.assertEqual(fit.dropped_history, 0)
+
+    def test_when_no_one_section_is_enough_the_history_goes_first(self):
+        # The 10-02 order still holds past step 1b: oldest history, then the
+        # sections largest first.
+        msgs = _history(6, n=1200) + [_msg("user", 40, "w")]
+        parts = [pb.TurnPart("A", "A" * 2000, pb.RANK_SECTION),
+                 pb.TurnPart("B", "B" * 2500, pb.RANK_SECTION)]
+        measure = _measure(self.SYSTEM)
+        full = measure(_ctx_attach(msgs, self._ctx(parts)))
+        b_alone = measure(_ctx_attach(msgs, "A" * 2000))
+        budget = full - (full - b_alone) - 400     # B alone is not enough
+        fit = self._fit(msgs, parts, budget=budget)
+        self.assertTrue(fit.fits, fit)
+        self.assertGreater(fit.dropped_history, 0)
+        self.assertEqual(fit.dropped_parts, ())
+        # ...and that trim was caused by the sections, not the history.
+        self.assertLessEqual(measure(_ctx_attach(msgs, "")), budget)
+        self.assertFalse(fit.history_overflow)
+
+    def test_a_history_too_long_on_its_own_says_so(self):
+        msgs = _history(10, n=1200) + [_msg("user", 40, "w")]
+        parts = [pb.TurnPart("A", "A" * 2000, pb.RANK_SECTION),
+                 pb.TurnPart("tone", "T" * 200, pb.RANK_REGISTER)]
+        measure = _measure(self.SYSTEM)
+        self.assertGreater(measure(_ctx_attach(msgs, "")), self.BUDGET)
+        fit = self._fit(msgs, parts)
+        self.assertTrue(fit.fits, fit)
+        self.assertGreater(fit.dropped_history, 0)
+        self.assertTrue(fit.history_overflow)
+
+    def test_a_directive_is_never_traded_for_history(self):
+        # The owner's accepted offer / the recent-actions note: what the turn
+        # has to do. Not a step-1b candidate, and the last part to go.
+        self.assertGreater(pb.RANK_DIRECTIVE, pb.RANK_SECTION)
+        msgs = _history(4, n=1200) + [_msg("user", 40, "w")]
+        parts = [pb.TurnPart("accepted offer", "D" * 900, pb.RANK_DIRECTIVE)]
+        measure = _measure(self.SYSTEM)
+        full = measure(_ctx_attach(msgs, self._ctx(parts)))
+        fit = self._fit(msgs, parts, budget=full - 150)
+        self.assertTrue(fit.fits, fit)
+        self.assertEqual(fit.dropped_parts, ())
+        self.assertGreater(fit.dropped_history, 0)
+        self.assertIn("D" * 900, fit.messages[-1]["content"])
+        # Step 3: sections before the directive.
+        parts = [pb.TurnPart("accepted offer", "D" * 400, pb.RANK_DIRECTIVE),
+                 pb.TurnPart("A", "A" * 200, pb.RANK_SECTION)]
+        fit = pb.fit_chat(_history(1, n=50) + [_msg("user", 40, "w")], parts,
+                          budget=self.BUDGET, measure=_measure("S" * 59200),
+                          attach=_ctx_attach)
+        self.assertEqual(fit.dropped_parts[0], "A")
+
+    def test_an_inherited_section_still_goes_in_step_one(self):
+        # RANK_INHERITED (25) sits below RANK_SECTION: it goes with the cheap
+        # tail, never as the step-1b candidate.
+        msgs = _history(2, n=200) + [_msg("user", 40, "w")]
+        parts = [pb.TurnPart("OWN", "O" * 3000, pb.RANK_SECTION),
+                 pb.TurnPart("INHERITED", "I" * 3000, pb.RANK_INHERITED)]
+        measure = _measure(self.SYSTEM)
+        full = measure(_ctx_attach(msgs, self._ctx(parts)))
+        fit = self._fit(msgs, parts, budget=full - 300)
+        self.assertEqual(fit.dropped_parts, ("INHERITED",))
+
+    def test_a_follow_up_round_keeps_its_history_too(self):
+        # pin_last_user: the owner's request + the chain stay; one section
+        # still goes before the older history.
+        msgs = (_history(3, n=300)
+                + [{"role": "user", "content": "OWNER: show the holo"},
+                   {"role": "assistant", "content": "[ACTION: holo_show]"},
+                   _msg("user", 400, "r")])
+        parts = self._live_parts()
+        fit = self._fit(msgs, parts, pin_last_user=True)
+        self.assertTrue(fit.fits, fit)
+        self.assertEqual(fit.dropped_history, 0, fit)
+        self.assertIn("TASK QUEUE", fit.dropped_parts)
 
 
 if __name__ == "__main__":

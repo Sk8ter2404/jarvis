@@ -25,16 +25,36 @@ the budget, trims in a fixed order until it fits:
      tone, a section only the history routed, long-term memory, agent mode),
      lowest rank first - they sit at the END of the prompt, so dropping them
      breaks no cached prefix;
+  1b. ONE routed section instead of any history: the largest RANK_SECTION
+     part whose removal alone brings the prompt in (2026-11-17, below);
   2. the oldest history messages, down to the last ``keep_recent`` (the most
      recent exchange: a short follow-up's subject lives there);
   3. the remaining parts - the routed PC sections, largest first within a
-     rank, so the fewest capabilities are lost;
+     rank, so the fewest capabilities are lost; RANK_DIRECTIVE parts last;
   4. the rest of the history.
 
 Review 2026-10-02: the order used to start with the history, which moves the
 front of the message list and costs the turn a full prompt re-evaluation
 (~2.5 s, see _STABLE_LOCAL_PREFIX in the monolith) while the cheap tail
 parts stayed.
+
+ONE SECTION BEFORE THE HISTORY (2026-11-17)
+===========================================
+Live 2026-11-17 16:11:01: a turn ~1,208 tokens over budget dropped its cheap
+tail, then 6 history messages, and only then the 9,053-character TASK QUEUE
+section (~2.4k tokens), which alone would have covered the whole overflow -
+and the monolith then deleted those 6 messages from the conversation for good.
+Step 1b drops the one section first when that alone is enough: the largest
+(the first victim step 3 would have picked anyway), tried largest first so a
+denser smaller section is still found when the largest is not enough. A
+section costs the turn one capability's instructions (the cached head's
+ACTION INDEX still names every action); the history it saves is the
+conversation itself. Only parts of exactly RANK_SECTION qualify: a
+RANK_DIRECTIVE part (the owner's accepted offer, the recent-actions note) is
+what the turn has to do, so it is never traded for history and step 3 drops
+it last. ``Fit.history_overflow`` says whether a history trim was the
+history's own (the prompt still overflows with every section part removed);
+the monolith keeps a trim for good only then (_persist_budget_history_trim).
 
 It never touches the system prompt (the cache-stable prefix, which carries the
 action grammar and the safety core) or the final message (the user's words, or
@@ -206,6 +226,10 @@ RANK_INHERITED = 25    # a section only the HISTORY routed (a short follow-up's
 RANK_MEMORY = 30       # per-turn long-term-memory recall
 RANK_MODE = 40         # agent-mode PLAN/EXECUTE directive
 RANK_SECTION = 50      # PC_CONTROL section bodies (the turn's action grammar)
+RANK_DIRECTIVE = 60    # what this turn has to do: the owner's accepted offer,
+                       # the actions that really ran (2026-11-17). Never
+                       # traded for history (step 1b); dropped after every
+                       # section.
 
 # A follow-up round whose results alone overflow clips each result to these
 # sizes in turn (head and tail kept, clip_middle) before giving up.
@@ -240,6 +264,11 @@ class Fit(NamedTuple):
                            # alone (the final one, plus the pinned owner turn
                            # and chain with pin_last_user); 0 when the prompt
                            # fit and nothing was measured
+    history_overflow: bool = False  # a history trim the history needed on
+                           # its own: the whole history, with every section
+                           # part (RANK_SECTION and up) removed and the other
+                           # kept parts in, is still over budget. False when
+                           # no history went (2026-11-17)
 
     @property
     def trimmed(self) -> bool:
@@ -616,6 +645,14 @@ def fit_chat(messages: Sequence, parts: Sequence[TurnPart] = (), *,
         dropped_parts.append(kept.pop(i).label)
         out = build()
         now = measure(out)
+    # 1b. One routed section instead of the history (2026-11-17): the
+    #     largest one whose removal alone brings the prompt in.
+    if now > budget:
+        i, trial, n = _one_section_that_fits(kept, budget, measure, attach,
+                                             head + pinned + [current])
+        if i >= 0:
+            dropped_parts.append(kept.pop(i).label)
+            out, now = trial, n
     # 2. Oldest history, down to the most recent exchange.
     while now > budget and head and len(head) + len(pinned) > max(0, keep_recent):
         dropped_history += _drop_oldest(head)
@@ -632,8 +669,32 @@ def fit_chat(messages: Sequence, parts: Sequence[TurnPart] = (), *,
         dropped_history += _drop_oldest(head)
         out = build()
         now = measure(out)
+    history_overflow = False
+    if dropped_history:
+        # Was that trim the history's own? Put the whole history back, take
+        # every section part out (the other kept parts stay in): still over
+        # means every turn carrying this history overflows, whatever routes.
+        rest = "".join(p.text for p in kept if p.rank < RANK_SECTION)
+        history_overflow = measure(attach(history + [current], rest)) > budget
     return Fit(out, before, now, budget, dropped_history,
-               tuple(dropped_parts), floor)
+               tuple(dropped_parts), floor, history_overflow)
+
+
+def _one_section_that_fits(kept: List[TurnPart], budget: int, measure,
+                           attach, msgs: list):
+    """(index, messages, tokens) for the step-1b drop: the largest part of
+    exactly RANK_SECTION whose removal ALONE brings the prompt within
+    ``budget`` - tried largest first, so a denser smaller one is still found
+    when the largest is not enough. (-1, None, 0) when none does."""
+    order = sorted((i for i, p in enumerate(kept) if p.rank == RANK_SECTION),
+                   key=lambda i: (-len(kept[i].text), -i))
+    for i in order:
+        ctx = "".join(p.text for j, p in enumerate(kept) if j != i)
+        trial = attach(list(msgs), ctx)
+        n = measure(trial)
+        if n <= budget:
+            return i, trial, n
+    return -1, None, 0
 
 
 def clip_middle(text, max_chars: int) -> str:
