@@ -1448,6 +1448,21 @@ PROACTIVE_MAX_UNANSWERED = 2
 PROACTIVE_ATTEMPT_GAP_S  = 300
 # How many recent remarks a new one may not repeat (core/proactive_guard).
 PROACTIVE_RECENT_RING    = 8
+# 2026-11-17 (live 11-16): "...the first computer mouse was made of wood." at
+# 09:28 and again at 12:30 after the 10:11 restart - the ring above lived in
+# memory only. Spoken remarks are also kept on disk (data/proactive_recent.json,
+# restored at boot): a new one may not repeat any of the last
+# PROACTIVE_RECENT_KEEP_N spoken within PROACTIVE_RECENT_KEEP_S. 0 = memory
+# only, as before.
+PROACTIVE_RECENT_KEEP_S  = 7 * 86400
+PROACTIVE_RECENT_KEEP_N  = 30
+# ...and 11:25-12:25 four generations in a row were dropped as a copy of the
+# persona example "One moment, sir.", each a ~12k-token brain call five
+# minutes after the last. After PROACTIVE_DROP_STREAK drops in a row the next
+# attempt waits PROACTIVE_DROP_BACKOFF_S instead of PROACTIVE_ATTEMPT_GAP_S;
+# a spoken remark ends the streak. 0 = no backoff, as before.
+PROACTIVE_DROP_STREAK    = 2
+PROACTIVE_DROP_BACKOFF_S = 3600
 
 MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bobert_memory.json")
 
@@ -17098,7 +17113,12 @@ def should_be_proactive() -> bool:
         last_attempt_at=float(_proactive_last_attempt_at[0] or 0.0),
         cooldown_s=PROACTIVE_COOLDOWN_S, factor=PROACTIVE_BACKOFF_FACTOR,
         max_unanswered=PROACTIVE_MAX_UNANSWERED,
-        attempt_gap_s=PROACTIVE_ATTEMPT_GAP_S)
+        attempt_gap_s=_proactive_guard.attempt_gap_s(
+            int(_proactive_drop_streak[0] or 0),
+            base_s=PROACTIVE_ATTEMPT_GAP_S,
+            streak_min=int(globals().get("PROACTIVE_DROP_STREAK", 0) or 0),
+            backoff_s=float(globals().get("PROACTIVE_DROP_BACKOFF_S", 0)
+                            or 0)))
     if not ok:
         return _proactive_hold("pacing", why)
 
@@ -17140,8 +17160,89 @@ def _proactive_note_spoken(text: str) -> None:
         _proactive_remarks_at.append(_proactive_mono())
         del _proactive_remarks_at[:-16]
         _proactive_hold_logged[0] = ""
+        _proactive_drop_streak[0] = 0
     except Exception:
         pass
+    _proactive_saved_note(text)
+
+
+def _proactive_recent_path() -> str:
+    """data/proactive_recent.json, resolved at call time (core/paths)."""
+    from core.paths import data_file
+    return data_file("proactive_recent.json")
+
+
+def _proactive_saved_prune(now: float) -> None:
+    """Keep the saved remarks within PROACTIVE_RECENT_KEEP_S and the newest
+    PROACTIVE_RECENT_KEEP_N. Never raises."""
+    try:
+        keep_s = float(globals().get("PROACTIVE_RECENT_KEEP_S", 0) or 0)
+        keep_n = max(1, int(globals().get("PROACTIVE_RECENT_KEEP_N", 30) or 30))
+        _proactive_saved[:] = [
+            (t, x) for t, x in _proactive_saved
+            if keep_s > 0 and 0 <= now - t <= keep_s][-keep_n:]
+    except Exception:
+        pass
+
+
+def _proactive_saved_note(text: str) -> None:
+    """A remark was spoken: add it to the saved ring and write it out
+    (PROACTIVE_RECENT_KEEP_S 0 = off). Never raises."""
+    try:
+        if float(globals().get("PROACTIVE_RECENT_KEEP_S", 0) or 0) <= 0:
+            return
+        now = time.time()
+        _proactive_saved.append((now, str(text)))
+        _proactive_saved_prune(now)
+        from core.atomic_io import _atomic_write_json as _w
+        _w(_proactive_recent_path(),
+           [{"t": t, "text": x} for t, x in _proactive_saved])
+    except Exception as _e:
+        print(f"  [proactive] could not save the recent remarks: {_e}")
+
+
+def _proactive_recent_restore() -> int:
+    """Boot: read the remarks the last runs spoke (data/proactive_recent.json)
+    into the saved ring, so a restart cannot repeat one. Returns how many
+    were kept. A missing / corrupt file keeps none. Never raises."""
+    try:
+        if float(globals().get("PROACTIVE_RECENT_KEEP_S", 0) or 0) <= 0:
+            return 0
+        path = _proactive_recent_path()
+        if not os.path.exists(path):
+            return 0
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        rows = []
+        for r in data if isinstance(data, list) else []:
+            if (isinstance(r, dict) and isinstance(r.get("text"), str)
+                    and isinstance(r.get("t"), (int, float))
+                    and not isinstance(r.get("t"), bool)):
+                rows.append((float(r["t"]), r["text"]))
+        _proactive_saved[:] = sorted(rows + list(_proactive_saved))
+        _proactive_saved_prune(time.time())
+        if _proactive_saved:
+            print(f"  [proactive] remembered {len(_proactive_saved)} recent "
+                  f"remark(s) from earlier runs")
+        return len(_proactive_saved)
+    except Exception as _e:
+        print(f"  [proactive] could not read the recent remarks: {_e}")
+        return 0
+
+
+def _proactive_recent_all() -> list:
+    """Every remark a new one may not repeat: the saved ring (earlier runs,
+    PROACTIVE_RECENT_KEEP_S) then this run's ring, oldest first, without
+    duplicates. Never raises."""
+    try:
+        _proactive_saved_prune(time.time())
+        out: list = []
+        for x in [x for _t, x in _proactive_saved] + list(_proactive_recent):
+            if x not in out:
+                out.append(x)
+        return out
+    except Exception:
+        return list(_proactive_recent)
 
 
 def generate_proactive_comment(now: float | None = None) -> str:
@@ -17206,7 +17307,8 @@ def generate_proactive_comment(now: float | None = None) -> str:
         system += (" You have run nothing: never say you did, checked, "
                    "pulled up or prepared anything.")
     clock = time.strftime("%I:%M %p", lt).lstrip("0")
-    recent = list(_proactive_recent)
+    # This run's remarks AND the saved ones from earlier runs (2026-11-17).
+    recent = _proactive_recent_all()
     user = (f"(Local time: {clock}, {_proactive_guard.day_part(lt.tm_hour)}. "
             + ("Give one short interesting fact, or SKIP." if grounded else
                "There has been silence. Generate one short proactive comment."))
@@ -17223,11 +17325,31 @@ def generate_proactive_comment(now: float | None = None) -> str:
         return ""
     if not line.strip():
         return ""
+    # 2026-11-17: "Good morning, sir." / "Certainly, sir." in front of the
+    # fact is cut off (core/proactive_guard.strip_filler_opener); a line that
+    # was nothing more is dropped.
+    opener = _proactive_guard.filler_opener(line)
+    if opener:
+        trimmed = _proactive_guard.strip_filler_opener(line)
+        if not trimmed:
+            _proactive_drop_streak[0] = int(_proactive_drop_streak[0] or 0) + 1
+            print(f"  [proactive] dropped (only '{opener}')")
+            return ""
+        print(f"  [proactive] trimmed the opener '{opener}'")
+        line = trimmed
     ok, why = _proactive_guard.check_remark(line, hour=lt.tm_hour,
                                             recent=recent,
-                                            grounded_only=grounded)
+                                            grounded_only=grounded,
+                                            no_opener=True)
     if not ok:
-        print(f"  [proactive] dropped ({why})")
+        # PROACTIVE_DROP_STREAK: drops in a row back the next attempt off.
+        _proactive_drop_streak[0] = int(_proactive_drop_streak[0] or 0) + 1
+        _streak = int(_proactive_drop_streak[0])
+        _min = int(globals().get("PROACTIVE_DROP_STREAK", 0) or 0)
+        print(f"  [proactive] dropped ({why})"
+              + (f" - {_streak} in a row, next try in "
+                 f"{float(globals().get('PROACTIVE_DROP_BACKOFF_S', 0)) / 60:.0f}"
+                 f" min" if _min > 0 and _streak >= _min else ""))
         return ""
     return line
 
@@ -26153,6 +26275,11 @@ _proactive_recent: list = []
 _proactive_remarks_at: list = []
 _proactive_last_attempt_at = [0.0]
 _proactive_hold_logged = [""]
+# 2026-11-17: [(time.time(), remark)] spoken in this run AND restored from
+# data/proactive_recent.json at boot (PROACTIVE_RECENT_KEEP_S), and how many
+# generations in a row the text gate dropped (PROACTIVE_DROP_STREAK).
+_proactive_saved: list = []
+_proactive_drop_streak = [0]
 
 
 def _note_owner_voice() -> None:
@@ -55552,6 +55679,9 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         # Arm the presence hold on queued proactive speech (starts the
         # physical-input watcher; see _presence_watch_start).
         _presence_watch_start()
+        # The idle remarks the last runs spoke (PROACTIVE_RECENT_KEEP_S): a
+        # restart must not repeat one.
+        _proactive_recent_restore()
         # BOOT_PARALLEL_LOAD (v3 W10): the full dependency import check,
         # now that boot is done (only what the fast pass missed is reported).
         # Kept ABOVE _listen_media_boot(): that call stays the statement right

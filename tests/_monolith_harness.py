@@ -326,6 +326,10 @@ _MONOLITH_RESTORE_NAMES = (
     # the wrong reason; a leaked remark would make a later remark a "repeat".
     "_last_owner_voice_at", "_proactive_recent", "_proactive_remarks_at",
     "_proactive_last_attempt_at", "_proactive_hold_logged",
+    # ...the saved ring of earlier runs' remarks and the drop streak
+    # (2026-11-17): a leaked remark would make a later one a "repeat", a
+    # leaked streak would back a later test's attempt off.
+    "_proactive_saved", "_proactive_drop_streak",
     # The speech-queue presence hold (2026-10-02): the last room-talk stamp,
     # the boot arm (a leaked True would hold a LATER test's queue for an
     # "absent" owner) and the logged hold kind.

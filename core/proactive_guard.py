@@ -326,11 +326,73 @@ def ungrounded_remark(text) -> str:
         return ""
 
 
+# ── an opener that answers a request nobody made (2026-11-17) ───────────────
+# Live 11-16 09:28:44 "Good morning, sir. Interestingly, the first computer
+# mouse was made of wood." and, after the 10:11 restart, 12:30:58 "Certainly,
+# sir. Interestingly, the first computer mouse was made of wood." The prompt
+# forbids a greeting; "Certainly, sir" acknowledges an order that was never
+# given. One leading clause of either kind, after any [tags].
+_FILLER_OPENER_RE = re.compile(
+    r"^(?P<tags>(?:\s*\[[^\]]*\]\s*)*)"
+    r"(?P<opener>\s*(?:certainly|very\s+good|very\s+well|right\s+away|"
+    r"at\s+once|on\s+it|of\s+course|understood|as\s+you\s+wish|indeed|"
+    r"good\s+(?:morning|afternoon|evening|day)|hello|greetings|hey)"
+    r"(?:\s*,?\s*sir)?\s*[.!,;:—–-]+)\s*", re.IGNORECASE)
+OPENER_MIN_WORDS = 4     # what is left after the opener must say something
+
+
+def filler_opener(text) -> str:
+    """The leading greeting / acknowledgement clause of ``text`` ("Certainly,
+    sir.", "Good morning, sir."), or ""."""
+    try:
+        m = _FILLER_OPENER_RE.match(str(text or ""))
+        return m.group("opener").strip() if m else ""
+    except Exception:
+        return ""
+
+
+def strip_filler_opener(text) -> str:
+    """``text`` without its leading greeting / acknowledgement clause (any
+    [tags] kept, the next word capitalised); "" when what is left has fewer
+    than OPENER_MIN_WORDS words. Unchanged when it has no such opener."""
+    try:
+        s = str(text or "")
+        m = _FILLER_OPENER_RE.match(s)
+        if not m:
+            return s
+        rest = s[m.end():].strip()
+        if len(_WORD_RE.findall(rest.lower())) < OPENER_MIN_WORDS:
+            return ""
+        rest = rest[:1].upper() + rest[1:]
+        tags = m.group("tags").strip()
+        return f"{tags} {rest}".strip() if tags else rest
+    except Exception:
+        return str(text or "")
+
+
+def attempt_gap_s(drop_streak: int, *, base_s: float, streak_min: int,
+                  backoff_s: float) -> float:
+    """The wait before the next remark attempt: ``backoff_s`` once
+    ``drop_streak`` generations IN A ROW were dropped by the text gate (live
+    11-16 11:25-12:25 four persona-copy drops, each a ~12k-token brain call),
+    else ``base_s``. ``streak_min`` <= 0 or ``backoff_s`` <= ``base_s``: always
+    ``base_s``."""
+    try:
+        if (int(streak_min) > 0 and int(drop_streak) >= int(streak_min)
+                and float(backoff_s) > float(base_s)):
+            return float(backoff_s)
+        return float(base_s)
+    except Exception:
+        return float(base_s)
+
+
 def check_remark(text, *, hour: int, recent=(), pool=None,
-                 grounded_only: bool = False) -> tuple:
+                 grounded_only: bool = False, no_opener: bool = False) -> tuple:
     """(ok, reason) for one generated proactive remark at local ``hour``.
 
     Dropped (ok False) when it states a time of day the clock contradicts,
+    with ``no_opener`` when it opens with a greeting or an acknowledgement
+    (filler_opener; the idle remark strips one first, strip_filler_opener),
     copies a persona example, or repeats one of ``recent``; with
     ``grounded_only`` also when it has nothing behind it (ungrounded_remark:
     the idle remark asks for this, a screen remark built from what is on
@@ -344,6 +406,9 @@ def check_remark(text, *, hour: int, recent=(), pool=None,
         if bad:
             return (False, f"says '{bad}' at {int(hour) % 24:02d}:00, "
                            f"{day_part(hour)}")
+        opener = filler_opener(text) if no_opener else ""
+        if opener:
+            return (False, f"opens with '{opener}'")
         copied = persona_copy(text, pool)
         if copied:
             return (False, f"copies the persona example '{copied}'")
