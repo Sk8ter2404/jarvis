@@ -21,8 +21,11 @@ synthesising every signal we already log:
 Sample line the skill aims to produce:
   "Sir, today you spent 2 hours 40 minutes in Bambu Studio, completed one
    print, took 4 Teams calls including one from a colleague, and played 11
-   tracks. Shall I queue the same morning briefing for
-   tomorrow?"
+   tracks."
+(No closing question since 2026-11-17: "Shall I queue the same morning
+briefing for tomorrow?" had nothing behind it. The SCHEDULED recap leaves out
+what the evening briefing already said that day - the voice count, the tasks
+cleared, the print still running - and is not queued when nothing is left.)
 
 Actions added:
   daily_recap   -- manually trigger the recap (e.g. "JARVIS, recap my day").
@@ -56,6 +59,11 @@ import time
 from collections import Counter
 
 from core.atomic_io import _atomic_write_json
+
+try:
+    from . import _common
+except ImportError:   # loaded by file path with no package (a smoke run)
+    _common = None
 
 _PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _SPEECH_QUEUE = os.path.join(_PROJECT_DIR, "pending_speech.json")
@@ -536,7 +544,31 @@ def _count_tasks_completed_today() -> int:
 
 # --- recap assembly ------------------------------------------------------
 
-def _build_recap() -> str:
+# What the evening briefing (skills/daily_briefing/evening.py) already says:
+# the day's voice-interaction count, the tasks cleared and the print still
+# running. Live 11-16 23:49:34 / 23:50:21 both were queued while he was out
+# and drained one after the other: "Good evening, sir. 21 voice interactions
+# logged today..." then "Sir, today 21 voice interactions reached me today."
+EVENING_OVERLAP = frozenset({"voice", "tasks", "in_flight"})
+
+
+def _evening_briefed_today() -> bool:
+    """True when the evening briefing fired today (its own same-day stamp,
+    read through the loaded sibling part). False on any failure, so a broken
+    sibling never silences the recap."""
+    try:
+        ev = _common.part(__package__, "evening")
+        return (ev._load_last_fired_date()
+                == datetime.date.today().isoformat())
+    except Exception:
+        return False
+
+
+def _build_recap(skip=()) -> str:
+    """The recap line ('' when there is nothing to say). ``skip``: the kinds
+    of part to leave out ("voice", "tasks", "in_flight" - EVENING_OVERLAP
+    when the evening briefing already said them)."""
+    skip = frozenset(skip or ())
     report = _scan_session_logs()
     _supplement_with_pattern_jsonl(report)
 
@@ -571,7 +603,7 @@ def _build_recap() -> str:
             parts.append("had one print fail on you")
         else:
             parts.append(f"had {_number_word(failed)} prints fail on you")
-    if gcode_state in ("RUNNING", "PREPARE", "PAUSE"):
+    if gcode_state in ("RUNNING", "PREPARE", "PAUSE") and "in_flight" not in skip:
         if in_flight_name:
             parts.append(f"and the H2D is still printing '{in_flight_name}'")
         else:
@@ -616,7 +648,7 @@ def _build_recap() -> str:
                 parts.append(f"played {music_total} tracks")
 
     # 5) Tasks shipped from the queue
-    tasks_done = _count_tasks_completed_today()
+    tasks_done = 0 if "tasks" in skip else _count_tasks_completed_today()
     if tasks_done >= 1:
         if tasks_done == 1:
             parts.append("cleared one task from the queue")
@@ -625,19 +657,36 @@ def _build_recap() -> str:
 
     # 6) Voice-channel volume -- always honest about the lower bound, even
     # if everything else is empty.
+    # Whole sentences with their own subject and their own "today" (live
+    # 11-16 23:50:21: "Sir, today 21 voice interactions reached me today.").
+    # With the evening briefing already given (skip "voice") there is
+    # nothing left to say: no recap.
+    body = ""
     if not parts:
+        if "voice" in skip:
+            return ""
         vc = report["voice_count"]
         if vc == 0:
-            parts.append("nothing of note made it onto the record today, sir")
+            body = "Sir, nothing of note made it onto the record today."
         elif vc == 1:
-            parts.append("just one voice interaction reached me today")
+            body = "Sir, just one voice interaction reached me today."
         else:
-            parts.append(f"{vc} voice interactions reached me today")
+            body = f"Sir, {vc} voice interactions reached me today."
 
     # Stitch into a single JARVIS-style sentence. The opening varies very
     # slightly depending on how much we have.
-    if len(parts) == 1:
-        body = f"Sir, today {parts[0]}."
+    if body:
+        pass
+    elif len(parts) == 1:
+        one = parts[0]
+        if one.startswith("you "):
+            body = f"Sir, today {one}."
+        elif one.startswith("and "):
+            # Only the print still running: "Sir, the H2D is still ...".
+            body = f"Sir, {one[4:]}."
+        else:
+            # A bare verb phrase: "Sir, today you completed one print."
+            body = f"Sir, today you {one}."
     else:
         # The bambu "and the H2D is still printing X" segment is meant to
         # tail at the end of the prints chunk -- if it landed in the middle
@@ -661,9 +710,11 @@ def _build_recap() -> str:
                 or re.match(r"^\d", parts[0]):  # pragma: no cover - defensive: no multi-chunk first part is digit/keyword-led (voice fallback is single-chunk)
             body = f"Sir, today {sentence}."
 
-    # Closing nudge -- the spec's headline ask.
-    closing = " Shall I queue the same morning briefing for tomorrow?"
-    text = body + closing
+    # No closing question (2026-11-17): "Shall I queue the same morning
+    # briefing for tomorrow?" had no action or route behind it - a "yes"
+    # did nothing - and a queued line must not end on a question nothing can
+    # answer (core/owner_presence.recap_line's rule).
+    text = body
 
     # Briefing intent tag so TTS uses the measured "briefing" preset rather
     # than the default neutral one. The dispatcher strips the tag before
@@ -687,11 +738,21 @@ def _show_card_safe() -> None:
 # --- scheduler thread ----------------------------------------------------
 
 def _fire_recap(reason: str = "scheduled") -> str:
-    text = _build_recap()
-    print(f"  [recap] firing recap ({reason}): {text}")
+    # The scheduled recap leaves out what the evening briefing already said
+    # today (EVENING_OVERLAP); with nothing else to add it is not queued at
+    # all. His own "recap my day" (the daily_recap action) is always whole.
+    skip = EVENING_OVERLAP if _evening_briefed_today() else ()
+    text = _build_recap(skip=skip)
+    _save_last_fired_date(datetime.date.today().isoformat())
+    if not text:
+        print(f"  [recap] not queued ({reason}): the evening briefing "
+              f"already covered today")
+        return ""
+    print(f"  [recap] firing recap ({reason}"
+          + (", without what the evening briefing said" if skip else "")
+          + f"): {text}")
     _enqueue_speech(text)
     _show_card_safe()
-    _save_last_fired_date(datetime.date.today().isoformat())
     return text
 
 

@@ -334,6 +334,9 @@ _MONOLITH_RESTORE_NAMES = (
     # the boot arm (a leaked True would hold a LATER test's queue for an
     # "absent" owner) and the logged hold kind.
     "_last_room_talk_at", "_presence_gate_armed", "_presence_hold_logged",
+    # The gap after a budget deferral (PENDING_DEFER_GAP_S, 2026-11-17): a
+    # leaked one would hold a LATER test's queue.
+    "_pending_defer_gap",
     # The media hold (v3.0.10): the last video signal and the hold start (a
     # leaked stamp would hold or release a LATER test's queue), and the
     # owner turn's voice-context stamp (TTS_TURN_CONTEXT_TTL_S).

@@ -2524,6 +2524,9 @@ class SpeakPendingDrainBudgetTests(SectionSixBase):
         # guarantees forward progress), the rest go back on the queue in order.
         self._p(self.bc, "_speak", lambda msg, **k: self.spoke.append(msg))
         self._p(self.bc, "_PENDING_DRAIN_BUDGET_S", 0.0)
+        # The pass-to-pass mechanics, without the 2026-11-17 gap after a
+        # deferral (PENDING_DEFER_GAP_S; test_monolith_proactive_lines_1117).
+        self._p(self.bc, "PENDING_DEFER_GAP_S", 0, create=True)
         with tempfile.TemporaryDirectory() as d:
             path = os.path.join(d, "pending.json")
             self._redirect(path)

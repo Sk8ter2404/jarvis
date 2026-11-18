@@ -209,7 +209,7 @@ Every briefing below is one skill, `skills/daily_briefing/` (merged 2026-10-12 f
 - **Evening briefing** — 22:00 auto. Today's interactions and tasks, the live print, tomorrow's weather and first appointment, an umbrella warning, one dry observation, headlines.
   - "evening briefing", "what's tomorrow looking like"
   - Action: `evening_briefing`
-- **Daily recap** — 22:30 auto end-of-day summary of what you did (app time, prints, calls, music, tasks shipped), ending "Shall I queue the same morning briefing for tomorrow?"
+- **Daily recap** — 22:30 auto end-of-day summary of what you did (app time, prints, calls, music, tasks shipped); after the evening briefing it only adds what that did not say.
   - "recap my day"
   - Action: `daily_recap`
 - **Calendar** — today, tomorrow, this week or the next two weeks via Microsoft Graph; degrades honestly when Graph isn't signed in.

@@ -146,7 +146,9 @@ class DailyRecapTests(unittest.TestCase):
         self.assertIn("completed one print", out)
         self.assertIn("took four Teams calls including one from Sam", out)
         self.assertIn("11 Michael Jackson Essentials tracks", out)
-        self.assertIn("Shall I queue the same morning briefing for tomorrow?", out)
+        # 2026-11-17: no closing question - nothing could answer it.
+        self.assertNotIn("?", out)
+        self.assertNotIn("Shall I", out)
 
     def test_build_recap_empty_day_uses_voice_fallback(self):
         report = _empty_report(voice_count=0)
@@ -155,7 +157,8 @@ class DailyRecapTests(unittest.TestCase):
              mock.patch.object(self.mod, "_bambu_now", return_value={}), \
              mock.patch.object(self.mod, "_count_tasks_completed_today", return_value=0):
             out = self.mod._build_recap()
-        self.assertIn("nothing of note made it onto the record today, sir", out)
+        self.assertIn("Sir, nothing of note made it onto the record today.", out)
+        self.assertEqual(out.count("today"), 1)
 
     def test_build_recap_in_flight_print(self):
         report = _empty_report()
@@ -597,19 +600,22 @@ class BuildRecapBranchTests(unittest.TestCase):
     def test_single_voice_interaction_fallback(self):
         report = _empty_report(voice_count=1)
         out = self._run(report)
-        self.assertIn("just one voice interaction reached me today", out)
+        self.assertIn("Sir, just one voice interaction reached me today.", out)
 
     def test_many_voice_interactions_fallback(self):
         report = _empty_report(voice_count=12)
         out = self._run(report)
-        self.assertIn("12 voice interactions reached me today", out)
+        # Live 11-16 23:50:21: "Sir, today 21 voice interactions reached me
+        # today." - "today" once.
+        self.assertIn("Sir, 12 voice interactions reached me today.", out)
+        self.assertEqual(out.count("today"), 1)
 
     def test_single_part_only_uses_one_chunk_sentence(self):
         # Exactly one chunk (top app, below-10-min is filtered, so use prints).
         report = _empty_report(print_finished=1)
         out = self._run(report)
-        # len(parts)==1 path: "Sir, today completed one print."
-        self.assertIn("Sir, today completed one print.", out)
+        # len(parts)==1 path: a bare verb phrase gets its subject.
+        self.assertIn("Sir, today you completed one print.", out)
 
     def test_top_app_below_threshold_is_omitted(self):
         # 5 minutes of samples < 10 → no app chunk; falls to voice fallback.
@@ -665,7 +671,7 @@ class CardAndFireTests(unittest.TestCase):
             sys.path[:] = saved
 
     def test_fire_recap_enqueues_and_stamps(self):
-        with mock.patch.object(self.mod, "_build_recap", return_value="[intent:briefing] X"), \
+        with mock.patch.object(self.mod, "_build_recap", return_value="[intent:briefing] X"),              mock.patch.object(self.mod, "_evening_briefed_today", return_value=False), \
              mock.patch.object(self.mod, "_enqueue_speech") as enq, \
              mock.patch.object(self.mod, "_show_card_safe") as card, \
              mock.patch.object(self.mod, "_save_last_fired_date") as save:
@@ -674,6 +680,97 @@ class CardAndFireTests(unittest.TestCase):
         enq.assert_called_once()
         card.assert_called_once()
         save.assert_called_once()
+
+
+class EveningOverlapTests(unittest.TestCase):
+    """Live 11-16 23:49:34 "Good evening, sir. 21 voice interactions logged
+    today..." then 23:50:21 "Sir, today 21 voice interactions reached me
+    today. Shall I queue the same morning briefing for tomorrow?" - both had
+    waited for him, and the recap said nothing the briefing had not."""
+
+    def setUp(self):
+        self.mod, self.actions = load_briefing_part("recap")
+
+    def _fire(self, report, *, evening_today, bambu=None, tasks=0):
+        with mock.patch.object(self.mod, "_scan_session_logs", return_value=report), \
+             mock.patch.object(self.mod, "_supplement_with_pattern_jsonl"), \
+             mock.patch.object(self.mod, "_bambu_now", return_value=bambu or {}), \
+             mock.patch.object(self.mod, "_count_tasks_completed_today",
+                               return_value=tasks), \
+             mock.patch.object(self.mod, "_evening_briefed_today",
+                               return_value=evening_today), \
+             mock.patch.object(self.mod, "_enqueue_speech") as enq, \
+             mock.patch.object(self.mod, "_show_card_safe"), \
+             mock.patch.object(self.mod, "_save_last_fired_date") as save:
+            out = self.mod._fire_recap("scheduled")
+        return out, enq, save
+
+    def test_live_count_only_recap_is_not_queued_after_the_evening_briefing(self):
+        out, enq, save = self._fire(_empty_report(voice_count=21),
+                                    evening_today=True)
+        self.assertEqual(out, "")
+        enq.assert_not_called()
+        save.assert_called_once()          # still done for today
+
+    def test_what_the_briefing_did_not_say_is_still_recapped(self):
+        report = _empty_report(voice_count=21, print_finished=1,
+                               teams_alerts=2)
+        bambu = {"gcode_state": "RUNNING", "filename": "gear.3mf"}
+        out, enq, _ = self._fire(report, evening_today=True, bambu=bambu,
+                                 tasks=3)
+        enq.assert_called_once()
+        self.assertIn("completed one print", out)
+        self.assertIn("took two Teams calls", out)
+        # The evening briefing said these: not again.
+        self.assertNotIn("still printing", out)
+        self.assertNotIn("tasks", out)
+        self.assertNotIn("voice interaction", out)
+
+    def test_without_an_evening_briefing_the_recap_is_whole(self):
+        out, enq, _ = self._fire(_empty_report(voice_count=21),
+                                 evening_today=False)
+        enq.assert_called_once()
+        self.assertIn("Sir, 21 voice interactions reached me today.", out)
+
+    def test_his_own_recap_is_always_whole(self):
+        with mock.patch.object(self.mod, "_scan_session_logs",
+                               return_value=_empty_report(voice_count=21)), \
+             mock.patch.object(self.mod, "_supplement_with_pattern_jsonl"), \
+             mock.patch.object(self.mod, "_bambu_now", return_value={}), \
+             mock.patch.object(self.mod, "_count_tasks_completed_today",
+                               return_value=0), \
+             mock.patch.object(self.mod, "_evening_briefed_today",
+                               return_value=True), \
+             mock.patch.object(self.mod, "_enqueue_speech") as enq, \
+             mock.patch.object(self.mod, "_show_card_safe"), \
+             mock.patch.object(self.mod, "_save_last_fired_date"):
+            out = self.actions["daily_recap"]("")
+        enq.assert_called_once()
+        self.assertIn("21 voice interactions", out)
+
+    def test_the_evening_stamp_is_read_from_the_evening_part(self):
+        ev = mock.MagicMock()
+        ev._load_last_fired_date.return_value = datetime.date.today().isoformat()
+        with mock.patch.object(self.mod._common, "part", return_value=ev):
+            self.assertTrue(self.mod._evening_briefed_today())
+        ev._load_last_fired_date.return_value = "1999-01-01"
+        with mock.patch.object(self.mod._common, "part", return_value=ev):
+            self.assertFalse(self.mod._evening_briefed_today())
+        with mock.patch.object(self.mod._common, "part",
+                               side_effect=ImportError("no part")):
+            self.assertFalse(self.mod._evening_briefed_today())
+
+    def test_only_the_running_print_reads_as_a_sentence(self):
+        bambu = {"gcode_state": "RUNNING", "filename": "gear.3mf"}
+        with mock.patch.object(self.mod, "_scan_session_logs",
+                               return_value=_empty_report()), \
+             mock.patch.object(self.mod, "_supplement_with_pattern_jsonl"), \
+             mock.patch.object(self.mod, "_bambu_now", return_value=bambu), \
+             mock.patch.object(self.mod, "_bambu_strip", return_value="gear"), \
+             mock.patch.object(self.mod, "_count_tasks_completed_today",
+                               return_value=0):
+            out = self.mod._build_recap()
+        self.assertIn("Sir, the H2D is still printing 'gear'.", out)
 
 
 class RegisterTests(unittest.TestCase):

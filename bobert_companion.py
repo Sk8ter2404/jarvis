@@ -1019,9 +1019,9 @@ WEATHER_ALERT_COOLDOWN_HOURS      = 4      # per-alert-class cooldown
 # the pattern_learning JSONL, today's session logs, Teams events, and
 # bambu_monitor state ("Sir, today you spent 2 hours 40 minutes in Bambu
 # Studio, completed one print, took 4 Teams calls including one from a
-# colleague, and played 11 tracks. Shall I queue the same morning
-# briefing for tomorrow?"). Also runs on demand via the daily_recap action
-# ("JARVIS, recap my day").
+# colleague, and played 11 tracks."; no closing question since 2026-11-17,
+# and the scheduled one leaves out what the evening briefing already said).
+# Also runs on demand via the daily_recap action ("JARVIS, recap my day").
 DAILY_RECAP_ENABLED           = True
 DAILY_RECAP_HOUR              = 22    # 24-hour clock, local time
 DAILY_RECAP_MINUTE            = 30
@@ -26568,6 +26568,11 @@ def _media_hold_asked_for(entry) -> bool:
     try:
         if not globals().get("MEDIA_HOLD_PASS_ASKED", False):
             return False
+        # The presence recap carries history_text too (its unnamed lines,
+        # 2026-11-17), but nobody asked for it.
+        if (_owner_presence_mod.source_root(entry)
+                == _owner_presence_mod._RECAP_SOURCE.split(":", 1)[0]):
+            return False
         hist = entry.get("history_text") if isinstance(entry, dict) else None
         return isinstance(hist, str) and bool(hist.strip())
     except Exception:
@@ -50749,6 +50754,41 @@ _PENDING_DRAIN_BUDGET_S = 25.0
 # attempts in all, then dropped (a permanently failing line must not wedge
 # the queue).
 _PENDING_SPEAK_MAX_TRIES = 3
+# PENDING_DEFER_GAP_S (core/config, 2026-11-17): after a budget deferral the
+# rest waits until _proactive_mono() reaches [0] or an owner turn newer than
+# [1] (the _last_owner_turn_at of the deferral). [0] 0.0 = no gap running.
+_pending_defer_gap = [0.0, 0.0]
+
+
+def _pending_defer_gap_start() -> None:
+    """A full drain just deferred its tail: hold the rest PENDING_DEFER_GAP_S
+    (0 = off). Never raises."""
+    try:
+        gap = float(globals().get("PENDING_DEFER_GAP_S", 0) or 0)
+        if gap <= 0:
+            return
+        _pending_defer_gap[0] = _proactive_mono() + gap
+        _pending_defer_gap[1] = float(_last_owner_turn_at[0] or 0.0)
+    except Exception:
+        pass
+
+
+def _pending_defer_gap_left() -> float:
+    """Seconds left of the gap after a budget deferral (0.0 = none: never
+    started, run out, or he has spoken since). Never raises."""
+    try:
+        until = float(_pending_defer_gap[0] or 0.0)
+        if until <= 0.0:
+            return 0.0
+        left = until - _proactive_mono()
+        if (left <= 0.0
+                or float(_last_owner_turn_at[0] or 0.0) > float(
+                    _pending_defer_gap[1] or 0.0)):
+            _pending_defer_gap[0] = 0.0
+            return 0.0
+        return left
+    except Exception:
+        return 0.0
 
 
 def _requeue_supersede(items: list, live: list) -> list:
@@ -51048,6 +51088,7 @@ def _speak_pending(only_sources=None):
     # untouched; it is spoken once the hold passes.
     if _speech_hold_active():
         return False
+    _full_drain = only_sources is None
     _return_drain = False
     _return_away = False
     _hold_urgent = False
@@ -51066,6 +51107,13 @@ def _speak_pending(only_sources=None):
         # guard alert are spoken; everything else waits, in order, untouched
         # on disk (the peek below never claims a queue with nothing to say).
         _hold = _presence_hold_reason()
+        if not _hold:
+            # PENDING_DEFER_GAP_S (2026-11-17): the tail a budget deferred
+            # waits a moment, or until his next turn.
+            _gap_left = _pending_defer_gap_left()
+            if _gap_left > 0:
+                _hold = (f"after the drain budget ({_gap_left:.0f} s left, "
+                         f"or until he speaks)")
         if _hold:
             _kind = _hold.split(" (", 1)[0]
             if _presence_hold_logged[0] != _kind:
@@ -51317,6 +51365,8 @@ def _speak_pending(only_sources=None):
         print(f"  [pending] drain budget ({_PENDING_DRAIN_BUDGET_S:.0f}s) "
               f"reached — deferring {len(deferred)} announcement(s) to the "
               f"next pass")
+        if _full_drain:
+            _pending_defer_gap_start()
     if back and not _requeue_pending_speech(back):
         # Held + deferred entries go back in their original queue order. When
         # that write fails they must not go down with the snapshot (2026-10-01

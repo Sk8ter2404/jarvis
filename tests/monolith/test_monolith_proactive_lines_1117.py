@@ -7,6 +7,11 @@ proactive cluster).
     ring lived in memory only), opened with "Good morning, sir." /
     "Certainly, sir.", and four persona-copy drops in a row each cost a
     brain call five minutes after the last.
+  * proactive-08: coming back at night (11-16 23:49:34-23:50:29) meant the
+    evening briefing, a recap naming a 6 PM forecast and two false mic
+    alerts "plus 3 more" (two "Yes, listening, sir."), the daily recap
+    repeating the briefing's count and asking a question nothing answers -
+    and the budget's deferral was spoken the same second.
 
 Every brain call, voice and clock is faked; files live in temp dirs.
 Synthetic remarks only.
@@ -25,6 +30,7 @@ import unittest
 from unittest import mock
 
 from tests._monolith_harness import MonolithGlobalsTestCase, requires_monolith
+from tests.monolith.test_monolith_presence_hold import _Base as _QueueBase
 from tests.monolith.test_monolith_proactive_presence import _GateBase
 
 FACT = "Interestingly, the first computer mouse was made of wood."
@@ -199,6 +205,124 @@ class DropStreakBackoffTests(_GateBase):
         self._attempt()
         self._later(301)
         self.assertTrue(self._check()[0])
+
+
+# ── proactive-08: the night return ─────────────────────────────────────────
+H = 3600.0
+FORECAST = ("Sir, the temperature drops about 10 degrees by 6 PM - you may "
+            "want a jacket.")
+MIC_SILENT = ("Sir, the desk mic has been completely silent for 30 seconds - "
+              "I can hear nothing at all from it.")
+MIC_DOWN = "Sir, the microphone appears to be down. I'll queue a fix."
+WAKE_ACK = "Yes, listening, sir."
+PULSE = "GPU pinned at 100 percent, sir. CPU 34 percent, memory 97 percent."
+CREDITS = "Heads up, sir - the credit balance is down to 7.10 dollars."
+EVENING = ("[intent:briefing] Good evening, sir. 21 voice interactions "
+           "logged today.")
+
+
+class NightReturnTests(_QueueBase):
+    def setUp(self):
+        super().setUp()
+        self._owner_spoke(30)                # "Insane Jarvis." at 23:49:05
+        self._cell("_presence_away_seen", True)
+
+    def test_live_night_return_says_only_what_is_still_true(self):
+        self._write([self._e(FORECAST, "weather", 5.8 * H)]
+                    + [self._e(MIC_SILENT, "audio", 3 * H) for _ in range(4)]
+                    + [self._e(MIC_DOWN, "self_diagnostic", 3 * H),
+                       self._e(WAKE_ACK, "ambient-listen", 2 * H),
+                       self._e(WAKE_ACK, "ambient-listen", 2 * H),
+                       self._e(PULSE, "pulse", 2 * H),
+                       self._e(CREDITS, "disk_budget_watchdog", 1 * H),
+                       self._e(EVENING, "evening", 1.8 * H)])
+        _, log = self._drain()
+        said = " | ".join(self.spoke)
+        self.assertEqual(self.spoke[0], EVENING)          # the greeting first
+        recap = self.spoke[1]
+        self.assertTrue(recap.startswith("While you were away, sir: "), recap)
+        self.assertIn("GPU pinned at 100 percent", recap)
+        self.assertIn("7.10 dollars", recap)
+        for stale in ("temperature", "silent", "appears to be down",
+                      "listening", "more"):
+            self.assertNotIn(stale, said)
+        self.assertEqual(len(self.spoke), 2)
+        self.assertIn("too old to say (weather; weather:", log)
+        self.assertIn("too old to say (audio; mic_health:", log)
+        self.assertIn("too old to say (ambient-listen; wake_ack:", log)
+
+    def test_a_long_recap_offers_the_rest_and_records_them(self):
+        self._keep_history()
+        # His turn came first (an assistant line cannot lead the history).
+        self.bc.conversation_history.append({"role": "user",
+                                             "content": "Jarvis, I'm back."})
+        self._write([self._e(f"Notice {n} came in, sir.", f"src{n}", 2 * H)
+                     for n in range(5)])
+        self._drain()
+        self.assertEqual(len(self.spoke), 1)
+        self.assertTrue(self.spoke[0].endswith(
+            "And two more - shall I list them?"), self.spoke[0])
+        last = self.bc.conversation_history[-1]
+        self.assertEqual(last["role"], "assistant")
+        self.assertIn("Notice 3 came in", last["content"])
+        self.assertIn("Notice 4 came in", last["content"])
+
+    def _keep_history(self):
+        bc = self.bc
+        n = len(bc.conversation_history)
+        self.addCleanup(lambda: bc.conversation_history.__delitem__(
+            slice(n, None)))
+
+
+class DeferGapTests(_QueueBase):
+    """Live 23:50:09 "drain budget (25s) reached - deferring 2" and the
+    recap was spoken in the same second."""
+
+    def setUp(self):
+        super().setUp()
+        self._owner_spoke(30)
+        self._p(self.bc, "_PENDING_DRAIN_BUDGET_S", 0.0)   # one line a pass
+        self.bc._last_owner_turn_at[0] = self.mono[0] - 30
+
+    def _three(self):
+        self._write([self._e(f"Notice {n}, sir.", f"src{n}") for n in "abc"])
+
+    def test_the_deferred_tail_waits_a_moment(self):
+        self._three()
+        _, log = self._drain()
+        self.assertEqual(self.spoke, ["Notice a, sir."])
+        self.assertIn("deferring 2 announcement(s)", log)
+        _, log = self._drain()                      # the same second
+        self.assertEqual(self.spoke, ["Notice a, sir."])
+        self.assertIn("holding queued speech: after the drain budget (20 s "
+                      "left, or until he speaks)", log)
+        self.mono[0] += self.bc.PENDING_DEFER_GAP_S + 1
+        self._drain()
+        self.assertEqual(self.spoke, ["Notice a, sir.", "Notice b, sir."])
+
+    def test_his_turn_ends_the_gap(self):
+        self._three()
+        self._drain()
+        self.mono[0] += 3
+        self.bc._last_owner_turn_at[0] = self.mono[0]   # he spoke
+        self._drain()
+        self.assertEqual(self.spoke, ["Notice a, sir.", "Notice b, sir."])
+
+    def test_his_timer_still_speaks_in_the_gap(self):
+        self._three()
+        self._drain()
+        q = self._read()
+        q.append(self._e("Reminder, sir — tea", "timer"))
+        self._write(q)
+        self._drain()
+        self.assertEqual(self.spoke, ["Notice a, sir.", "Reminder, sir — tea"])
+
+    def test_gap_zero_is_the_old_drain(self):
+        self._p(self.bc, "PENDING_DEFER_GAP_S", 0)
+        self._three()
+        self._drain()
+        self._drain()
+        self.assertEqual(self.spoke, ["Notice a, sir.", "Notice b, sir."])
 
 
 if __name__ == "__main__":

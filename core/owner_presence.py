@@ -39,10 +39,13 @@ EXEMPT_SOURCES = frozenset({"timer", "schedule", "promise", "guard"})
 # (2026-10-02 review repair): the fold cut "Slight problem, sir - your H2D
 # appears to be unwell. Error code 0300-0100 on layer 142." to "Slight
 # problem." - the printer and the code were the whole point.
+# "arrival_v2" (2026-11-17): the presence-triggered morning briefing's own
+# source was missing, so with PENDING_SOURCE_POLICY off a stale one could be
+# cut to a fragment (core/pending_policy.BRIEFING_SOURCES always had it).
 KEEP_WHOLE_SOURCES = frozenset({
-    "morning", "arrival", "evening", "daily", "news", "recap", "handoff",
-    "weekly_digest_briefing", "anticipation_briefing", "focus", "focus_mode",
-    "bambu", "bambu_voice_companion", "print_companion",
+    "morning", "arrival", "arrival_v2", "evening", "daily", "news", "recap",
+    "handoff", "weekly_digest_briefing", "anticipation_briefing", "focus",
+    "focus_mode", "bambu", "bambu_voice_companion", "print_companion",
 })
 
 
@@ -206,23 +209,49 @@ def recap_fragment(message: str) -> str:
         return ""
 
 
+_COUNT_WORDS = ("no", "one", "two", "three", "four", "five", "six", "seven",
+                "eight", "nine", "ten")
+
+
+def _count_word(n: int) -> str:
+    return _COUNT_WORDS[n] if 0 <= n < len(_COUNT_WORDS) else str(n)
+
+
+def _listed(frags: list) -> str:
+    if len(frags) == 1:
+        return frags[0]
+    return "; ".join(frags[:-1]) + "; and " + frags[-1]
+
+
 def recap_line(fragments: list, extra: int = 0, *, away: bool = True) -> str:
-    """'While you were away, sir: A; B; and C, plus 2 more.' — '' when there
-    is nothing to name. ``away`` False (the lines waited for another reason:
-    room talk, standby, a speech hold - he never left) says 'Earlier, sir:'
-    instead (2026-10-02). Never asks a question (nothing on the queue may end
-    unanswerable in wake-word mode)."""
+    """'While you were away, sir: A; B; and C.' — '' when there is nothing
+    to name. ``away`` False (the lines waited for another reason: room talk,
+    standby, a speech hold - he never left) says 'Earlier, sir:' instead
+    (2026-10-02). With ``extra`` more not named it ends 'And two more -
+    shall I list them?' (2026-11-17; it was ', plus 2 more.', which nothing
+    could ask about): plan_return_drain records the others in the entry's
+    history_text, so "JARVIS, yes" reaches the brain with them - the one
+    question a queued recap may ask."""
     frags = [f for f in (fragments or []) if f]
     if not frags:
         return ""
-    if len(frags) == 1:
-        listed = frags[0]
-    else:
-        listed = "; ".join(frags[:-1]) + "; and " + frags[-1]
-    if extra > 0:
-        listed += f", plus {extra} more"
     lead = "While you were away, sir" if away else "Earlier, sir"
-    return f"{lead}: {listed}."
+    line = f"{lead}: {_listed(frags)}."
+    if extra > 0:
+        line += f" And {_count_word(int(extra))} more - shall I list them?"
+    return line
+
+
+def recap_history(fragments: list, rest: list, *, away: bool = True) -> str:
+    """What conversation_history records for a recap whose ``rest`` was not
+    named (proactive_announce's history_text rule): the spoken line plus
+    the others, so his "yes" has them. '' when nothing is left out."""
+    rest = [f for f in (rest or []) if f]
+    line = recap_line(fragments, extra=len(rest), away=away)
+    if not line or not rest:
+        return ""
+    return (f"{line} (The other {_count_word(len(rest))}: "
+            f"{'; '.join(rest)}.)")
 
 
 def plan_return_drain(items: list, *, now: float, stale_s: float,
@@ -284,11 +313,15 @@ def plan_return_drain(items: list, *, now: float, stale_s: float,
                 if frag and frag not in frags:
                     frags.append(frag)
             named = frags[:_RECAP_NAMED]
-            line = recap_line(named, extra=len(frags) - len(named),
-                              away=away)
+            rest = frags[_RECAP_NAMED:]
+            line = recap_line(named, extra=len(rest), away=away)
             if line:
-                out.insert(recap_at, {"ts": float(now), "message": line,
-                                      "source": _RECAP_SOURCE})
+                entry = {"ts": float(now), "message": line,
+                         "source": _RECAP_SOURCE}
+                if rest:
+                    entry["history_text"] = recap_history(named, rest,
+                                                          away=away)
+                out.insert(recap_at, entry)
         return out, dropped, folded
     except Exception:
         return list(items), [], []

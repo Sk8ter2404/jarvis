@@ -1179,7 +1179,10 @@ MEDIA_HOLD_SIGNAL_CACHE_S  = 5
 # whether it may go into the "While you were away" recap: a clap acknowledgement
 # 10 s, a mic change 5 min, a RAM alert 3 min (none of them ever folded; live
 # 12:55:14 and 14:44:19 for RAM), a briefing or digest 6 h (never cut to a
-# fragment), anything else 24 h; "Good evening" is not spoken between 04:00 and
+# fragment), a weather line 2 h, a "mic is silent / down" alert 5 min and the
+# ambient listener's "Yes, listening, sir." 1 min (2026-11-17, live 11-16
+# 23:50:09: a 6 PM forecast and two false mic lines in the night's recap),
+# anything else 24 h; "Good evening" is not spoken between 04:00 and
 # 17:00 unless it was queued in the last 2 minutes (he asked for it). His own
 # timers, schedules, promises, the guard alert and urgent lines are untouched.
 # False: every queued line waits as long as it takes, as before. Applies on the
@@ -1191,6 +1194,15 @@ PENDING_SOURCE_POLICY = True
 # queued greeting goes ahead of everything but his own reminders and urgent
 # lines. False: strict queue order. Applies on the next start.
 PENDING_GREETING_FIRST = True
+# PENDING_DEFER_GAP_S (seconds, 2026-11-17; bobert_companion._speak_pending) -
+# live 11-16 23:50:09 "[pending] drain budget (25s) reached - deferring 2" and
+# the next pass ran in the same second: the per-pass budget meant to let him
+# get a word in never did (a new queued line ended the idle listen at once).
+# After a budget deferral, the rest of the queue waits this long, or until his
+# next turn, whichever is first; his own timers, schedules, promises, the guard
+# alert and urgent lines still speak. 0 = the next pass speaks it at once, as
+# before. Applies on the next start.
+PENDING_DEFER_GAP_S = 20
 
 # ARRIVAL_NEWS_WAIT_FOR_BRAIN (bool, v3.0.11; skills/daily_briefing/arrival_v2) -
 # live 2026-11-05: the arrival's news section timed out at 10:54:24 under its 8 s

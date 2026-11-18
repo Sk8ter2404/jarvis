@@ -84,8 +84,16 @@ class RecapTests(unittest.TestCase):
     def test_recap_line_shape(self):
         self.assertEqual(op.recap_line([]), "")
         self.assertEqual(op.recap_line(["A"]), "While you were away, sir: A.")
+        # 2026-11-17: "plus 2 more" became a question he can answer (the
+        # entry's history_text holds the others, ReturnDrainTests).
         self.assertEqual(op.recap_line(["A", "B", "C"], extra=2),
-                         "While you were away, sir: A; B; and C, plus 2 more.")
+                         "While you were away, sir: A; B; and C. "
+                         "And two more - shall I list them?")
+        self.assertEqual(op.recap_history(["A", "B", "C"], ["D", "E"]),
+                         "While you were away, sir: A; B; and C. "
+                         "And two more - shall I list them? "
+                         "(The other two: D; E.)")
+        self.assertEqual(op.recap_history(["A"], []), "")
 
 
 class ReturnDrainTests(unittest.TestCase):
@@ -141,8 +149,30 @@ class ReturnDrainTests(unittest.TestCase):
                  for i in range(6)]
         out, _, folded = op.plan_return_drain(items, now=self.NOW, stale_s=600)
         self.assertEqual(len(out), 1)
-        self.assertTrue(out[0]["message"].endswith(", plus 3 more."))
+        self.assertTrue(out[0]["message"].endswith(
+            "And three more - shall I list them?"))
+        # The three not named ride in history_text, so "JARVIS, yes" reaches
+        # the brain with them (_speak_pending records it once spoken).
+        hist = out[0]["history_text"]
+        for i in (3, 4, 5):
+            self.assertIn(f"Thing {i} happened", hist)
         self.assertEqual(len(folded), 6)
+
+    def test_a_recap_naming_everything_has_no_history_text(self):
+        items = [self._e(f"Thing {i} happened, sir.", f"src{i}", 4000)
+                 for i in range(2)]
+        out, _, _ = op.plan_return_drain(items, now=self.NOW, stale_s=600)
+        self.assertNotIn("history_text", out[0])
+        self.assertNotIn("?", out[0]["message"])
+
+    def test_the_arrival_v2_briefing_is_kept_whole(self):
+        # Its source was missing from KEEP_WHOLE_SOURCES (BRIEFING_SOURCES had
+        # it): without PENDING_SOURCE_POLICY it could be cut to a fragment.
+        item = self._e("Good morning, sir. The news today is long.",
+                       "arrival_v2", 4000)
+        out, dropped, folded = op.plan_return_drain([item], now=self.NOW,
+                                                    stale_s=600)
+        self.assertEqual((out, dropped, folded), ([item], [], []))
 
     def test_never_raises(self):
         out, d, f = op.plan_return_drain([object(), 5, None], now="bad",
