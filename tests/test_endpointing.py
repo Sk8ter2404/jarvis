@@ -586,7 +586,7 @@ class EotDeciderModeTests(unittest.TestCase):
         self.assertEqual(rec.actual_ms, 41 * 64)
         self.assertEqual(rec.shadow_line(),
                          "[eot-shadow] fire_ms=1536 p=0.910 resumed=0 "
-                         "actual_ms=2624")
+                         "actual_ms=2624 pause_ms=0")
 
     def test_shadow_marks_a_turn_that_went_on_after_the_fire(self):
         dec, pred = _decider("shadow", 0.91)
@@ -599,6 +599,10 @@ class EotDeciderModeTests(unittest.TestCase):
         self.assertEqual((rec.resumed, rec.fire_ms, rec.st_n),
                          (1, 24 * 64, 1))
         self.assertIn("resumed=1", rec.shadow_line())
+        # The pause he went on after (6 chunks) is the turn's longest; the
+        # 21 silent chunks that ended the capture are not a pause.
+        self.assertEqual(rec.pause_ms, 6 * 64)
+        self.assertTrue(rec.shadow_line().endswith(" pause_ms=384"))
 
     def test_shadow_line_when_it_never_fired(self):
         dec, _ = _decider("shadow", 0.2)
@@ -606,12 +610,38 @@ class EotDeciderModeTests(unittest.TestCase):
         _pause(dec, 21)
         self.assertEqual(dec.record().shadow_line(),
                          "[eot-shadow] fire_ms=- p=0.200 resumed=0 "
-                         "actual_ms=2624")
+                         "actual_ms=2624 pause_ms=0")
         dec, _ = _decider("shadow", 0.2)
         _pause(dec, 21)                               # nothing said
         self.assertEqual(dec.record().shadow_line(),
                          "[eot-shadow] fire_ms=- p=- resumed=0 "
-                         "actual_ms=1344")
+                         "actual_ms=1344 pause_ms=0")
+
+    def test_pause_ms_is_the_longest_pause_inside_the_turn(self):
+        # Shadow keeps listening after a would-be end, so a later, longer
+        # pause still counts; a noise spike splits a pause in two.
+        dec, _ = _decider("shadow", 0.2)
+        _speak(dec, 5)
+        _pause(dec, 3)
+        _speak(dec, 2)
+        _pause(dec, 9)
+        _speak(dec, 1)
+        _pause(dec, 4)
+        dec.update(SPEECH, 0)                         # a click
+        _pause(dec, 4)
+        _speak(dec, 1)
+        _pause(dec, 21)                               # the end of the turn
+        rec = dec.record()
+        self.assertEqual(rec.pause_ms, 9 * 64)
+        self.assertIn(" pause_ms=576", rec.shadow_line())
+        dec, _ = _decider("shadow", 0.99)             # it fires at 4
+        _speak(dec)
+        _pause(dec, 6)
+        _speak(dec, 2)
+        _pause(dec, 12)
+        _speak(dec, 2)
+        _pause(dec, 21)
+        self.assertEqual(dec.record().pause_ms, 12 * 64)
 
     def test_on_mode_record_has_no_shadow_line(self):
         dec, _ = _decider("on", 0.99)

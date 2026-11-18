@@ -1659,20 +1659,29 @@ PLAYBACK_PRIMED_STREAM = False
 # silence run, and SMART_TURN_MIN_SPEECH_S of Silero speech so far — and a p
 # of SMART_TURN_THRESHOLD or more ends the turn there. The 21 chunks stay the
 # ceiling; Silero or Smart Turn missing, failing or too slow = today's turn.
-#   SMART_TURN_MODE   'off'    (default) no models are loaded;
-#                     'shadow' the models run but nothing changes: each
-#                              owner turn JARVIS accepts gets an
-#                              [eot-shadow] line saying when Smart Turn
-#                              WOULD have ended it (resumed=1: a sound
-#                              above the RMS gate came after that point);
+#   SMART_TURN_MODE   'off'    no models are loaded;
+#                     'shadow' (default, 3.0.26) the models run but nothing
+#                              changes: each owner turn JARVIS accepts
+#                              gets an [eot-shadow] line saying when Smart
+#                              Turn WOULD have ended it (resumed=1: a
+#                              sound above the RMS gate came after that
+#                              point) and pause_ms, the longest pause
+#                              inside the turn;
 #                     'on'     Smart Turn ends turns.
 #                     Env JARVIS_SMART_TURN, or user_settings.json.
+#   NOT 'on' YET: the 10-02..10-12 shadow run (105 owner turns) would have
+#   ended 81 turns early, but 13 of those 81 were followed by more sound and
+#   8 by over a second of it - his mid-sentence pauses, at p 0.82-0.99, so
+#   no threshold separates them. Read a few days of the new pause_ms first:
+#   'on' is safe only with SMART_TURN_MIN_SILENCE_S above nearly all of his
+#   pauses, and the saving per turn is the 1,344 ms hangover minus that.
+#   Lower SILENCE_SECS only with 'on' (it is the backstop).
 #   SMART_TURN_MODEL  the ONNX file (smart-turn-v3.2-cpu.onnx), kept OUTSIDE
 #                     the repo: never commit a model. Missing = Smart Turn
 #                     latched off (one log line), i.e. 'rms' turns.
 # Set via user_settings.json; applies on the next start.
-SMART_TURN_MODE = (os.getenv("JARVIS_SMART_TURN", "off").strip().lower()
-                   or "off")
+SMART_TURN_MODE = (os.getenv("JARVIS_SMART_TURN", "shadow").strip().lower()
+                   or "shadow")
 SMART_TURN_THRESHOLD = 0.7
 SMART_TURN_MIN_SILENCE_S = 0.256
 SMART_TURN_MIN_SPEECH_S = 1.0

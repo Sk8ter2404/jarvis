@@ -17851,9 +17851,10 @@ if TURN_TAIL_PROBE:
 # record_speech(smart_endpoint=True) — stream what Whisper will hear into a
 # Silero detector and, in a real pause, ask Smart Turn v3.2 whether he has
 # finished (core/endpointing.EotDecider; the knobs are SMART_TURN_* in
-# core/config.py). This release ships SMART_TURN_MODE='off' (opt in to 'shadow' to log): nothing ends a
+# core/config.py). This release ships SMART_TURN_MODE='shadow' (3.0.26; see
+# core/config.py for why not 'on' yet): nothing ends a
 # turn early; each ACCEPTED owner turn logs one "[eot-shadow] fire_ms= p=
-# resumed= actual_ms=" line (right after its "You:" line) and its
+# resumed= actual_ms= pause_ms=" line (right after its "You:" line) and its
 # [turn-timing] line gets eot / st_p / st_n, and the owner promotes to 'on'
 # from that data. A capture the main loop drops — TV or another voice refused
 # in wake-word mode, a standby line with no wake word, self-echo, a filtered
