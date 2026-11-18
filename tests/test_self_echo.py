@@ -232,5 +232,34 @@ class ContentLayerTests(_Clocked):
         self.assertEqual(len(se._lines), se._MAX_LINES)
 
 
+
+class RecentWordsTests(_Clocked):
+    """recent_words(): the words his own voice can have put into a short
+    mic cut - the voice barge-in's echo test (3.0.26)."""
+
+    def test_the_playing_line_and_a_just_finished_one_count(self):
+        a = se.remember("Shall I stop the music, sir?", at=990.0)
+        se.refresh(a, at=997.0)                       # finished 3 s ago
+        se.remember("Here is the next one.", at=999.0)    # playing
+        words = se.recent_words(4.0)
+        self.assertIn("stop", words)
+        self.assertIn("next", words)
+
+    def test_an_older_line_does_not(self):
+        a = se.remember("Shall I stop the music, sir?", at=980.0)
+        se.refresh(a, at=990.0)                       # finished 10 s ago
+        self.assertNotIn("stop", se.recent_words(4.0))
+
+    def test_a_line_never_finished_lapses_after_two_minutes(self):
+        se.remember("Shall I stop the music, sir?", at=850.0)
+        self.assertNotIn("stop", se.recent_words(4.0))
+        se.remember("Cancel that.", at=950.0)
+        self.assertIn("cancel", se.recent_words(4.0))
+
+    def test_junk_is_empty(self):
+        self.assertEqual(se.recent_words("bad"), frozenset())
+        self.assertEqual(se.recent_words(), frozenset())
+
+
 if __name__ == "__main__":
     unittest.main()

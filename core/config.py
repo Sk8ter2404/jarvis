@@ -1461,7 +1461,13 @@ MUSIC_GATE_MODE            = "off"
 # WAKE_DUCK_MODE      'on' = after a confirmed wake, other apps duck to
 #   AUDIO_DUCKING_LEVEL for at most 8 s while he speaks.
 # WAKE_BARGEIN_MODE   'on' = saying "Jarvis" / "stop" over his own speech
-#   stops it (needs MIC_BUS_MODE and the pre-gate).
+#   stops it (needs MIC_BUS_MODE; it runs the pre-gate detector on the bus
+#   even with WAKE_PREGATE_MODE 'off'). 3.0.26: a heard name / stop word
+#   that his own recent line also says is his echo and never cuts him (the
+#   media canceller is not relied on). 'shadow' = the same listening and
+#   confirm, but it only logs "[barge-in] shadow: would cut JARVIS ..." (or
+#   "... his echo, not cut"); nothing is cut. Run 'shadow' for an evening
+#   before 'on' (OD-7). The legacy headset RMS barge-in is BARGE_IN_ENABLED.
 # MEDIA_AEC_DRM_FALLBACK  protected video (HBO / Netflix) is silent in the
 #   loopback, so the canceller has no reference ("reference MISSING" in the
 #   log) while the speakers play loud. When the reference is missing AND

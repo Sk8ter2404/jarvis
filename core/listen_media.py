@@ -120,7 +120,7 @@ DEFAULTS = {
     "WAKE_LOOPBACK_VETO": "shadow",     # D2 (needs the loopback)
     "WAKE_DUCK_MODE": "off",            # D3: OD-5
     "MEDIA_AEC_DRM_FALLBACK": "shadow",  # E1: log-only until he flips it on
-    "WAKE_BARGEIN_MODE": "off",         # D5: OD-7
+    "WAKE_BARGEIN_MODE": "off",         # D5: OD-7; 'shadow' logs (3.0.26)
     "MEDIA_SEGMENT_S": 12.0,            # B2 (0 = off)
     "MEDIA_AEC_BACKEND": "nlms",        # C3's 'windows_comms' is OD-4
 }
@@ -180,6 +180,53 @@ def threshold_from_peaks(peaks, default: float = DEFAULT_THRESHOLD) -> float:
         return min(DATA_THRESHOLD_MAX, max(DATA_THRESHOLD_MIN, p10))
     except Exception:
         return default
+
+
+# ── D5: voice barge-in over JARVIS's own speech ──────────────────────────
+# WAKE_BARGEIN_MODE (3.0.26: 'off' | 'shadow' | 'on'). While he speaks, a
+# pre-gate hit of at least BARGEIN_SCORE_MIN is confirmed on a short cut of
+# the bus; the cut must hold the wake word at its start or a stop word. The
+# mic hears the speakers, and live the media canceller is not cancelling
+# most of the time (85 % of the 11-16..11-17 media minutes), so the cut also
+# holds HIS OWN voice. bargein_echo() is the echo test that does not depend
+# on the canceller: a word that would cut him ("jarvis", a stop word) only
+# counts when none of his own recent lines says it (or a word that starts
+# with it: "stopped", "cancelled"). 'shadow' runs all of this and logs what
+# 'on' would do; nothing is cut.
+BARGEIN_SCORE_MIN = 0.5
+BARGEIN_OWN_WINDOW_S = 4.0     # his lines finished this recently count
+
+
+def bargein_mode(value, default: str = "off") -> str:
+    """WAKE_BARGEIN_MODE: 'off' | 'shadow' | 'on'. True / False (an old
+    two-state value) read as on / off; anything else is ``default``. Never
+    raises."""
+    if value is True:
+        return "on"
+    if value is False:
+        return "off"
+    return mode3(value, default)
+
+
+def bargein_echo(heard_keys, own_words) -> str:
+    """D5's echo test. ``heard_keys``: the words in the confirm cut that
+    would cut JARVIS (the wake word, a stop word); ``own_words``: every word
+    of the lines he is saying or said within BARGEIN_OWN_WINDOW_S (both
+    normalised the same way: core.device_speech_filter.normalise). Returns
+    the first key word his own lines could have produced (his line has the
+    word, or a word starting with it), else ''. Never raises: an error reads
+    as an echo ("?"), so a fault can never cut him."""
+    try:
+        own = set(own_words or ())
+        for key in heard_keys or ():
+            k = str(key or "").lower()
+            if not k:
+                continue
+            if k in own or any(w.startswith(k) for w in own):
+                return k
+        return ""
+    except Exception:
+        return "?"
 
 
 # ── word timing (A2) ──────────────────────────────────────────────────────

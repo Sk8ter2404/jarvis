@@ -39642,9 +39642,27 @@ def _bus_mode_on() -> bool:
                                     _lm.DEFAULTS["MIC_BUS_MODE"])) == "on"
 
 
+def _bargein_mode() -> str:
+    """WAKE_BARGEIN_MODE: 'off' | 'shadow' | 'on' (3.0.26 added 'shadow':
+    the bus pre-gate listens over his speech and logs what 'on' would cut;
+    nothing is cut). Never raises."""
+    try:
+        return _lm.bargein_mode(globals().get("WAKE_BARGEIN_MODE",
+                                              _lm.DEFAULTS["WAKE_BARGEIN_MODE"]))
+    except Exception:
+        return "off"
+
+
 def _bargein_bus_on() -> bool:
-    return _lm.mode2(globals().get("WAKE_BARGEIN_MODE",
-                                    _lm.DEFAULTS["WAKE_BARGEIN_MODE"])) == "on"
+    """WAKE_BARGEIN_MODE 'on': a confirmed "Jarvis" / stop word over his own
+    speech stops it."""
+    return _bargein_mode() == "on"
+
+
+def _bargein_armed() -> bool:
+    """WAKE_BARGEIN_MODE 'shadow' or 'on': the pre-gate listens over his
+    speech and confirms each hit ('shadow' only logs the verdict)."""
+    return _bargein_mode() in ("shadow", "on")
 
 
 def _segment_s() -> float:
@@ -40253,7 +40271,7 @@ def _pregate_get():
     """The mic pre-gate worker while WAKE_PREGATE_MODE is not 'off' (built
     and attached on first use); None otherwise. Never raises."""
     try:
-        if _pregate_mode() == "off" and not _bargein_bus_on():
+        if _pregate_mode() == "off" and not _bargein_armed():
             return None
         pg = _pregate_obj[0]
         if pg is None:
@@ -40266,7 +40284,7 @@ def _pregate_get():
                             _pregate_threshold(), strict=_drm_strict_bump),
                         on_trigger=_pregate_on_trigger,
                         active=lambda: (_pregate_mode() != "off"
-                                        or _bargein_bus_on()))
+                                        or _bargein_armed()))
                     _pregate_obj[0] = pg
                     pg.start()
                     _pregate_attach()
@@ -40404,7 +40422,8 @@ def _pregate_on_trigger(t_hit: float, score: float) -> None:
         _listen_note("pregate_hits")
         bus = _mic_bus_obj[0]
         speaking = bool(_tts_playback_active[0] or _tts_reply_active[0])
-        if speaking and not (_bargein_bus_on() and score >= 0.5):
+        if speaking and not (_bargein_armed()
+                             and score >= _lm.BARGEIN_SCORE_MIN):
             return
         if not speaking and _pregate_mode() != "on":
             return
@@ -40482,11 +40501,7 @@ def _pregate_confirm_one(t_hit: float, score: float, speaking: bool) -> str:
         text, _conf = _wake_confirm_decode(audio)
         ok = _text_has_wake_prefix(text)
         if speaking:
-            if (ok or _wake_confirm_stop_word(text)) and request_tts_interrupt(
-                    "bus-wake", acoustic=True):
-                _listen_note("bargeins")
-                return "barge-in"
-            return "no-barge-in"
+            return _bargein_confirm(text, ok, score)
         if not ok:
             _listen_note("pregate_drops")
             return "dropped"
@@ -40532,6 +40547,62 @@ def _wake_confirm_stop_word(text: str) -> bool:
         return bool(_dsf.has_stop_word(text))
     except Exception:
         return False
+
+
+def _bargein_echo_word(text: str, wake: bool) -> str:
+    """The word that would cut JARVIS in the confirm cut ``text`` ("jarvis"
+    when ``wake``, any stop word) that his OWN recent lines also say (core.
+    listen_media.bargein_echo over core.self_echo.recent_words and the line
+    playing now), else ''. Never raises: a fault reads as an echo ("?")."""
+    try:
+        from core import device_speech_filter as _dsf
+        heard = _dsf.normalise(text).split()
+        keys = (["jarvis"] if wake else []) + [
+            w for w in heard if w in _dsf.STOP_WORDS]
+        own = set(_self_echo.recent_words(_lm.BARGEIN_OWN_WINDOW_S))
+        own.update(_dsf.normalise(_tts_current_text[0] or "").split())
+        return _lm.bargein_echo(keys, own)
+    except Exception:
+        return "?"
+
+
+def _bargein_confirm(text: str, wake: bool, score: float) -> str:
+    """D5 (WAKE_BARGEIN_MODE), the confirm of a pre-gate hit heard while
+    JARVIS speaks: ``text`` is the decoded cut, ``wake`` whether it starts
+    with the wake word. A cut with neither the wake word nor a stop word is
+    'no-barge-in'. One whose word his own recent lines also say is 'echo'
+    (the mic heard the speakers; the media canceller is not relied on).
+    Otherwise 'shadow' logs what 'on' would do ('would-barge-in') and 'on'
+    asks request_tts_interrupt (which keeps its own BARGE_IN_ENABLED and
+    "jarvis in this sentence" gates): 'barge-in' when it cut him. Logs the
+    kind of word and the score only, never the words. Never raises."""
+    try:
+        stop = _wake_confirm_stop_word(text)
+        if not (wake or stop):
+            _listen_note("bargein_none")
+            return "no-barge-in"
+        what = "the name" if wake else "a stop word"
+        mode = _bargein_mode()
+        echo = _bargein_echo_word(text, wake)
+        if echo:
+            _listen_note("bargein_echo")
+            print(f"  [barge-in] {mode}: heard {what} over his own speech "
+                  f"(pre-gate {float(score):.2f}) but his own line says "
+                  f"{'it' if echo != '?' else 'something unreadable'} - "
+                  f"his echo, not cut")
+            return "echo"
+        if mode != "on":
+            _listen_note("bargein_would")
+            print(f"  [barge-in] shadow: would cut JARVIS - {what} over his "
+                  f"speech, pre-gate {float(score):.2f} (BARGE_IN_ENABLED "
+                  f"{'on' if _barge_in_wake_enabled() else 'off'})")
+            return "would-barge-in"
+        if request_tts_interrupt("bus-wake", acoustic=True):
+            _listen_note("bargeins")
+            return "barge-in"
+        return "no-barge-in"
+    except Exception:
+        return "no-barge-in"
 
 
 def _pregate_take_hit(after_seq: int) -> "dict | None":
@@ -41067,7 +41138,7 @@ def _listen_media_boot() -> None:
                  f" @ {_pregate_threshold():.2f}, bus "
                  f"{'on' if _bus_mode_on() else 'off'}, aec {_aec_mode()}, "
                  f"veto {_veto_mode()}, wake duck {_duck_mode()}, "
-                 f"barge-in {'on' if _bargein_bus_on() else 'off'}")
+                 f"barge-in {_bargein_mode()}")
         print(f"  [listen-media] {modes}")
     except Exception:
         pass

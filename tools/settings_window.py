@@ -1063,10 +1063,12 @@ SCHEMA: dict[str, dict] = {
     },
     "WAKE_BARGEIN_MODE": {
         "tab": "hearing", "label": "Interrupt him by voice",
-        "type": "enum", "choices": ["off", "on"], "default": "off",
+        "type": "enum", "choices": ["off", "shadow", "on"], "default": "off",
         "help": "on = saying 'Jarvis' or 'stop' while he speaks stops him "
-                "(needs the always-open microphone and the wake-word "
-                "detector). Applies on the next start.",
+                "(needs the always-open microphone; a word his own line "
+                "says is his echo and never stops him). shadow = he only "
+                "logs when he would have stopped - try it for an evening "
+                "first. Applies on the next start.",
     },
     "WHISPER_MODEL_CUDA": {
         "tab": "hearing", "label": "Whisper GPU model", "type": "str",
@@ -1515,10 +1517,12 @@ SCHEMA: dict[str, dict] = {
         "tab": "voice", "label": "Barge-in (interrupt him by voice)",
         "type": "bool", "default": True,
         "help": "Say the wake word while JARVIS is talking to cut him off "
-                "and be heard. Requires the wake-word detector to be "
-                "running — say 'JARVIS, start listening for the wake word' "
-                "(wake_listener_start) first; his own voice can never "
-                "trigger it.",
+                "and be heard. Something must listen while he talks: "
+                "'Interrupt him by voice' (WAKE_BARGEIN_MODE, on the "
+                "always-open microphone), or the wake-word detector - say "
+                "'JARVIS, start listening for the wake word' "
+                "(wake_listener_start). The boot log says which one is "
+                "armed. A word his own line says never triggers it.",
     },
     "FOCUS_MODE_ENABLED": {
         "tab": "voice", "label": "Focus mode / do-not-disturb available",
