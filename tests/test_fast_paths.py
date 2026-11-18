@@ -807,7 +807,9 @@ class CapabilityQuestionTests(unittest.TestCase):
         # see_screen alone kept "...or through the cameras".
         from unittest import mock
         import core.config as cfg
-        with mock.patch.object(cfg, "SERVER_WATCH_HOST", "", create=True):
+        with mock.patch.object(cfg, "SERVER_WATCH_HOST", "", create=True), \
+                mock.patch.dict(fp._CAPABILITY_GATES,
+                                {"sort and draft your email": lambda: True}):
             said = fp.capability_reply({"system_pulse", "see_screen",
                                         "draft_reply", "server_status"})
         self.assertIn("check this PC", said)
@@ -850,6 +852,91 @@ class CapabilityQuestionTests(unittest.TestCase):
         for phrase, names in fp._CAPABILITY_PARTS:
             with self.subTest(phrase=phrase):
                 self.assertTrue(any(f'"{n}"' in src for n in names), names)
+
+
+class CapabilitySignInTests(unittest.TestCase):
+    """Live 2026-11-17 00:23:25 "what can you do" offered "read your
+    calendar" and "sort and draft your email": both skills REGISTER on every
+    install, and neither a Microsoft nor a Gmail sign-in was on disk, so
+    every such ask then failed. Each phrase now also needs its sign-in
+    (_CAPABILITY_GATES). The ms_graph / email_triage skills are faked here
+    with their real attribute names; ms_graph.has_saved_sign_in itself is
+    pinned in tests/skills/test_ms_graph.py."""
+
+    NAMES = {"set_timer", "weather_briefing", "calendar_today", "draft_reply",
+             "play_music", "control_smart_home", "web_search", "system_pulse",
+             "note_for_claude", "check_print"}
+
+    def setUp(self):
+        import os
+        import sys
+        import tempfile
+        import types
+        from unittest import mock
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.gmail_token = os.path.join(tmp.name, "gmail_token.json")
+        self.signed_in = [False]
+        graph = types.ModuleType("skill_ms_graph")
+        graph.has_saved_sign_in = lambda: self.signed_in[0]
+        mail = types.ModuleType("skill_email_triage")
+        mail.GMAIL_TOKEN_FILE = self.gmail_token
+        p = mock.patch.dict(sys.modules, {"skill_ms_graph": graph,
+                                          "skill_email_triage": mail})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _all_said(self):
+        return " ".join((fp.capability_reply(self.NAMES),
+                         fp.capability_short_reply(self.NAMES),
+                         fp.capability_rest_reply(self.NAMES)))
+
+    def test_neither_signed_in_names_neither(self):
+        said = self._all_said()
+        self.assertNotIn("calendar", said)
+        self.assertNotIn("email", said)
+        # The short overview fills up from the rest instead.
+        short = fp.capability_short_reply(self.NAMES)
+        self.assertIn("set timers and reminders", short)
+        self.assertIn("play music and YouTube", short)
+
+    def test_a_gmail_token_backs_the_email_only(self):
+        with open(self.gmail_token, "w", encoding="utf-8") as f:
+            f.write("{}")
+        said = fp.capability_reply(self.NAMES)
+        self.assertIn("sort and draft your email", said)
+        self.assertNotIn("calendar", said)
+
+    def test_a_microsoft_sign_in_backs_both(self):
+        # Outlook mail is Microsoft Graph too.
+        self.signed_in[0] = True
+        said = fp.capability_reply(self.NAMES)
+        self.assertIn("read your calendar", said)
+        self.assertIn("sort and draft your email", said)
+
+    def test_no_skill_loaded_is_not_connected(self):
+        import sys
+        from unittest import mock
+        with mock.patch.dict(sys.modules):
+            for key in ("skill_ms_graph", "skills.ms_graph",
+                        "skill_email_triage", "skills.email_triage"):
+                sys.modules.pop(key, None)
+            self.assertFalse(fp._microsoft_signed_in())
+            self.assertFalse(fp._email_connected())
+
+    def test_a_broken_probe_is_not_connected(self):
+        def boom():
+            raise OSError("disk")
+        sys_mod = __import__("sys").modules
+        sys_mod["skill_ms_graph"].has_saved_sign_in = boom
+        self.assertFalse(fp._microsoft_signed_in())
+        self.assertNotIn("calendar", fp.capability_reply(self.NAMES))
+
+    def test_the_shipped_overview_is_unchanged(self):
+        # available=None (no live setup to ask) still lists every phrase.
+        full = fp.capability_reply()
+        self.assertIn("read your calendar", full)
+        self.assertIn("sort and draft your email", full)
 
 
 class MemoryQuestionTests(unittest.TestCase):

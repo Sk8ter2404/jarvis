@@ -45,6 +45,38 @@ class ShortCapabilityOverview(_ShortcutBase):
         self._p(self.bc, "ACTIONS", acts)
         self._p(cfg, "SERVER_WATCH_HOST", "nas.example", create=True)
         self._p(cfg, "CAPABILITIES_SHORT_OVERVIEW", True, create=True)
+        # Signed in to the calendar and the mail (the gates are pinned in
+        # tests/test_fast_paths.CapabilitySignInTests and below).
+        from core import fast_paths as fp
+        self.real_gates = dict(fp._CAPABILITY_GATES)
+        p = mock.patch.dict(fp._CAPABILITY_GATES, {
+            "read your calendar": lambda: True,
+            "sort and draft your email": lambda: True})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_live_with_no_sign_in_neither_calendar_nor_email_is_offered(self):
+        # Live 2026-11-17 00:23:25: no Microsoft or Gmail sign-in on disk,
+        # and the overview offered both. The REAL gates, with the two skills
+        # absent from sys.modules (as a box with neither loaded).
+        from core import fast_paths as fp
+        import sys
+        p = mock.patch.dict(fp._CAPABILITY_GATES, self.real_gates)
+        p.start()
+        self.addCleanup(p.stop)
+        with mock.patch.dict(sys.modules):
+            for key in ("skill_ms_graph", "skills.ms_graph",
+                        "skill_email_triage", "skills.email_triage"):
+                sys.modules.pop(key, None)
+            handled, _ = self._turn("What can you do for me?")
+            self.assertTrue(handled)
+            del self.bc.conversation_history[2:]
+            self._turn("yes")
+        said = " ".join(self.spoken)
+        self.assertNotIn("calendar", said)
+        self.assertNotIn("email", said)
+        self.assertIn("set timers and reminders", said)
+        self.llm.assert_not_called()
 
     def test_live_question_is_short_and_ends_on_the_offer(self):
         handled, log = self._turn("What can you do for me?")

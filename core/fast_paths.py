@@ -63,7 +63,8 @@ before the LLM dispatch (bobert_companion._run_fast_paths, gated by
 FAST_PATHS_ENABLED) and speaks the reply itself. Every grammar is anchored on
 the whole utterance, so commands and other domains fall through untouched.
 Stdlib only, no I/O (but the memory answer, which the loaded system_pulse
-skill reads), never raises.
+skill reads, and the "what can you do" sign-in gates, which check that a
+token file exists), never raises.
 
 The recall helpers are shared with core.actions._act_session_memory_recall so
 the LLM route can never recall the current utterance either.
@@ -793,11 +794,59 @@ def _server_configured() -> bool:
         return False
 
 
+def _loaded_skill(name: str):
+    """A loaded skill module (the loader's "skill_<name>", else an imported
+    "skills.<name>"), or None. sys.modules only: no import. Never raises."""
+    try:
+        import sys as _sys
+        for key in (f"skill_{name}", f"skills.{name}"):
+            mod = _sys.modules.get(key)
+            if mod is not None:
+                return mod
+    except Exception:
+        pass
+    return None
+
+
+def _microsoft_signed_in() -> bool:
+    """A Microsoft sign-in is saved on this PC (the loaded ms_graph skill's
+    has_saved_sign_in: its token file or MSAL cache, file checks only).
+    Live 2026-11-17 00:23:25 "what can you do" offered "read your calendar"
+    and "sort and draft your email" because calendar_today and the email
+    actions are REGISTERED on every install, with neither a Microsoft nor a
+    Gmail sign-in on disk, so every such ask then failed. False on any
+    error. Never raises."""
+    try:
+        fn = getattr(_loaded_skill("ms_graph"), "has_saved_sign_in", None)
+        return bool(fn()) if callable(fn) else False
+    except Exception:
+        return False
+
+
+def _email_connected() -> bool:
+    """A mailbox the email actions can read: the loaded email_triage skill's
+    Gmail token on disk (GMAIL_TOKEN_FILE, written by its --auth-gmail), or
+    a Microsoft sign-in (its Outlook backend is Microsoft Graph). Never
+    raises."""
+    try:
+        path = getattr(_loaded_skill("email_triage"), "GMAIL_TOKEN_FILE", "")
+        if isinstance(path, str) and path:
+            import os as _os
+            if _os.path.isfile(path):
+                return True
+    except Exception:
+        pass
+    return _microsoft_signed_in()
+
+
 # Phrases that need more than a registered action: phrase -> a zero-argument
 # check, consulted only when `available` is given (None = the fixed shipped
-# overview, which has no live setup to ask).
+# overview, which has no live setup to ask). A gated phrase that is False
+# drops out of the short overview, its "the rest" list and the full one.
 _CAPABILITY_GATES = {
     "check on the home server": _server_configured,
+    "read your calendar": _microsoft_signed_in,
+    "sort and draft your email": _email_connected,
 }
 
 
