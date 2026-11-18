@@ -374,6 +374,9 @@ class _RagBase(unittest.TestCase):
         rag._last_error = ""
         for k in rag._stats:
             rag._stats[k] = 0
+        # v3.0.26: the walk's embed queue and its stamp.
+        del rag._pending_paths[:]
+        rag._last_walk[0] = 0.0
         # Drain the event queue.
         try:
             while True:
@@ -672,8 +675,14 @@ class OllamaEmbedderTests(_RagBase):
                 return False
 
         def _fake_urlopen(req, timeout=None):
+            url = getattr(req, "full_url", None) or getattr(req, "url", "")
+            if error is None and str(url).endswith("/api/ps"):
+                # The eviction guard's /api/ps read: the embed model "m" is
+                # loaded already, so a background request loads nothing
+                # (v3.0.26: it never takes the only slot itself).
+                return _Resp({"models": [{"name": "m"}]})
             if capture is not None:
-                capture["url"] = getattr(req, "full_url", None) or getattr(req, "url", "")
+                capture["url"] = url
                 capture["method"] = getattr(req, "method", None)
                 capture["data"] = getattr(req, "data", None)
             if error is not None:

@@ -233,14 +233,28 @@ class IndexerWaitsTests(_RagBase):
         self.assertEqual(self.emb.calls, 1)          # stopped at the 1st file
         self.assertEqual(rag._stats["errors"], 0)    # not an error
 
-    def test_a_deferred_scan_never_garbage_collects(self):
-        # A chunk of a file the walk never reached must survive.
+    def test_an_unfinished_walk_never_garbage_collects(self):
+        # A chunk of a file the walk never reached must survive. v3.0.26:
+        # a deferred EMBEDDING no longer stops the walk (it always finishes,
+        # see WalkThenQueueTests), so the unfinished walk here is a stop.
         self.coll.add(ids=["old:0"], embeddings=[[0.1, 0.2, 0.3]],
                       documents=["kept"],
                       metadatas=[{"file_id": "old", "path": "/gone/old.txt",
                                   "chunk_index": 0}])
+        rag._stop_flag.set()
+        self.addCleanup(rag._stop_flag.clear)
         rag.index_once()
         self.assertIn("old:0", self.coll.get()["ids"])
+
+    def test_a_finished_walk_collects_a_deleted_file_while_embedding_waits(
+            self):
+        self.coll.add(ids=["old:0"], embeddings=[[0.1, 0.2, 0.3]],
+                      documents=["gone"],
+                      metadatas=[{"file_id": "old", "path": "/gone/old.txt",
+                                  "chunk_index": 0}])
+        summary = rag.index_once()
+        self.assertTrue(summary["deferred"])
+        self.assertNotIn("old:0", self.coll.get()["ids"])
 
     def test_the_daemon_schedules_a_retry(self):
         t0 = time.time()
@@ -276,6 +290,221 @@ class IndexerWaitsTests(_RagBase):
         self.assertEqual(retried, [path])
         self.assertEqual(logged, ["re-index"])
         self.assertEqual(rag._stats["errors"], 0)
+
+
+class BackgroundNeverLoadsTests(_RagBase):
+    """v3.0.26 (reliability-06): with the brain out, the guard let the
+    background scan LOAD nomic-embed-text into Ollama's only slot (11-16
+    22:26:26), so the next brain call had to load the brain back. A
+    background request now goes only while the embed model is loaded
+    already; the owner's search and reindex still load it."""
+
+    MODEL = "nomic-embed-text"
+    URL = "http://127.0.0.1:11434/api/embeddings"
+
+    def setUp(self):
+        super().setUp()
+        import core
+        fake_gpu = types.ModuleType("core.gpu_state")
+        fake_gpu.log_gpu_state = lambda model: None
+        for p in (mock.patch.dict(sys.modules, {"core.gpu_state": fake_gpu}),
+                  mock.patch.object(core, "gpu_state", fake_gpu, create=True),
+                  mock.patch.dict(os.environ, {oo.MAX_LOADED_ENV: "1"}),
+                  mock.patch("core.local_traffic.GATE.defer_reason",
+                             return_value=None)):
+            p.start()
+            self.addCleanup(p.stop)
+        self.calls = []
+        self.emb = rag._OllamaEmbedder(self.MODEL, self.URL, batch_size=1,
+                                       timeout=1.0)
+
+    def _with(self, loaded):
+        return mock.patch.object(rag.urllib.request, "urlopen",
+                                 _ollama(loaded, record=self.calls))
+
+    def test_the_live_default_is_off(self):
+        self.assertIs(rag.RAG_BACKGROUND_MAY_LOAD_EMBED, False)
+
+    def test_an_empty_one_slot_server_is_a_wait(self):
+        with self._with([]):
+            why = rag._embed_eviction_reason(self.MODEL, self.URL)
+            self.assertIn("only model slot", why)
+            self.assertIn("only model slot", self.emb.defer_reason())
+            with self.assertRaises(rag.EmbedDeferred):
+                self.emb._embed_one("hello")
+        self.assertNotIn("POST", [m for m, _ in self.calls])
+
+    def test_a_loaded_embed_model_goes(self):
+        with self._with(["nomic-embed-text:latest"]):
+            self.assertEqual(self.emb.defer_reason(), "")
+            self.assertEqual(self.emb._embed_one("hello"), [1.0, 0.0])
+
+    def test_the_owners_search_still_loads_it(self):
+        with self._with([]):
+            out = self.emb.encode(["q"], convert_to_numpy=False,
+                                  allow_evict=True)
+        self.assertEqual(out, [[1.0, 0.0]])
+
+    def test_a_two_model_server_may_still_co_load(self):
+        with self._with([]), mock.patch.object(oo, "effective_max_loaded",
+                                               return_value=2):
+            self.assertEqual(self.emb.defer_reason(), "")
+
+    def test_the_flag_restores_the_old_load(self):
+        with mock.patch.object(rag, "RAG_BACKGROUND_MAY_LOAD_EMBED", True), \
+                self._with([]):
+            self.assertEqual(self.emb.defer_reason(), "")
+
+    def test_an_unreadable_server_is_a_wait(self):
+        with self._with(None):
+            self.assertIn("could not read", self.emb.defer_reason())
+
+    def test_index_file_asks_before_reading_the_file(self):
+        """A deferral used to parse the file (PDF / DOCX) first and throw
+        the text away, every 10 minutes."""
+        self._install_collection()
+        rag._embed_model = self.emb
+        path = self._write("docs/report.txt", "quarterly numbers " * 40)
+        read = []
+        real_read = rag._read_text
+        with self._with([]), mock.patch.object(
+                rag, "_read_text",
+                lambda p: read.append(p) or real_read(p)):
+            with self.assertRaises(rag.EmbedDeferred):
+                rag._index_file(path)
+        self.assertEqual(read, [], "the file was read before the check")
+        self.assertEqual([m for m, _ in self.calls], ["GET"])
+
+    def test_an_owner_scan_does_not_ask(self):
+        self._install_collection()
+        rag._embed_model = self.emb
+        path = self._write("docs/report.txt", "quarterly numbers " * 40)
+        rag._owner_scan.active = True
+        self.addCleanup(setattr, rag._owner_scan, "active", False)
+        with self._with([]), mock.patch.object(rag, "_wait_owner_quiet"):
+            self.assertGreater(rag._index_file(path), 0)
+        self.assertIn("POST", [m for m, _ in self.calls])
+
+
+class _GatedEmbedder:
+    """An embedder whose background gate the test opens and closes."""
+
+    def __init__(self):
+        self.reason = "loading nomic-embed-text would take Ollama's only " \
+                      "model slot"
+        self.encoded = 0
+
+    def defer_reason(self):
+        return self.reason
+
+    def encode(self, texts, **kw):
+        import numpy as np
+        self.encoded += len(texts)
+        return np.asarray([[1.0, 0.0, 0.0] for _ in texts], dtype="float32")
+
+
+class WalkThenQueueTests(_RagBase):
+    """v3.0.26 (reliability-06): no scan ever finished (no '[rag] initial
+    scan:' in 47 sessions) and every 10-minute retry walked the roots
+    again. The walk now always finishes and queues the changed files; a
+    deferral stops only the embedding, and the retry resumes the queue."""
+
+    def setUp(self):
+        super().setUp()
+        self.coll = self._install_collection()
+        self.emb = _GatedEmbedder()
+        rag._embed_model = self.emb
+        self.root = os.path.join(self.tmp, "docs")
+        self.paths = [self._write(os.path.join("docs", f"n{i}.txt"),
+                                  f"note {i} " * 50) for i in range(3)]
+        # one file indexed already, with its current signature
+        self.done = self._write(os.path.join("docs", "done.txt"), "old " * 50)
+        fid = rag._file_id(self.done)
+        self.coll.add(ids=[fid + ":0"], embeddings=[[0.0, 1.0, 0.0]],
+                      documents=["old"],
+                      metadatas=[{"file_id": fid, "path": self.done,
+                                  "sig": rag._file_signature(self.done),
+                                  "chunk_index": 0}])
+        rag.RAG_INDEX_PATHS = [self.root]
+        rag._scan_retry_at[0] = 0.0
+        rag._deferral_logged[0] = ""
+        self.addCleanup(lambda: rag._scan_retry_at.__setitem__(0, 0.0))
+        self.addCleanup(lambda: rag._deferral_logged.__setitem__(0, ""))
+
+    def test_a_deferred_scan_walks_everything_and_reads_nothing(self):
+        read, lookups = [], []
+        real_lookup = rag._existing_signature
+        with mock.patch.object(rag, "_read_text",
+                               lambda p: read.append(p) or "x"), \
+                mock.patch.object(rag, "_existing_signature",
+                                  lambda fid: lookups.append(fid)
+                                  or real_lookup(fid)):
+            summary = rag.index_once()
+        self.assertIn("only model slot", summary.get("deferred", ""))
+        self.assertEqual(summary["files_seen"], 4)
+        self.assertEqual(summary["pending"], 3)
+        self.assertEqual(read, [])
+        # The walk reads every signature in ONE bulk get; only _index_file's
+        # own re-check of the first queued file looks one up.
+        self.assertLessEqual(len(lookups), 1)
+        self.assertEqual(sorted(rag._pending_paths), sorted(self.paths))
+        self.assertNotIn(self.done, rag._pending_paths)
+        self.assertGreater(rag._last_walk[0], 0.0)
+        self.assertEqual(rag.status()["pending"], 3)
+
+    def test_the_retry_resumes_the_queue_and_never_walks(self):
+        rag.index_once()
+        self.emb.reason = ""                 # the embed model is loaded now
+        out = []
+        with mock.patch.object(rag, "_iter_files",
+                               side_effect=AssertionError("walked again")), \
+                mock.patch("builtins.print", lambda *a, **k: out.append(
+                    " ".join(str(x) for x in a))):
+            res = rag._resume_pending("resume after deferral")
+        self.assertEqual(res["embedded_now"], 3)
+        self.assertEqual(res["pending"], 0)
+        self.assertEqual(rag._pending_paths, [])
+        self.assertEqual(rag._scan_retry_at[0], 0.0)
+        self.assertGreater(rag._last_full_scan_ts, 0.0)
+        self.assertTrue(any("index up to date" in line for line in out), out)
+        self.assertEqual(self.coll.count(), 4)
+
+    def test_a_retry_that_is_still_deferred_keeps_the_queue(self):
+        rag.index_once()
+        t0 = time.time()
+        res = rag._resume_pending("resume after deferral")
+        self.assertTrue(res["deferred"])
+        self.assertEqual(len(rag._pending_paths), 3)
+        self.assertGreaterEqual(rag._scan_retry_at[0],
+                                t0 + rag.RAG_DEFER_RETRY_S - 1)
+
+    def test_the_drain_loop_resumes_the_queue_instead_of_walking(self):
+        rag._scan_retry_at[0] = 1.0                 # long due
+        resumed, walked = [], []
+
+        def _resume(label):
+            resumed.append(label)
+            rag._stop_flag.set()
+            return {}
+
+        def _walk(label):
+            walked.append(label)
+            rag._stop_flag.set()
+            return {}
+        with mock.patch.object(rag, "_resume_pending", _resume), \
+                mock.patch.object(rag, "_run_scan", _walk):
+            rag._drain_event_queue()
+        self.assertEqual(walked, [], "the retry walked the roots again")
+        self.assertEqual(resumed, ["resume after deferral"])
+
+    def test_the_daemon_logs_that_the_walk_finished(self):
+        out = []
+        with mock.patch("builtins.print", lambda *a, **k: out.append(
+                " ".join(str(x) for x in a))):
+            rag._run_scan("initial scan")
+        line = [x for x in out if "[rag] initial scan: walk done" in x]
+        self.assertTrue(line, out)
+        self.assertIn("4 file(s), 3 to embed", line[0])
 
 
 class OrchestratorKeepAliveTests(unittest.TestCase):

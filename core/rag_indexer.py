@@ -364,8 +364,29 @@ def _device() -> str:
 #    while the owner is talking to JARVIS (core.local_traffic's background
 #    gate): one sent just before his turn's brain request would reload the
 #    embed model right after the brain answered, unloading it again.
+#
+# v3.0.26 (overhaul finding reliability-06): no '[rag] initial scan:' summary
+# in any of the 47 sessions that started RAG through 11-17 - every scan ended
+# "deferred", and each 10-minute retry walked the roots again up to the
+# first changed file, PARSED it (PDF / DOCX) and threw the text away at the
+# eviction check. When the brain happened to be out, the check passed and the
+# embed model loaded into Ollama's only slot (11-16 22:26:26), so the next
+# brain call had to load the brain back. Now:
+#  * a scan is two phases. The WALK compares every file's signature with the
+#    collection (one bulk read, no per-file lookup) and needs no embedder, so
+#    it always finishes; the garbage collection runs after it. Then the files
+#    that changed are EMBEDDED from a queue (_pending_paths). A deferral
+#    stops the embedding only: the retry resumes the queue (_resume_pending)
+#    and never walks again. The watcher keeps the queue current after that.
+#  * a background (unrequested) embedding is never the one that LOADS the
+#    embed model while Ollama holds one model (RAG_BACKGROUND_MAY_LOAD_EMBED
+#    False): it goes only while the embed model is already loaded (after his
+#    own search, say). His search and his "reindex my files" still load it.
+#  * the check runs once per file BEFORE the file is read
+#    (_OllamaEmbedder.defer_reason), so a deferral costs one /api/ps GET.
 RAG_DEFER_RETRY_S: float = 600.0
 OWNER_SCAN_MAX_WAIT_S: float = 120.0
+RAG_BACKGROUND_MAY_LOAD_EMBED: bool = False
 
 
 class EmbedDeferred(RuntimeError):
@@ -397,15 +418,26 @@ def _embed_eviction_reason(model: str, endpoint: str,
     """Why a BACKGROUND embedding request for ``model`` must wait right now
     ('' = it may go): core.ollama_opts.eviction_risk against the server
     ``endpoint`` points at (``resident``: its /api/ps list, already read),
-    and - while that server holds one model - the owner talking to JARVIS.
+    and - while that server holds one model - the embed model not being
+    loaded already (a background request never takes the only slot,
+    RAG_BACKGROUND_MAY_LOAD_EMBED) and the owner talking to JARVIS.
     Fails closed. Never raises."""
     try:
         from core import ollama_opts as _oo
         base = _ollama_base(endpoint)
+        if resident is None:
+            resident = _oo.resident_models(base, _oo.probe_timeout(base))
+            if resident is None:
+                return f"could not read {base}/api/ps"
         why = _oo.eviction_risk(model, base, resident=resident)
         if why:
             return why
         if _oo.effective_max_loaded(base) < 2:
+            if not RAG_BACKGROUND_MAY_LOAD_EMBED and not any(
+                    _oo.same_tag(n, model) for n in resident):
+                return (f"loading {model} would take Ollama's only model "
+                        f"slot (background indexing waits until it is "
+                        f"loaded anyway)")
             return _owner_talking_reason()
         return ""
     except Exception as e:  # pragma: no cover - in-tree import
@@ -476,6 +508,17 @@ class _OllamaEmbedder:
         self.endpoint = endpoint
         self.batch_size = max(1, int(batch_size))
         self.timeout = float(timeout)
+
+    def defer_reason(self) -> str:
+        """Why a BACKGROUND file must wait right now ('' = it may go):
+        _embed_eviction_reason against one fresh /api/ps read. _index_file
+        asks this once per file BEFORE reading it, so a deferral no longer
+        parses a PDF only to throw the text away (reliability-06). Never
+        raises (fails closed)."""
+        try:
+            return _embed_eviction_reason(self.model, self.endpoint)
+        except Exception as e:  # pragma: no cover - it never raises
+            return f"eviction guard unavailable ({type(e).__name__})"
 
     def _embed_one(self, text: str, allow_evict: bool = False,
                    owner: bool = False) -> list[float]:
@@ -807,6 +850,18 @@ def _index_file(path: str) -> int:
     if prev and prev == sig:
         return 0  # unchanged — skip
 
+    embedder = _get_embedder()
+    # Background work asks BEFORE reading the file (reliability-06: each
+    # deferred retry used to parse the same PDF and throw the text away).
+    # An owner scan never waits for the brain; a fake embedder in a test
+    # without defer_reason keeps the per-request check only.
+    if not getattr(_owner_scan, "active", False):
+        probe = getattr(embedder, "defer_reason", None)
+        if callable(probe):
+            why = probe()
+            if why:
+                raise EmbedDeferred(why)
+
     text = _read_text(path)
     if not text or not text.strip():
         _delete_file(fid)  # was indexed before, now empty / unreadable
@@ -816,7 +871,6 @@ def _index_file(path: str) -> int:
     if not chunks:
         return 0
 
-    embedder = _get_embedder()
     coll = _get_collection()
 
     try:
@@ -929,43 +983,57 @@ def _index_once(progress: Optional[Callable[[str, int], None]] = None,
     _get_collection()
     _get_embedder()
 
+    # PHASE 1 - the walk (reliability-06). Needs no embedder, so it always
+    # finishes: each file's signature against ONE bulk read of the
+    # collection's metadata (the garbage collection below needs that read
+    # anyway); a file whose signature differs goes on the queue.
+    try:
+        existing = _get_collection().get(include=["metadatas"])
+    except Exception:
+        existing = None
+    known = _known_signatures(existing)
     seen_files: set[str] = set()
+    pending: list[str] = []
     files_seen_count = 0
-    deferred = ""
+    stopped = False
     for root in RAG_INDEX_PATHS:
         if not os.path.isdir(root):
             continue
         for path in _iter_files(root):
             if _stop_flag.is_set():
+                stopped = True
                 break
-            seen_files.add(_file_id(path))
-            try:
-                _index_file(path)
-            except EmbedDeferred as e:
-                # Embedding now would unload the voice brain: stop the walk
-                # (the next file would wait for the same reason) and leave
-                # the rest for the retry. Unchanged files never reach the
-                # embedder, so the walk only stops at real work.
-                deferred = str(e)
-                break
-            except Exception as e:
-                with _lock:
-                    _stats["errors"] += 1
-                    _last_error = f"{path}: {e}"
-                continue
+            fid = _file_id(path)
+            seen_files.add(fid)
             files_seen_count += 1
+            if not _unchanged(path, fid, known):
+                pending.append(path)
             if progress and (files_seen_count % 25 == 0):
                 try:
                     progress(path, files_seen_count)
                 except Exception:
                     pass
-        if _stop_flag.is_set() or deferred:
+        if _stop_flag.is_set():
+            stopped = True
             break
 
+    excluded_dropped = 0
+    if not stopped:
+        # Only a FINISHED walk garbage-collects: every file an unfinished
+        # one never reached would look deleted.
+        excluded_dropped = _garbage_collect(existing, seen_files)
+        with _lock:
+            _pending_paths[:] = pending
+            _last_walk[0] = time.time()
+
+    # PHASE 2 - embed the queue. A deferral (EmbedDeferred) stops here and
+    # leaves the rest queued; the daemon's drain loop resumes the QUEUE
+    # later (_resume_pending), it never walks again.
+    done, deferred = (0, "") if stopped else _embed_pending()
+    with _lock:
+        left = len(_pending_paths)
+
     if deferred:
-        # An unfinished walk must not garbage-collect: every file it never
-        # reached would look deleted. The daemon's drain loop runs the scan
-        # again later (an owner scan's rest included, as a background one).
         _scan_retry_at[0] = time.time() + RAG_DEFER_RETRY_S
         _log_deferral("index scan", deferred)
         with _lock:
@@ -973,22 +1041,73 @@ def _index_once(progress: Optional[Callable[[str, int], None]] = None,
                 "ok": True,
                 "deferred": deferred,
                 "files_seen": files_seen_count,
+                "pending": left,
+                "embedded_now": done,
                 "files_indexed_total": _stats["files_indexed"],
                 "chunks_written_total": _stats["chunks_written"],
                 "errors": _stats["errors"],
-                "excluded_dropped": 0,
+                "excluded_dropped": excluded_dropped,
                 "ts": _last_full_scan_ts,
             }
 
-    # Garbage-collect: drop chunks whose file no longer exists on disk, AND
-    # chunks of a file that now matches RAG_EXCLUDE_GLOBS. The second half is
-    # new: a file indexed before its pattern was added (a passwords file, a
-    # .csv device export) used to stay searchable forever, because the walk
-    # merely stopped visiting it while the file itself stayed on disk.
+    if not stopped:
+        _scan_retry_at[0] = 0.0
+        _deferral_logged[0] = ""
+    with _lock:
+        if not stopped:
+            _last_full_scan_ts = time.time()
+        return {
+            "ok": True,
+            "files_seen": files_seen_count,
+            "pending": left,
+            "embedded_now": done,
+            "files_indexed_total": _stats["files_indexed"],
+            "chunks_written_total": _stats["chunks_written"],
+            "errors": _stats["errors"],
+            "excluded_dropped": excluded_dropped,
+            "ts": _last_full_scan_ts,
+        }
+
+
+def _known_signatures(existing) -> "dict | None":
+    """{file_id: sig} from a bulk ``get(include=["metadatas"])`` result;
+    None when there is no usable result (the walk then asks per file)."""
+    if not isinstance(existing, dict):
+        return None
+    try:
+        out: dict = {}
+        for m in existing.get("metadatas") or []:
+            if isinstance(m, dict) and m.get("file_id"):
+                out.setdefault(str(m["file_id"]), str(m.get("sig", "")))
+        return out
+    except Exception:
+        return None
+
+
+def _unchanged(path: str, fid: str, known) -> bool:
+    """Is ``path`` indexed with its current signature? ``known`` is the
+    walk's bulk {file_id: sig} map, or None (then one lookup per file).
+    A file whose signature cannot be read counts as unchanged (_index_file
+    would skip it too)."""
+    sig = _file_signature(path)
+    if not sig:
+        return True
+    prev = known.get(fid, "") if known is not None else _existing_signature(fid)
+    return bool(prev) and prev == sig
+
+
+def _garbage_collect(existing, seen_files) -> int:
+    """Drop chunks whose file no longer exists on disk, AND chunks of a file
+    that now matches RAG_EXCLUDE_GLOBS (a file indexed before its pattern was
+    added - a passwords file, a .csv device export - used to stay searchable
+    forever, because the walk merely stopped visiting it). ``existing`` is
+    the walk's bulk read (None = read now). Returns how many excluded files
+    were dropped. Never raises."""
     excluded_dropped = 0
     try:
         coll = _get_collection()
-        existing = coll.get(include=["metadatas"])
+        if not isinstance(existing, dict):
+            existing = coll.get(include=["metadatas"])
         metas = existing.get("metadatas") or []
         ids = existing.get("ids") or []
         excluded_memo: dict[str, bool] = {}
@@ -1011,33 +1130,85 @@ def _index_once(progress: Optional[Callable[[str, int], None]] = None,
                   f"that now match RAG_EXCLUDE_GLOBS")
     except Exception:
         excluded_dropped = 0
+    return excluded_dropped
 
+
+def _embed_pending() -> "tuple[int, str]":
+    """Embed the queued files (_pending_paths), oldest first, until it is
+    empty, the daemon stops, or a file is deferred (EmbedDeferred: that file
+    goes back to the front, nothing after it is tried). Returns (files that
+    wrote chunks, deferral reason or ''). A file that fails for any other
+    reason is counted as an error and dropped from the queue (the watcher
+    re-queues it when it changes). Never raises."""
+    global _last_error
+    done = 0
+    while not _stop_flag.is_set():
+        with _lock:
+            if not _pending_paths:
+                break
+            path = _pending_paths.pop(0)
+        try:
+            if _index_file(path):
+                done += 1
+        except EmbedDeferred as e:
+            with _lock:
+                if path not in _pending_paths:
+                    _pending_paths.insert(0, path)
+            return done, str(e)
+        except Exception as e:
+            with _lock:
+                _stats["errors"] += 1
+                _last_error = f"{path}: {e}"
+    return done, ""
+
+
+def _resume_pending(label: str) -> dict:
+    """The deferred-scan retry: embed what the last walk queued, without
+    walking again. Schedules the next retry on a new deferral; prints one
+    line when the queue is done. Never raises."""
+    global _last_full_scan_ts
+    done, deferred = _embed_pending()
+    with _lock:
+        left = len(_pending_paths)
+    if deferred:
+        _scan_retry_at[0] = time.time() + RAG_DEFER_RETRY_S
+        _log_deferral("index scan", deferred)
+        return {"ok": True, "deferred": deferred, "pending": left,
+                "embedded_now": done}
+    if _stop_flag.is_set():
+        return {"ok": True, "pending": left, "embedded_now": done}
     _scan_retry_at[0] = 0.0
     _deferral_logged[0] = ""
     with _lock:
         _last_full_scan_ts = time.time()
-        return {
-            "ok": True,
-            "files_seen": files_seen_count,
-            "files_indexed_total": _stats["files_indexed"],
-            "chunks_written_total": _stats["chunks_written"],
-            "errors": _stats["errors"],
-            "excluded_dropped": excluded_dropped,
-            "ts": _last_full_scan_ts,
-        }
+    print(f"  [rag] {label}: index up to date ({done} file(s) embedded, "
+          f"{left} left)")
+    return {"ok": True, "pending": left, "embedded_now": done}
 
 
 # ── watchdog daemon ──────────────────────────────────────────────────
-# time.time() when a deferred full scan is due again (0.0 = none pending).
+# time.time() when a deferred scan's queue is due again (0.0 = none pending).
 _scan_retry_at = [0.0]
+# The files the last finished walk found changed and not embedded yet, oldest
+# first (guarded by _lock); _embed_pending works through it.
+_pending_paths: list = []
+# time.time() of the last finished walk (0.0 = none this process).
+_last_walk = [0.0]
 
 
 def _run_scan(label: str) -> dict:
     """One index_once() for the daemon. A deferred scan (see EmbedDeferred)
     has already scheduled its retry (_scan_retry_at, run by the drain loop)
-    and logged why; a finished one prints its summary."""
+    and logged why; it prints that its WALK finished and how many files wait
+    (v3.0.26: the log never showed a scan get anywhere). A finished one
+    prints its summary."""
     summary = index_once()
-    if not (isinstance(summary, dict) and summary.get("deferred")):
+    if isinstance(summary, dict) and summary.get("deferred"):
+        print(f"  [rag] {label}: walk done ({summary.get('files_seen', 0)} "
+              f"file(s), {summary.get('pending', 0)} to embed, "
+              f"{summary.get('embedded_now', 0)} embedded now); the rest "
+              f"waits: {summary.get('deferred')}")
+    else:
         print(f"  [rag] {label}: {summary}")
     return summary
 
@@ -1047,7 +1218,8 @@ def _drain_event_queue() -> None:
     multiple events for the same path within a short window into one
     re-index call (debounce ~2 s). A path whose embedding was deferred
     (EmbedDeferred) waits RAG_DEFER_RETRY_S and is tried again; a deferred
-    full scan is re-run here when it is due."""
+    scan's queue is resumed here when it is due (_resume_pending - the
+    roots are NOT walked again, v3.0.26)."""
     pending: dict[str, float] = {}
     while not _stop_flag.is_set():
         try:
@@ -1078,10 +1250,10 @@ def _drain_event_queue() -> None:
                     _last_error = f"reindex({p}): {e}"
         if _scan_retry_at[0] and now >= _scan_retry_at[0] and not ready:
             try:
-                _run_scan("rescan after deferral")
+                _resume_pending("resume after deferral")
             except Exception as e:
                 _scan_retry_at[0] = now + RAG_DEFER_RETRY_S
-                print(f"  [rag] rescan failed: {e}")
+                print(f"  [rag] resume failed: {e}")
 
 
 def _start_watchdog() -> bool:
@@ -1335,6 +1507,8 @@ def status() -> dict:
         stats_snapshot = dict(_stats)
         last_full_scan_ts = _last_full_scan_ts
         last_error = _last_error
+        pending = len(_pending_paths)
+        last_walk_ts = _last_walk[0]
     return {
         "available": is_available(),
         "running": _indexer_thread is not None and _indexer_thread.is_alive(),
@@ -1346,6 +1520,10 @@ def status() -> dict:
         # scan runs again (0.0 = none pending).
         "deferred": _deferral_logged[0],
         "retry_at": _scan_retry_at[0],
+        # v3.0.26: files the last finished walk queued and not embedded yet,
+        # and when that walk finished (0.0 = none this process).
+        "pending": pending,
+        "last_walk_ts": last_walk_ts,
         **stats_snapshot,
         "config": current_config(),
     }

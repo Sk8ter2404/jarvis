@@ -339,7 +339,10 @@ class _EmbBase(_RagBase):
 
 class OwnerTalkingGateTests(_EmbBase):
     def test_a_background_embedding_waits_while_the_owner_talks(self):
-        self.loaded = [[]]                       # nothing loaded: no risk
+        # The embed model is loaded already: no load, no eviction risk.
+        # (Nothing loaded at all is a wait of its own since v3.0.26:
+        # BackgroundNeverLoadsTests in test_rag_indexer.)
+        self.loaded = [["nomic-embed-text:latest"]]
         self.gate_reason.return_value = "conversation"
         with self._patched(), self.assertRaises(rag.EmbedDeferred) as cm:
             self.emb._embed_one("hello")
