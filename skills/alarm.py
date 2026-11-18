@@ -22,7 +22,9 @@ When an alarm is due it:
   * says a wake-up line over the tone every ALARM_SAY_EVERY_S ("Sir, you
     need to wake up."), naming what the alarm is for when he gave a label,
   * rings until "stop" / "I'm up" / "snooze" is heard, a key or the mouse is
-    touched, or ALARM_MAX_RING_S passes, then puts the volume back.
+    touched by him (input an automation could have made counts only with
+    his voice or a face just before it: _input_is_his), or ALARM_MAX_RING_S
+    passes, then puts the volume back.
 
 Pending alarms are saved (data/alarms.json) and re-armed at boot; one that
 came due while JARVIS was down rings at once if it is under
@@ -76,6 +78,22 @@ ALARM_RETRY_GAP_S = 300.0    # no answer for ALARM_MAX_RING_S: quiet this long,
 ALARM_MAX_RETRIES = 6        # then ring again, up to this many more times
 ALARM_BUSY_RETRY_S = 30.0    # came due while another rings: try again after
 ALARM_DUP_S = 2.0            # same label, same moment as the one ringing: a duplicate
+# The same "in 20 minutes" heard twice lands seconds apart, maybe across a
+# minute: one alarm. Only ever between two asks for a length of time; a clock
+# time is the same ask only in the same minute (live 2026-11-16 09:20:37: "at
+# 9:21" was refused as "already set for 9:20 AM" by a 60 s window, and no
+# 9:21 alarm was set).
+ALARM_SAME_ASK_S = 60.0
+# A key or the mouse stops the ring only when it is his (live 2026-11-16 the
+# low-level hook was off at every boot, so the OS input timer was the only
+# reading, and it counts injected input: AFK-Helper's clicks, an automation,
+# the Kinect air-mouse). Polled input counts only with his voice or a face
+# within ALARM_INPUT_WITNESS_S (bobert_companion._polled_input_backed); with
+# the hook, injected input never counts. Saying "stop" always works.
+# core/config.py ALARM_INPUT_NEEDS_WITNESS (False = any input, the old way).
+ALARM_INPUT_NEEDS_WITNESS = True
+ALARM_INPUT_WITNESS_S = 180.0
+ALARM_INPUT_SLOP_S = 0.5     # the input stamp may trail the tick by this much
 ALARM_PREP_MAX_S = 8.0       # speakers + volume get this long; the tone starts anyway
 ALARM_VOLUME_RETRY_S = 2.0   # the volume would not go up: try again this often
 ALARM_ASKED_WHEN_S = 90.0    # "what time should it ring?" is live this long
@@ -192,6 +210,56 @@ def _input_tick():
     except Exception:
         pass
     return None
+
+
+def _monolith():
+    """The running bobert_companion module, or None (isolated tests)."""
+    return sys.modules.get("bobert_companion")
+
+
+def _cfg_bool(name: str, default: bool) -> bool:
+    """A bool setting from the running monolith (owner settings applied),
+    else ``default``. Never raises."""
+    try:
+        v = getattr(_monolith(), name, None)
+        return v if isinstance(v, bool) else default
+    except Exception:
+        return default
+
+
+def _input_is_his(since_s: float) -> bool:
+    """May keyboard / mouse input the OS timer just showed stop the ring?
+    ``since_s``: seconds since the ring's input grace ended; input older than
+    that is not this ring's answer.
+
+    With the low-level hook live, only non-injected input counts (the
+    monolith's _physical_input_age_s). On the polling fallback - every boot
+    of 2026-11-16/17 - the OS timer cannot tell AFK-Helper or an automation
+    from him, so it counts only with his voice or a face within
+    ALARM_INPUT_WITNESS_S (_polled_input_backed, the presence rule, with the
+    alarm's own window). No monolith (a bare skill) or a fault: True, the
+    plain tick as before. Never raises."""
+    try:
+        if not _cfg_bool("ALARM_INPUT_NEEDS_WITNESS", ALARM_INPUT_NEEDS_WITNESS):
+            return True
+        bc = _monolith()
+        age_fn = getattr(bc, "_physical_input_age_s", None)
+        backed_fn = getattr(bc, "_polled_input_backed", None)
+        if not (callable(age_fn) and callable(backed_fn)):
+            return True
+        try:
+            from skills import _air_mouse_yield as _y
+            source = _y.input_source()
+        except Exception:
+            source = "none"
+        if source == "none":
+            # The watcher never started: nothing stamps real input, so the
+            # OS tick this ring already read is all there is.
+            return bool(backed_fn(ALARM_INPUT_WITNESS_S))
+        age = float(age_fn(ALARM_INPUT_WITNESS_S))
+        return age <= max(0.0, float(since_s)) + ALARM_INPUT_SLOP_S
+    except Exception:
+        return True
 
 
 def _to_speakers() -> None:
@@ -478,7 +546,15 @@ def _tomorrow_shift(secs: int) -> int:
 def _parse_when(text: str):
     """Seconds from now for 'at 7', '7:30 am', '422', 'seven thirty', 'half
     past six', 'in 20 minutes', '6 tomorrow'. None when no time is named, or
-    when a day other than today or tomorrow is.
+    when a day other than today or tomorrow is. See _parse_when_kind."""
+    return _parse_when_kind(text)[0]
+
+
+def _parse_when_kind(text: str):
+    """(seconds from now, kind) for an alarm time; (None, "") when none is
+    named. kind is "clock" for a time of day (also "20 minutes before my 8
+    am class") and "relative" for a length of time ("in 20 minutes"): the
+    same-ask check treats the two differently (set_alarm).
 
     The FIRST thing in the ask that reads as a time wins ("7 am for the 9 30
     lecture" is 7 AM), starting at "wake me at" / "alarm for" when the line
@@ -489,7 +565,7 @@ def _parse_when(text: str):
     from skills import timer as _timer
     t = _spoken_clock(_normalise((text or "").strip().lower()))
     if not t or _FAR_DAY_RE.search(t):
-        return None
+        return None, ""
     a = _ANCHOR_RE.search(t)
     pos = a.start() if a else 0
     cands = []            # (where its hour starts, rule, minute, hours, tomorrow)
@@ -536,18 +612,18 @@ def _parse_when(text: str):
             clock = _until_clock(first[2], *first[3])
             if span is not None and span > 0:
                 secs = clock - span if rel.group(1) == "before" else clock + span
-                return int(secs if secs > 0 else secs + 86400)
+                return int(secs if secs > 0 else secs + 86400), "clock"
         else:
             secs = _timer._parse_duration(seg)
             if secs is not None and secs > 0:
-                return int(secs)
+                return int(secs), "relative"
     if first:
         secs = _until_clock(first[2], *first[3])
-        return _tomorrow_shift(secs) if first[4] else secs
+        return (_tomorrow_shift(secs) if first[4] else secs), "clock"
     secs = _timer._parse_duration(t)
     if secs is not None and secs > 0:
-        return int(secs)
-    return None
+        return int(secs), "relative"
+    return None, ""
 
 
 # Words a time is made of. A label half that is nothing else is the time,
@@ -563,17 +639,24 @@ def _split_args(args: str):
     """(seconds, label) from "<time>" or "<time> | <label>". Only the time
     half is ever rewritten. "gym | 6:30" is read the other way round, but a
     digit inside a real label ("lunch | take 2 pills") is never the time."""
+    secs, label, _kind = _split_when(args)
+    return secs, label
+
+
+def _split_when(args: str):
+    """_split_args plus the kind of time asked for (_parse_when_kind)."""
     raw = (args or "").strip()
     when, _, label = raw.partition("|")
     if not label.strip():
-        return _parse_when(when), ""
-    secs = _parse_when(when)
+        secs, kind = _parse_when_kind(when)
+        return secs, "", kind
+    secs, kind = _parse_when_kind(when)
     if secs is None and not re.search(r"\d", when) and \
             not _TIME_ONLY_RE.sub("", label.lower()).strip():
-        other = _parse_when(label)
+        other, other_kind = _parse_when_kind(label)
         if other is not None:
-            return other, when.strip()
-    return secs, label.strip()
+            return other, when.strip(), other_kind
+    return secs, label.strip(), kind
 
 
 def _clock(epoch: float) -> str:
@@ -683,7 +766,10 @@ def restore_persisted_alarms() -> int:
 
 # ── arming and ringing ───────────────────────────────────────────────────
 def _arm(secs: float, label: str, at: float | None = None,
-         tries: int = 0) -> int:
+         tries: int = 0, kind: str = "") -> int:
+    """Arm one alarm. ``kind`` is how it was asked for ("clock" /
+    "relative", _parse_when_kind; "" for a snooze, a retry or a restored
+    one), read only by set_alarm's same-ask check."""
     with _lock:
         aid = _next_id[0]
         _next_id[0] += 1
@@ -692,7 +778,7 @@ def _arm(secs: float, label: str, at: float | None = None,
     t.daemon = True
     with _lock:
         _alarms[aid] = {"at": fire_at, "label": label, "timer": t,
-                        "tries": int(tries)}
+                        "tries": int(tries), "kind": str(kind or "")}
     t.start()
     return aid
 
@@ -838,8 +924,9 @@ def ring(aid: int, label: str = "", at: float | None = None,
         return
     box = {"before": None, "raised": False, "done": False, "level": None,
            "stepping": False, "closed": False, "lock": threading.Lock()}
+    unproven = 0          # input seen but not counted as his (_input_is_his)
     try:
-        print(f"  [alarm] \u23f0 ringing #{aid} {label}".rstrip())
+        print(f"  [alarm]\u23f0 ringing #{aid} {label}".rstrip())
         _persist()
         # The speaker switch and the volume are calls into the audio service
         # with no time limit of their own. They get a few seconds on their
@@ -886,9 +973,19 @@ def ring(aid: int, label: str = "", at: float | None = None,
             if age < ALARM_INPUT_GRACE_S or tick0 is None:
                 tick0 = tick
             elif tick is not None and tick != tick0:
-                with _lock:
-                    me["why"] = me["why"] or "input"
-                break
+                if _input_is_his(age - ALARM_INPUT_GRACE_S):
+                    with _lock:
+                        me["why"] = me["why"] or "input"
+                    break
+                # Not provably him (an automation, an auto-clicker): the
+                # ring goes on, and the next change is read afresh.
+                tick0 = tick
+                unproven += 1
+                if unproven == 1:
+                    print(f"  [alarm] #{aid} input not counted: no voice or "
+                          f"face in the last {ALARM_INPUT_WITNESS_S:.0f} s "
+                          "and the OS input timer counts automation too "
+                          "(ALARM_INPUT_NEEDS_WITNESS); still ringing")
             if not tone:
                 # No sound at all is not a reason to stop: the spoken lines
                 # go out another way, and the tone is tried again.
@@ -931,6 +1028,9 @@ def ring(aid: int, label: str = "", at: float | None = None,
         with _lock:
             if _ringing[0] is me:
                 _ringing[0] = None
+        if unproven:
+            print(f"  [alarm] #{aid} ignored {unproven} input change(s) "
+                  "it could not prove were yours")
     try:
         _after_ring(aid, label, me["why"] or "voice", tries, at)
     except Exception as e:
@@ -1064,8 +1164,28 @@ def asked_when_recently() -> bool:
     return 0.0 < time.monotonic() - _asked_when_at[0] < ALARM_ASKED_WHEN_S
 
 
+def _same_ask(a: dict, at: float, label: str, kind: str) -> bool:
+    """Is an alarm being set (``at``, ``label``, ``kind``) the same ask as
+    the pending alarm ``a``, heard twice? Same label, and: the same clock
+    minute (a clock time asked twice), or - only between two asks for a
+    length of time - within ALARM_SAME_ASK_S or ALARM_DUP_S. A clock time
+    in another minute is NEVER the same ask: live 2026-11-16 "at 9:21" was
+    answered "already set for 9:20 AM" (any alarm within 60 s matched) and
+    nothing was set for 9:21."""
+    if a["label"] != label:
+        return False
+    gap = abs(float(a["at"]) - float(at))
+    if gap < 60.0 and _hm(a["at"]) == _hm(at):
+        return True
+    if kind == "clock":
+        return False
+    if kind == "relative" and a.get("kind") == "relative":
+        return gap < ALARM_SAME_ASK_S
+    return gap < ALARM_DUP_S
+
+
 def set_alarm(args: str = "") -> str:
-    secs, label = _split_args(args)
+    secs, label, kind = _split_when(args)
     if secs is None or secs <= 0:
         if _FAR_DAY_RE.search((args or "").lower()):
             return ("I can only set an alarm for today or tomorrow, sir. "
@@ -1078,11 +1198,11 @@ def set_alarm(args: str = "") -> str:
     at = time.time() + secs
     with _lock:
         same = next((a for a in _alarms.values()
-                     if a["label"] == label and abs(a["at"] - at) < 60.0), None)
+                     if _same_ask(a, at, label, kind)), None)
     if same is not None:
         # The same ask heard twice is one alarm.
         return f"That alarm is already set for {_clock_day(same['at'])}, sir."
-    aid = _arm(secs, label)
+    aid = _arm(secs, label, kind=kind)
     _persist()
     tail = f" for {label}" if label else ""
     return (f"Alarm #{aid} set for {_clock_day(at)}{tail}, {_span(secs)} "

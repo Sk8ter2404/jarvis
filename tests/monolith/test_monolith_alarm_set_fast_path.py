@@ -49,7 +49,7 @@ class AlarmSetFastPathTests(MonolithGlobalsTestCase):
             self.alarm, _acts = load_skill_isolated("alarm", register=False)
         self.armed = []
 
-        def arm(secs, label, at=None, tries=0):
+        def arm(secs, label, at=None, tries=0, kind=""):
             self.armed.append((int(secs), label))
             return len(self.armed)
 
@@ -255,6 +255,57 @@ class AlarmSetFastPathTests(MonolithGlobalsTestCase):
         self.assertTrue(self._run("7 am"))
         self.assertEqual(self.set_calls, ["7 am"])
         self.assertFalse(self.alarm.asked_when_recently())
+
+    def test_his_answer_with_the_ask_around_it_sets_the_alarm(self):
+        # Live 2026-11-16 09:18:46 set_alarm asked "What time should it ring,
+        # sir?"; 09:19:13 "Jarvis, go ahead and set it for one minute from
+        # now." reached the brain, which set a one-line TIMER.
+        for said, arg, secs in (
+                ("Jarvis, go ahead and set it for one minute from now.",
+                 "one minute", 60),
+                ("set it for 7", "at 7", None),
+                ("make it 7:30", "7:30", None),
+                ("can you set it to 6 am", "6 am", None),
+                ("set it to ring at 7", "at 7", None),
+                ("have it go off in 20 minutes", "in 20 minutes", 1200),
+                ("okay so set it for twenty minutes from now", "twenty minutes",
+                 1200)):
+            with self.subTest(said=said):
+                self.set_calls.clear()
+                self.armed.clear()
+                self.alarm.set_alarm("a quick test")      # asks when
+                self.assertTrue(self.alarm.asked_when_recently())
+                self.assertTrue(self._run(said))
+                self.assertEqual(self.set_calls, [arg])
+                self.assertEqual(len(self.armed), 1)
+                if secs is not None:
+                    self.assertEqual(self.armed[0][0], secs)
+        self.llm.assert_not_called()
+
+    def test_after_the_question_other_asks_still_go_to_the_brain(self):
+        for said in ("set a timer for 5 minutes", "go ahead and set it",
+                     "set it for the gym", "set it for 7 and turn the lights off",
+                     "make it louder", "set the lights to 7"):
+            with self.subTest(said=said):
+                self.alarm.set_alarm("a quick test")
+                self.assertFalse(self.bc._run_alarm_set_shortcut(said))
+        self.assertEqual(self.set_calls, [])
+        # And with no question open, "set it for 7" is not an alarm.
+        self.alarm._asked_when_at[0] = 0.0
+        self.assertFalse(self.bc._run_alarm_set_shortcut("set it for 7"))
+
+    def test_set_heard_as_send_or_sent_along_still_sets_it(self):
+        # Live 2026-11-16 09:20:33 / 11:12:39 / 11:12:51: all three went to
+        # the brain ("I haven't the slightest idea what you mean", a blocked
+        # "I'll keep that in mind"); only the third try was heard right.
+        for said, arg in (("Jarvis, send an alarm for 921.", "at 9:21"),
+                          ("Jarvis sent along for eleven-thirteen.", "at 11:13"),
+                          ("Jarvis setting long for eleven thirteen.", "at 11:13")):
+            with self.subTest(said=said):
+                self.set_calls.clear()
+                self.assertTrue(self._run(said))
+                self.assertEqual(self.set_calls, [arg])
+        self.llm.assert_not_called()
 
     def test_the_speech_filter_does_not_eat_the_answer(self):
         # "7 am" is four characters: is_valid_speech calls it too short, and

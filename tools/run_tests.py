@@ -229,7 +229,14 @@ def main(argv: list[str]) -> int:
     if selectors:
         suite = unittest.TestSuite()
         for sel in selectors:
-            name = sel if sel.startswith("test_") else f"test_{sel}"
+            head, dot, _rest = sel.partition(".")
+            if dot and os.path.isdir(os.path.join(_TESTS_DIR, head)):
+                # A module in a tests/ subpackage ("skills.test_alarm",
+                # "monolith.test_monolith_alarm_set_fast_path"): taken as
+                # written - the test_ prefix made it "test_skills.x".
+                name = sel
+            else:
+                name = sel if sel.startswith("test_") else f"test_{sel}"
             name = name[:-3] if name.endswith(".py") else name
             suite.addTests(loader.loadTestsFromName(f"tests.{name}"))
     else:

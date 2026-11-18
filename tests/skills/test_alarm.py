@@ -66,6 +66,11 @@ class _Rig:
         patch("_input_tick", lambda: self.tick)
         patch("_to_speakers", lambda: self.events.append(("speakers",)))
         patch("_say", lambda message, key=None: self.said.append(message))
+        # No running monolith unless a test gives one (_input_is_his reads
+        # the presence helpers through it): a monolith another test module
+        # imported must not decide whether a key stops this ring.
+        self.bc = None
+        patch("_monolith", lambda: self.bc)
         # Never the real PC-speaker beep, never real COM, no real waiting.
         patch("_beep", self._beep)
         patch("_com_enter", lambda: self.events.append(("com",)))
@@ -842,6 +847,217 @@ class RingTests(_AlarmCase):
     def test_a_label_that_reads_as_an_answer_is_not_said_aloud(self):
         self.assertNotIn("stop smoking", self.mod.wake_line(0, 2.0, "stop smoking"))
         self.assertIn("for the gym", self.mod.wake_line(0, 2.0, "the gym"))
+
+
+class SameAskTests(_AlarmCase):
+    """set_alarm's "the same ask heard twice" check (live 2026-11-16
+    09:20:37: "at 921" was refused as "already set for 9:20 AM" because any
+    alarm within 60 s matched, and nothing was set for 9:21)."""
+
+    @staticmethod
+    def _ts(h, m, s=0):
+        return datetime(2026, 11, 16, h, m, s).timestamp()
+
+    def _set(self, when, arg):
+        with mock.patch.object(self.mod.time, "time", return_value=when):
+            return self._quiet(self.actions["set_alarm"], arg)
+
+    def test_the_kind_of_time_asked_for(self):
+        k = self.mod._parse_when_kind
+        with mock.patch.object(self.mod.time, "time",
+                               return_value=self._ts(16, 21)):
+            self.assertEqual(k("in 20 minutes"), (1200, "relative"))
+            self.assertEqual(k("45"), (45 * 60, "relative"))
+            self.assertEqual(k("at 9:21")[1], "clock")
+            self.assertEqual(k("422")[1], "clock")
+            self.assertEqual(k("20 minutes before my 8 am class")[1], "clock")
+            self.assertEqual(k("when I get tired"), (None, ""))
+        self.assertEqual(self.mod._split_when("gym | 6:30")[1:], ("gym", "clock"))
+
+    def test_the_live_9_21_after_a_one_minute_alarm_is_set(self):
+        # 09:19:49 "set an alarm for one minute from now" (fast path: "in 1
+        # minutes") rang at 09:20:49; 09:20:37 "at 921".
+        first = self._set(self._ts(9, 19, 49), "in 1 minutes")
+        self.assertTrue(first.startswith("Alarm #1 set for 9:20 AM,"), first)
+        out = self._set(self._ts(9, 20, 37), "at 921")
+        self.assertTrue(out.startswith("Alarm #2 set for 9:21 AM,"), out)
+        self.assertEqual(len(self.mod._snapshot()), 2)
+
+    def test_never_already_set_for_a_minute_he_did_not_say(self):
+        # One second apart, but 9:20:59 and 9:21:00 are different minutes.
+        self._set(self._ts(9, 19, 59), "in 1 minutes")
+        out = self._set(self._ts(9, 20, 0), "at 9:21")
+        self.assertTrue(out.startswith("Alarm #2 set for 9:21 AM,"), out)
+
+    def test_a_clock_time_asked_twice_is_one_alarm(self):
+        self._set(self._ts(22, 0), "7 am")
+        out = self._set(self._ts(22, 0, 20), "at 7 am")
+        self.assertEqual(out, "That alarm is already set for 7:00 AM tomorrow, sir.")
+        self.assertEqual(len(self.mod._snapshot()), 1)
+        # A different label is a different alarm.
+        self.assertIn("Alarm #2", self._set(self._ts(22, 1), "7 am | gym"))
+
+    def test_a_length_of_time_heard_twice_is_one_alarm_across_a_minute(self):
+        # Two captures of "in 20 minutes" 15 s apart land 9:39:50 / 9:40:05.
+        self._set(self._ts(9, 19, 50), "in 20 minutes")
+        out = self._set(self._ts(9, 20, 5), "in 20 minutes")
+        self.assertEqual(out, "That alarm is already set for 9:39 AM, sir.")
+        # Over a minute apart is another ask.
+        self.assertIn("Alarm #2", self._set(self._ts(9, 21, 0), "in 20 minutes"))
+
+    def test_a_length_of_time_beside_a_clock_alarm(self):
+        self._set(self._ts(9, 19, 0), "at 9:40")
+        # Lands 9:39:40: another minute, and he named no minute: not it.
+        self.assertIn("Alarm #2", self._set(self._ts(9, 19, 40), "in 20 minutes"))
+        # Lands 9:40:30, in the 9:40 alarm's own minute: the same alarm.
+        self.assertEqual(self._set(self._ts(9, 20, 30), "in 20 minutes"),
+                         "That alarm is already set for 9:40 AM, sir.")
+
+
+class InputWitnessTests(_AlarmCase):
+    """A key or the mouse stops the ring only when the input is his
+    (_input_is_his). The monolith's presence helpers are faked here; the
+    real ones are driven in tests/monolith/test_monolith_alarm_input.py."""
+
+    def setUp(self):
+        super().setUp()
+        from skills import _air_mouse_yield as y
+        self.y = y
+        self.backed = [False]
+        self.age = [float("inf")]
+        self.calls = []
+
+        def backed_fn(window_s=None):
+            self.calls.append(("backed", window_s))
+            return self.backed[0]
+
+        def age_fn(backup_s=None):
+            self.calls.append(("age", backup_s))
+            return self.age[0]
+        self.rig.bc = mock.Mock(spec=["_polled_input_backed",
+                                      "_physical_input_age_s"])
+        self.rig.bc._polled_input_backed = backed_fn
+        self.rig.bc._physical_input_age_s = age_fn
+        # The watcher on its polling fallback, as at every live boot of
+        # 2026-11-16/17 ("LL hook unavailable ... falling back").
+        self._source("poll")
+        p = mock.patch.object(self.mod, "ALARM_INPUT_GRACE_S", 0.0)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _source(self, src):
+        for name, val in (("_installed", src != "none"),
+                          ("_hook_ok", src == "hook"),
+                          ("_last_hook_event", time.monotonic() + 3600.0)):
+            p = mock.patch.object(self.y, name, val)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(self.y, "_os_last_input_age_s", return_value=0.1)
+        p.start()
+        self.addCleanup(p.stop)
+        self.assertEqual(self.y.input_source(), src)
+
+    def _ring(self):
+        self.buf = io.StringIO()
+
+        def run():
+            with contextlib.redirect_stdout(self.buf):
+                self.mod.ring(7, "")
+        t = threading.Thread(target=run, daemon=True)
+        self.addCleanup(t.join, 5.0)
+        t.start()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline and not (
+                self.mod.is_ringing()
+                and any(e[0] == "start" for e in self.rig.events)):
+            time.sleep(0.01)
+        time.sleep(0.6)                     # the loop reads its baseline tick
+        self.assertTrue(self.mod.is_ringing())
+        return t
+
+    def _touch(self, secs=1.0):
+        self.rig.tick += 50
+        time.sleep(secs)
+
+    def test_polled_input_with_no_witness_does_not_stop_it(self):
+        t = self._ring()
+        self._touch()
+        self.assertTrue(self.mod.is_ringing(), "an automation's input ended it")
+        self._touch()
+        self.assertTrue(self.mod.is_ringing())
+        self.assertIn(("age", self.mod.ALARM_INPUT_WITNESS_S), self.calls)
+        self.assertEqual(self.mod.ALARM_INPUT_WITNESS_S, 180.0)
+        # Then he is seen (or heard) and touches a key: it stops.
+        self.backed[0] = True
+        self.age[0] = 0.1
+        self._touch()
+        t.join(5.0)
+        self.assertFalse(self.mod.is_ringing())
+        self.assertIn("Alarm off, sir.", self.rig.said)
+        log = self.buf.getvalue()
+        self.assertEqual(log.count("#7 input not counted"), 1, log)
+        self.assertIn("#7 ignored 2 input change(s)", log)
+        self.assertIn("#7 stopped (input)", log)
+
+    def test_with_the_hook_only_real_input_counts(self):
+        self._source("hook")
+        t = self._ring()
+        self.age[0] = 3600.0                # only injected input since the hook
+        self._touch()
+        self.assertTrue(self.mod.is_ringing())
+        self.age[0] = 0.1                   # a real key
+        self._touch()
+        t.join(5.0)
+        self.assertFalse(self.mod.is_ringing())
+
+    def test_real_input_from_before_the_grace_is_not_the_answer(self):
+        self._source("hook")
+        with mock.patch.object(self.mod, "ALARM_INPUT_GRACE_S", 0.3):
+            t = self._ring()
+            self.age[0] = 30.0              # his last real key: before it rang
+            self._touch()
+            self.assertTrue(self.mod.is_ringing())
+            self.mod._stop_ringing("voice")
+            t.join(5.0)
+
+    def test_no_watcher_falls_back_to_the_witness_alone(self):
+        self._source("none")
+        t = self._ring()
+        self._touch()
+        self.assertTrue(self.mod.is_ringing())
+        self.backed[0] = True
+        self._touch()
+        t.join(5.0)
+        self.assertFalse(self.mod.is_ringing())
+        self.assertIn(("backed", self.mod.ALARM_INPUT_WITNESS_S), self.calls)
+
+    def test_the_setting_off_is_any_input_as_before(self):
+        self.rig.bc = mock.Mock(spec=["_polled_input_backed",
+                                      "_physical_input_age_s",
+                                      "ALARM_INPUT_NEEDS_WITNESS"])
+        self.rig.bc.ALARM_INPUT_NEEDS_WITNESS = False
+        self.rig.bc._polled_input_backed = lambda *a: False
+        self.rig.bc._physical_input_age_s = lambda *a: float("inf")
+        t = self._ring()
+        self._touch()
+        t.join(5.0)
+        self.assertFalse(self.mod.is_ringing())
+
+    def test_a_broken_presence_read_fails_open(self):
+        def boom(*a):
+            raise OSError("watcher gone")
+        self.rig.bc._physical_input_age_s = boom
+        t = self._ring()
+        self._touch()
+        t.join(5.0)
+        self.assertFalse(self.mod.is_ringing())
+
+    def test_voice_stop_always_works_with_no_witness(self):
+        t = self._ring()
+        self._touch()
+        self.assertEqual(self.mod.handle_ringing("stop"), "Alarm off, sir.")
+        t.join(5.0)
+        self.assertFalse(self.mod.is_ringing())
 
 
 class HeardWhileRingingTests(_AlarmCase):

@@ -150,6 +150,12 @@ POS = [
     ("wake me up at 7 eleven", "Thu 19:11"),
     ("set an alarm for 7 a.m. That's all.", "Fri 07:00"),
     ("Jarvis, alarm, 6 30 am", "Fri 06:30"),
+    # "set" as speech-to-text heard it, live 2026-11-16 09:20:33 / 11:12:39 /
+    # 11:12:51 (all three went to the brain; two got no alarm at all)
+    ("Jarvis, send an alarm for 921.", "Thu 21:21"),
+    ("Jarvis sent along for eleven-thirteen.", "Thu 23:13"),
+    ("Jarvis setting long for eleven thirteen.", "Thu 23:13"),
+    ("set a long for 7 am", "Fri 07:00"),
 ]
 
 NEG = [
@@ -220,6 +226,10 @@ NEG = [
     "set an alarm for 4 22 22", "set an alarm in 7 am", "wake me up in 7 pm",
     "set an alarm for 99 99", "set an alarm for 24 00", "set an alarm for 7 am 8 am",
     "what if you wake me up at 7", "you could set an alarm for 7", "would you say alarm at 7",
+    # the misheard heads, anywhere but a plain ask
+    "he sent along for 7", "I sent along for 7", "sent along for the documents",
+    "sent along for 7 people", "send an alarm to my phone for 7",
+    "send the alarm for 7 to mom", "setting long for", "it was a long for 7",
 ]
 
 
