@@ -21,7 +21,6 @@ os.startfile always failing (nothing is launched, no window opens):
 from __future__ import annotations
 
 import unittest
-from unittest import mock
 
 from tests._monolith_harness import requires_monolith
 from tests.monolith.test_monolith_offer_yes import _OfferBase
