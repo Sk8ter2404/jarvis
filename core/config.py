@@ -79,9 +79,19 @@ SKILLS_ENABLED = True
 # injected into the volatile system-prompt tail (budget-bounded, never
 # blocks the voice loop). Overridable via data/user_settings.json.
 LTM_ENABLED = True
+# How long a turn may wait for its long-term-memory recall, in seconds,
+# counted from when the recall STARTS - at the top of the turn, so the prompt
+# routing runs alongside it and the voice thread waits only for what is left
+# (2026-11-17). A recall that misses it puts no memories in that turn's
+# prompt and logs "[ltm] recall timeout"; one that finishes later logs
+# "[ltm] recall finished late ms=..." so the budget can be tuned from real
+# numbers. Every turn logs one "[ltm] recall n=K ms=T" line, the turn trace
+# carries ltm={hit, n, ms, outcome}, and boot logs one "[ltm] warm recall
+# ms=..." line. Clamped to 0.05-3.0. Overridable via data/user_settings.json.
+LTM_RECALL_BUDGET_S = 0.6
 # Torch device for the LTM sentence-transformer embedder (bge-small, ~0.4GB).
 # "cpu" (default 2026-07-15): keep the embedder OFF the GPU — encoding a short
-# utterance on the 14900K is a few ms (well inside the 0.6s recall budget), and
+# utterance on the 14900K is a few ms (well inside LTM_RECALL_BUDGET_S), and
 # the freed VRAM goes to the local LLM (now the 26B), the tenant that actually
 # needs it. The old "" auto-default silently loaded it on CUDA on this box. Set
 # "" to restore auto (cuda if available), or a specific device to override.

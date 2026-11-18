@@ -25123,8 +25123,15 @@ def _cached_system_param(full_prompt: str):
 # plus the staging guard (test injects must not pollute real memory).
 _ltm_queue: "queue.Queue[tuple[str, str]] | None" = None
 _ltm_worker_started = [False]
-_LTM_RETRIEVE_BUDGET_S = 0.6   # max wall-clock a turn will wait on recall
+# Max wall-clock a turn's recall may take, counted from its start
+# (LTM_RECALL_BUDGET_S, core/config.py; clamped in _ltm_recall_budget_s).
+_LTM_RETRIEVE_BUDGET_S = globals().get("LTM_RECALL_BUDGET_S", 0.6)
 _LTM_RETRIEVE_K = 6
+# Recall threads still running (_ltm_recall_start). A wedged or starved
+# embedder must not pile one thread per turn behind its encode lock: past
+# this many, a turn skips its recall and says so.
+_LTM_RECALL_MAX_INFLIGHT = 2
+_ltm_recall_threads: list = []
 # The facts the most recent recall put in the prompt (_ltm_context):
 # {"ts": float, "facts": [fact entry, ...]}, or None. In memory only; read by
 # the "where did you learn that" action (_act_where_learned, 2026-10-02).
@@ -25223,6 +25230,16 @@ def _ltm_boot_warm() -> None:
             loader = getattr(ltm, "_try_import_embedder", None)
             if callable(loader) and loader() is not None:
                 print("  [ltm] embedder ready")
+                # ...and run ONE recall (2026-11-17): the first encode and
+                # the first vector query pay their own warm-up, which used
+                # to land on the owner's first turn and miss its budget.
+                # Read-only; the number is the boot baseline for
+                # LTM_RECALL_BUDGET_S.
+                _t0 = time.monotonic()
+                ltm.retrieve_facts("hello", k=1)
+                print(f"  [ltm] warm recall ms="
+                      f"{int((time.monotonic() - _t0) * 1000)} (recall "
+                      f"budget {int(_ltm_recall_budget_s() * 1000)} ms)")
         except Exception as e:
             print(f"  [ltm] embedder warm-up failed: {e}")
 
@@ -25412,30 +25429,103 @@ def _ltm_enqueue(role: str, text: str) -> None:
         pass
 
 
-def _ltm_context(user_text: str) -> str:
+def _ltm_recall_budget_s() -> float:
+    """The recall budget in seconds (_LTM_RETRIEVE_BUDGET_S, from
+    LTM_RECALL_BUDGET_S), clamped to 0.05-3.0 so a typo can neither switch
+    recall off silently nor hold the voice thread for long. Never raises."""
+    try:
+        return min(3.0, max(0.05, float(_LTM_RETRIEVE_BUDGET_S)))
+    except Exception:
+        return 0.6
+
+
+def _ltm_recall_start(user_text: str):
+    """Start this turn's long-term-memory recall on a daemon thread and
+    return its handle for _ltm_context, or None when recall is off, the text
+    is blank or the store is unavailable. Never blocks, never raises.
+
+    _call_llm starts it at the top of the turn (2026-11-17), so the mood
+    classification and the prompt routing run alongside the embedding and
+    the voice thread waits only for what is left of the budget. At most
+    _LTM_RECALL_MAX_INFLIGHT recalls run at once: past that the turn skips
+    its recall (handle {"busy": True}) and logs one "[ltm] recall skipped"
+    line instead of queueing another thread behind a stuck encode."""
+    try:
+        if not _ltm_enabled() or not user_text or not user_text.strip():
+            return None
+        ltm = _ltm_module()
+        if ltm is None:
+            return None
+        alive = [t for t in _ltm_recall_threads if t.is_alive()]
+        _ltm_recall_threads[:] = alive
+        if len(alive) >= _LTM_RECALL_MAX_INFLIGHT:
+            print(f"  [ltm] recall skipped: {len(alive)} earlier recall(s) "
+                  f"still running - no memories this turn")
+            _turn_trace_call("note_ltm", 0, 0, "busy")
+            return {"busy": True, "text": user_text}
+        h = {"text": user_text, "t0": time.monotonic(), "result": [],
+             "done": threading.Event(), "lock": threading.Lock(),
+             "ms": None, "late": False, "error": False}
+
+        def _fetch():
+            try:
+                h["result"].extend(
+                    ltm.retrieve_facts(user_text, k=_LTM_RETRIEVE_K) or [])
+            except Exception as e:
+                h["error"] = True
+                print(f"  [ltm] retrieve failed: {e}")
+            finally:
+                ms = int((time.monotonic() - h["t0"]) * 1000)
+                with h["lock"]:
+                    h["ms"] = ms
+                    late = h["late"]
+                h["done"].set()
+                if late:
+                    # The number to tune LTM_RECALL_BUDGET_S by.
+                    print(f"  [ltm] recall finished late ms={ms} "
+                          f"n={len(h['result'])} (budget "
+                          f"{int(_ltm_recall_budget_s() * 1000)} ms)")
+
+        t = threading.Thread(target=_fetch, name="ltm-recall", daemon=True)
+        _ltm_recall_threads.append(t)
+        t.start()
+        return h
+    except Exception:
+        return None
+
+
+def _ltm_context(user_text: str, started=None) -> str:
     """Top-k semantic facts relevant to this utterance, formatted as a
     system-prompt addendum — or '' when disabled, cold, or slow. The hard
     time budget means a cold embedder simply skips a turn or two while it
-    loads in the background instead of stalling the voice loop."""
-    if not _ltm_enabled() or not user_text or not user_text.strip():
-        return ""
-    ltm = _ltm_module()
-    if ltm is None:
-        return ""
-    result: list = []
-    done = threading.Event()
+    loads in the background instead of stalling the voice loop.
 
-    def _fetch():
-        try:
-            result.extend(ltm.retrieve_facts(user_text, k=_LTM_RETRIEVE_K) or [])
-        except Exception as e:
-            print(f"  [ltm] retrieve failed: {e}")
-        finally:
-            done.set()
-
-    threading.Thread(target=_fetch, name="ltm-recall", daemon=True).start()
-    if not done.wait(timeout=_LTM_RETRIEVE_BUDGET_S):
+    ``started``: the handle _ltm_recall_start returned for this same text
+    earlier in the turn; without one (or for other text) the recall starts
+    here. The wait is what is left of _ltm_recall_budget_s() since the
+    recall started, so the voice thread never waits longer than before.
+    Logs ONE line per turn (2026-11-17; a miss used to be silent):
+    "[ltm] recall n=K ms=T", or "[ltm] recall timeout ms=T (budget B ms)";
+    the turn trace gets ltm={hit, n, ms, outcome}."""
+    h = started
+    if not isinstance(h, dict) or h.get("text") != user_text:
+        h = _ltm_recall_start(user_text)
+    if not h or h.get("busy"):
         return ""
+    budget = _ltm_recall_budget_s()
+    left = budget - (time.monotonic() - h["t0"])
+    if not h["done"].wait(timeout=max(0.0, left)):
+        with h["lock"]:
+            missed = h["ms"] is None
+            if missed:
+                h["late"] = True
+        if missed:
+            waited = int((time.monotonic() - h["t0"]) * 1000)
+            print(f"  [ltm] recall timeout ms={waited} (budget "
+                  f"{int(budget * 1000)} ms) - no memories this turn")
+            _turn_trace_call("note_ltm", 0, waited, "timeout")
+            return ""
+    result = h["result"]
     lines = []
     recalled = []
     for f in result[:_LTM_RETRIEVE_K]:
@@ -25449,6 +25539,11 @@ def _ltm_context(user_text: str) -> str:
             if isinstance(tags, (list, tuple)) and "project" in tags:
                 t = "(auto-learned project mention, unverified) " + t
             lines.append(f"- {t[:300]}")
+    ms = h["ms"] if isinstance(h.get("ms"), int) else 0
+    outcome = "hit" if lines else ("error" if h.get("error") else "none")
+    print(f"  [ltm] recall n={len(lines)} ms={ms}"
+          + (" (retrieve failed)" if outcome == "error" else ""))
+    _turn_trace_call("note_ltm", len(lines), ms, outcome)
     if not lines:
         return ""
     # What "where did you learn that" asks about (_act_where_learned): the
@@ -27645,6 +27740,10 @@ def _call_llm(user_text: str) -> str:
     # local. _trim_conversation_history drops leading non-'user' messages, so
     # running it here guarantees the very first request is well-formed. 2026-07-08.
     _trim_conversation_history()
+    # Long-term-memory recall starts NOW (2026-11-17): the mood classifier
+    # and the prompt routing below run alongside the embedding, and
+    # _ltm_context further down waits only for what is left of its budget.
+    _ltm_pending = _ltm_recall_start(user_text)
     _ltm_enqueue("user", user_text)
 
     # Classify this utterance's tone / voice mood / emotion (stamps the
@@ -27771,7 +27870,7 @@ def _call_llm(user_text: str) -> str:
             print(f"  [prompt-router] slim failed ({_pr_err}); full prompt")
             _base_prompt = _system_prompt
 
-    _ltm_txt = _ltm_context(user_text)
+    _ltm_txt = _ltm_context(user_text, started=_ltm_pending)
     # PROMPT_SLIM_MODE: the learned facts / projects / topics this turn shares
     # a word with (they left the cached prompt; see _slim_local_system_prompt)
     # - '' otherwise. The follow-up rounds get the copy without the LTM

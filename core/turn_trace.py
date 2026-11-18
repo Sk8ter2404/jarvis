@@ -22,6 +22,8 @@ One record (keys with no value are left out; every string is scrubbed)::
      "validators": {"validation": 1},  # lines the speech/claim validators printed
      "shadow": {"head-hold": 1},      # W02/W09/W11/W21 "would ..." lines
      "model": "gemma4:26b-a4b-it-qat",
+     "ltm": {"hit": true, "n": 3, "ms": 41,   # long-term-memory recall
+             "outcome": "hit"},       # hit | none | timeout | busy | error
      "pe_state": "warm",              # warm | partial | full (prefill estimate)
      "llm_calls": 1, "filler": 0,
      "stages": {"stt": 1578, "llm": 2760, "actions": 8,
@@ -252,6 +254,28 @@ def note_chain(reply, results, cut: str = "", rounds: int = 0,
         pass
 
 
+LTM_OUTCOMES = ("hit", "none", "timeout", "busy", "error")
+
+
+def note_ltm(n, ms, outcome: str = "") -> None:
+    """This turn's long-term-memory recall (2026-11-17): how many facts it
+    put in the prompt, how long it took (ms; for a timeout, how long the
+    turn waited) and how it ended - one of LTM_OUTCOMES. Numbers and the
+    outcome word only, never a fact. The first call of a turn wins. Never
+    raises."""
+    try:
+        o = str(outcome or "")
+        if o not in LTM_OUTCOMES:
+            o = "hit" if int(n) > 0 else "none"
+        rec = {"hit": int(n) > 0, "n": max(0, int(n)),
+               "ms": max(0, int(ms)), "outcome": o}
+        with _lock:
+            if _active[0] and "ltm" not in _cur:
+                _cur["ltm"] = rec
+    except Exception:
+        pass
+
+
 def note_model(model) -> None:
     try:
         m = str(model or "").strip()[:80]
@@ -345,7 +369,7 @@ def build_record(line: str, outcome: str, collected: dict,
         if val:
             rec[key + "_chars"] = len(val)
     for key in ("sections", "actions", "cut", "rounds",
-                "validators", "shadow", "model"):
+                "validators", "shadow", "model", "ltm"):
         val = collected.get(key)
         if val:
             rec[key] = val
