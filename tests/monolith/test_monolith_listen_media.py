@@ -912,7 +912,7 @@ class MediaTestAndLogTests(_Base):
               "realign_rejected": 0}
         tail = bc._media_aec_minute_extra(st, {"n": 100, "raw": 40, "sup": 30})
         self.assertIn("; scoreable; per minute: ", tail)
-        self.assertIn("re-anchors 2, realigns 6, ref late 30, resets 1", tail)
+        self.assertIn("re-anchors 2, realigns/min 6, ref late 30, resets 1", tail)
         self.assertIn("ref slips 2 (net -30 ms, gaps 0)", tail)
         self.assertIn("mic overflows 3, drops 0", tail)
         self.assertIn("; why quiet", bc._media_aec_minute_extra(
@@ -951,6 +951,19 @@ class MediaTestAndLogTests(_Base):
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("NOT converging", lines[0])
         self.assertIn("; scoreable; per minute: re-anchors 2", lines[0])
+        # Not converging: the mic passes through, so no 'cancelled' share.
+        self.assertIn("/ cancelled -", lines[0])
+        self.assertNotIn("cancelled 25.0", lines[0])
+        # Converging: the share is real again.
+        aec.status.return_value["converging"] = True
+        self._p(bc, "_listen_aec_frames", {"raw": 30, "sup": 25, "n": 100})
+        now[0] = 1122.0
+        with mock.patch("builtins.print") as p:
+            bc._listen_tick()
+        lines = [str(c.args[0]) for c in p.call_args_list
+                 if "[media-aec]" in str(c.args[0])]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("/ cancelled 25.0 %", lines[0])
 
     def test_the_shadow_turn_peak(self):
         bc = self.bc

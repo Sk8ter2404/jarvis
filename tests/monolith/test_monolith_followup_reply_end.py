@@ -44,6 +44,7 @@ class _ReplyEndBase(_FollowupBase):
         self.addCleanup(p.stop)
         # The shipped default (the live install does not set it).
         self.assertTrue(bc.FOLLOWUP_WINDOW_FROM_REPLY_END)
+        self.assertIn("FOLLOWUP_WINDOW_FROM_REPLY_END", bc._TURN_FLAG_KEYS)
 
     def _boundary(self):
         """The next main-loop pass's top: the real _note_turn_boundary."""

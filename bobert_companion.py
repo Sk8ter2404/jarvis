@@ -18184,6 +18184,7 @@ _TURN_FLAG_KEYS = (
     "LEARN_PREFILTER",
     "BOOT_PARALLEL_LOAD",
     "BOOT_CHANGELOG_BACKGROUND",
+    "FOLLOWUP_WINDOW_FROM_REPLY_END",
     "SPEECH_HYGIENE",
     "PROMPT_DIRECTIVE_V3",
     "PROMPT_ROUTED_V3",
@@ -39842,7 +39843,10 @@ def _listen_tick() -> None:
                   f"drift {st.get('drift_ppm')} ppm, "
                   f"{'converging' if st.get('converging') else 'NOT converging'}"
                   f", frames over VAD raw {100.0 * fr['raw'] / n:.1f} % / "
-                  f"cancelled {100.0 * fr['sup'] / n:.1f} %"
+                  # Not converging = the canceller passes the mic through,
+                  # so 'cancelled' would be a share it did not cancel.
+                  + (f"cancelled {100.0 * fr['sup'] / n:.1f} %"
+                     if st.get('converging') else "cancelled -")
                   # MEDIA_AEC_DELAY_BOUNDS (v3.0.10): its counters, when on.
                   + (f", realigns {st.get('realigns')} "
                      f"({st.get('realign_rejected')} rejected, "
@@ -39905,7 +39909,7 @@ def _media_aec_minute_extra(st: dict, fr: dict) -> str:
             return cur.get(k, 0.0) - prev.get(k, 0.0)
 
         parts = [f"re-anchors {d('sessions'):.0f}",
-                 f"realigns {d('realigns'):.0f}",
+                 f"realigns/min {d('realigns'):.0f}",
                  f"ref late {d('ref_late'):.0f}",
                  f"resets {d('resets'):.0f}"]
         if "slips" in cur:
