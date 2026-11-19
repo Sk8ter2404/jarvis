@@ -164,7 +164,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `check_for_updates` | `core/actions.py:5032` | **VERBATIM** | yes | yes |
 | `check_orders` | `skills/amazon_order_tracker.py:987` | *INFORMATIVE* | yes | yes |
 | `check_print` | `skills/bambu_monitor.py:1670` | *INFORMATIVE* | yes | yes |
-| `check_system` | `skills/system_monitor.py:744` | **VERBATIM** | yes | yes |
+| `check_system` | `skills/system_monitor.py:753` | **VERBATIM** | yes | yes |
 | `check_updates` | `core/actions.py:5032` | **VERBATIM** | — | yes |
 | `clap_trigger_off` | `skills/clap_trigger.py:849` | **VERBATIM** | yes | yes |
 | `clap_trigger_on` | `skills/clap_trigger.py:829` | **VERBATIM** | yes | yes |
@@ -259,7 +259,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `forget_screen` | `core/actions.py:4621` | **VERBATIM** | yes | yes |
 | `forget_voice` | `skills/enroll_voice.py:373` | **VERBATIM** | — | yes |
 | `forget_voice_line` | `skills/voice_clone.py:286` | **VERBATIM** | yes | yes |
-| `free_memory` | `skills/system_pulse.py:1638` | **VERBATIM** | yes | yes |
+| `free_memory` | `skills/system_pulse.py:1905` | **VERBATIM** | yes | yes |
 | `full_power` | `skills/game_mode.py:2210` | **VERBATIM** | — | yes |
 | `game_mode_learn_this` | `skills/game_mode.py:2255` | **VERBATIM** | — | yes |
 | `game_mode_off` | `skills/game_mode.py:2210` | **VERBATIM** | — | yes |
@@ -663,8 +663,8 @@ One row per action, sorted by name; aliases share their handler's location.
 | `status_hud` | `skills/holographic_overlay/__init__.py:1674` | neither | — | yes |
 | `status_hud_off` | `skills/holographic_overlay/__init__.py:1669` | neither | — | yes |
 | `status_hud_on` | `skills/holographic_overlay/__init__.py:1664` | neither | — | yes |
-| `status_panel` | `skills/status_panel.py:511` | **VERBATIM** | yes | yes |
-| `status_report` | `skills/system_pulse.py:1622` | **VERBATIM** | — | yes |
+| `status_panel` | `skills/status_panel.py:526` | **VERBATIM** | yes | yes |
+| `status_report` | `skills/system_pulse.py:1889` | **VERBATIM** | — | yes |
 | `status_ring` | `skills/holographic_overlay/__init__.py:1674` | neither | — | yes |
 | `status_ring_off` | `skills/holographic_overlay/__init__.py:1669` | neither | — | yes |
 | `status_ring_on` | `skills/holographic_overlay/__init__.py:1664` | neither | — | yes |
@@ -679,7 +679,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `stop_voice_clone` | `skills/voice_clone.py:244` | **VERBATIM** | — | yes |
 | `streaming_search` | `core/actions.py:4227` | **VERBATIM** | yes | yes |
 | `success_score` | `skills/weekly_score.py:20` | **VERBATIM** | — | no |
-| `suit_diagnostics` | `skills/status_panel.py:511` | **VERBATIM** | — | yes |
+| `suit_diagnostics` | `skills/status_panel.py:526` | **VERBATIM** | — | yes |
 | `suit_up` | `skills/suit_up.py:361` | neither | yes | yes |
 | `suit_up_sequence` | `skills/suit_up.py:361` | neither | — | yes |
 | `switch_llm` | `core/actions.py:8232` | neither | — | yes |
@@ -691,8 +691,8 @@ One row per action, sorted by name; aliases share their handler's location.
 | `switch_to_speakers` | `skills/audio_autoswitch.py:272` | **VERBATIM** | — | no |
 | `switch_voice_profile` | `skills/voice_clone.py:182` | **VERBATIM** | — | yes |
 | `system_check` | `skills/self_diagnostic.py:4467` | **VERBATIM** | yes | yes |
-| `system_pulse` | `skills/system_pulse.py:1622` | **VERBATIM** | yes | yes |
-| `system_status` | `skills/status_panel.py:511` | **VERBATIM** | — | yes |
+| `system_pulse` | `skills/system_pulse.py:1889` | **VERBATIM** | yes | yes |
+| `system_status` | `skills/status_panel.py:526` | **VERBATIM** | — | yes |
 | `take_the_cursor` | `skills/kinect_air_mouse.py:4030` | **VERBATIM** | — | yes |
 | `teams_unread` | `skills/ms_graph.py:870` | **VERBATIM** | yes | yes |
 | `test_each_skill` | `core/actions.py:5118` | neither | yes | yes |

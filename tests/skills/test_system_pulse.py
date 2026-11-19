@@ -1704,7 +1704,7 @@ _GB = 1024 ** 3
 def _no_cmdlines(case):
     """The fixture pids are not this machine's processes: never read a real
     command line for one (the 15:59 log named none)."""
-    p = mock.patch.object(case.mod, "_python_cmdline", return_value=[])
+    p = mock.patch.object(case.mod, "_python_cmdlines", return_value={})
     p.start()
     case.addCleanup(p.stop)
 
@@ -2337,8 +2337,10 @@ class PulseMemoryUsersTests(unittest.TestCase):
 
 class PulsePythonLabelTests(unittest.TestCase):
     """Live 2026-11-16: a memory line said "Python at 28 GB", which names
-    nothing he can act on. A Python process is named by what it runs; the
-    command lines are injected (no real process is read)."""
+    nothing he can act on. ovh-f's half of the naming (merged into ovh-g's
+    one _python_role in v3.0.26 integration): a script of JARVIS's own folder
+    or packages that has no role name is "my <name>". The command lines are
+    injected (no real process is read)."""
 
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("system_pulse")
@@ -2351,46 +2353,43 @@ class PulsePythonLabelTests(unittest.TestCase):
             504: [],                                   # access denied / gone
             505: ["python.exe", "-c", "print(1)"],
         }
-        p = mock.patch.object(self.mod, "_python_cmdline",
-                              side_effect=lambda pid: self.cmd.get(pid, []))
-        p.start()
-        self.addCleanup(p.stop)
 
     def test_labels(self):
-        lab = self.mod._python_label
-        self.assertEqual(lab(501), "my demo helper")
-        self.assertEqual(lab(502), "my demo server")
-        self.assertEqual(lab(503), "Python running photo sorter")
-        self.assertEqual(lab(504), "Python")
-        self.assertEqual(lab(505), "Python")
+        lab = self.mod._python_role
+        self.assertEqual(lab(self.cmd[501]), "my demo helper")
+        self.assertEqual(lab(self.cmd[502]), "my demo server")
+        self.assertEqual(lab(self.cmd[503]),
+                         "the Python script photo sorter")
+        self.assertEqual(lab(self.cmd[504]), "")
+        self.assertEqual(lab(self.cmd[505]), "")
+        self.assertEqual(lab(["python.exe", "-m", "json.tool"]),
+                         "the Python script tool")
 
     def test_users_name_the_script_not_python(self):
         rows = [(501, "pythonw.exe", 28 * _GB), (503, "python.exe", 3 * _GB),
                 (504, "python.exe", 1.5 * _GB), (9, "chrome.exe", 2 * _GB),
                 (77, "pythonw.exe", 4 * _GB)]
-        users = self.mod._memory_users(rows, own_pid=77, top=8)
+        users = self.mod._memory_users(rows, own_pid=77, top=8,
+                                       cmdlines=self.cmd)
         self.assertEqual(users, [("my demo helper", 28.0),
                                  ("my own process", 4.0),
-                                 ("Python running photo sorter", 3.0),
+                                 ("the Python script photo sorter", 3.0),
                                  ("Chrome", 2.0), ("Python", 1.5)])
 
-    def test_small_python_processes_are_not_read(self):
-        rows = [(501, "python.exe", 0.1 * _GB)] * 3
-        self.mod._memory_users(rows, own_pid=1)
-        self.mod._python_cmdline.assert_not_called()
-
-    def test_command_lines_read_are_capped(self):
-        rows = [(1000 + i, "python.exe", 1 * _GB) for i in range(40)]
-        self.mod._memory_users(rows, own_pid=1)
-        self.assertEqual(self.mod._python_cmdline.call_count,
-                         self.mod.MEM_PY_LABEL_MAX)
+    def test_command_lines_read_are_capped_biggest_first(self):
+        rows = [(1000 + i, "python.exe", (1 + i) * _GB) for i in range(40)]
+        with mock.patch.object(self.mod.psutil, "Process") as proc:
+            proc.return_value.cmdline.return_value = ["python.exe", "x.py"]
+            got = self.mod._python_cmdlines(rows)
+        self.assertEqual(proc.call_count, self.mod.MEM_PY_CMDLINE_MAX)
+        self.assertEqual(min(got), 1040 - self.mod.MEM_PY_CMDLINE_MAX)
 
     def test_real_reader_never_raises(self):
-        # The real hook on a pid that does not exist (psutil's own error).
-        mod, _ = load_skill_isolated("system_pulse")
-        with mock.patch.object(mod, "psutil", create=True) as ps:
-            ps.Process.side_effect = RuntimeError("no such process")
-            self.assertEqual(mod._python_cmdline(424242), [])
+        # psutil's own error for a pid that does not exist.
+        with mock.patch.object(self.mod.psutil, "Process",
+                               side_effect=RuntimeError("no such process")):
+            self.assertEqual(
+                self.mod._python_cmdlines([(424242, "python.exe", _GB)]), {})
 
 
 class PulseFreeMemoryTests(unittest.TestCase):
@@ -2476,9 +2475,6 @@ class PulseFreeMemoryTests(unittest.TestCase):
                                side_effect=RuntimeError("boom")):
             self.assertEqual(self._answer([]), self.mod.FREE_MEMORY_CANT)
 
-
-if __name__ == "__main__":
-    unittest.main()
 class PythonProcessNamesTests(unittest.TestCase):
     """v3.0.26 (reliability-08): the 11-16/17 RAM alerts said "Python at 12 /
     17 / 18 / 22 / 28 GB" - every python.exe but JARVIS's own summed into one
@@ -2623,3 +2619,5 @@ class PythonProcessNamesTests(unittest.TestCase):
         self.assertEqual(out.getvalue().strip(), line.strip())
 
 
+if __name__ == "__main__":
+    unittest.main()

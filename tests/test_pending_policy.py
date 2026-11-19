@@ -85,7 +85,7 @@ class ClassTests(unittest.TestCase):
             ("Sir, the temperature drops about 10 degrees by 6 PM - you may "
              "want a jacket.", "weather", "weather"),
             ("Sir, the desk mic has been completely silent for 30 seconds - "
-             "I can hear nothing at all from it.", "audio", "mic_health"),
+             "I can hear nothing at all from it.", "audio", "mic_silent"),
             ("Sir, the microphone appears to be down. I'll queue a fix.",
              "self_diagnostic", "mic_health"),
             ("Yes, listening, sir.", "ambient-listen", "wake_ack"),
@@ -99,13 +99,15 @@ class ClassTests(unittest.TestCase):
 
     def test_the_night_return_limits(self):
         fc = _e("Sir, rain by 6 PM.", "weather", age=2 * 3600 + 60)
+        # The silent-mic line is ovh-d3's "mic_silent" class: its limit is
+        # the 900 s re-warn (MIC_SILENT_REWARN_SECONDS), not mic_health's 300.
         mic = _e("Sir, the desk mic has been completely silent for 64 "
-                 "seconds.", "audio", age=301)
+                 "seconds.", "audio", age=901)
         ack = _e("Yes, listening, sir.", "ambient-listen", age=61)
         kept, dropped = pp.plan_ages([fc, mic, ack], now=NOW, local_hour=23)
         self.assertEqual(kept, [])
         self.assertEqual([d[1].split(":")[0] for d in dropped],
-                         ["weather", "mic_health", "wake_ack"])
+                         ["weather", "mic_silent", "wake_ack"])
         fresh = [_e("Sir, rain by 6 PM.", "weather", age=3000),
                  _e("Sir, the desk mic has been completely silent for 64 "
                     "seconds.", "audio", age=30),

@@ -32,8 +32,9 @@ MISSED_KEEP_S = 12 * 3600.0
 # answer or a wake acknowledgement is over the moment it is late, and a stale
 # mic-health alert ("has been completely silent", "appears to be down") is
 # false once he is talking to JARVIS again (a mic still dead is warned about
-# again on the alert's own cool-down).
-NOT_NEWS = frozenset({"clap_ack", "wake_ack", "mic_health"})
+# again on the alert's own cool-down). The silent-mic warning has its own
+# class, "mic_silent" (ovh-d3), and is no more news than the rest.
+NOT_NEWS = frozenset({"clap_ack", "wake_ack", "mic_health", "mic_silent"})
 
 _lock = threading.Lock()
 _hooks: dict = {}     # source root -> (on_spoken, on_dropped)

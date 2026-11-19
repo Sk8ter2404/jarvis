@@ -66,8 +66,8 @@ class _PulseFixture:
         cmdlines = {9005: ["python.exe", helper]}
         for name, kw in (
                 ("_read_process_memory", {"side_effect": lambda: list(rows)}),
-                ("_python_cmdline",
-                 {"side_effect": lambda pid: cmdlines.get(pid, [])}),
+                ("_python_cmdlines",
+                 {"side_effect": lambda rows, *a, **k: dict(cmdlines)}),
                 ("_gpu_busy_processes", {"side_effect": lambda: []}),
                 ("_gather_pulse",
                  {"side_effect": AssertionError("cache is fresh")})):

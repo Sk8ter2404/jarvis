@@ -985,23 +985,32 @@ def _is_python_image(name) -> bool:
     return _image_stem(name) in _PY_IMAGES
 
 
-def _python_script(argv) -> str:
-    """What a Python command line runs: the script's stem
-    ('.../clone_tts_server.py' -> 'clone_tts_server'), the last part of a
-    -m module ('tools.settings_window' -> 'settings_window'), '' for -c code,
-    a bare interpreter or anything unreadable. Never raises."""
+# The top-level packages of JARVIS's own -m modules (python -m skills.x).
+_PY_OWN_PACKAGES = frozenset({"skills", "core", "tools", "hud", "audio"})
+
+
+def _python_target(argv) -> tuple:
+    """What a Python command line runs, as (stem, own): the script's stem
+    ('.../clone_tts_server.py' -> 'clone_tts_server') or the last part of a
+    -m module ('tools.settings_window' -> 'settings_window'), and whether it
+    is one of JARVIS's own (a script under _PROJECT_DIR, or a module of one
+    of its packages). ('', False) for -c code, a bare interpreter or
+    anything unreadable. Never raises."""
     try:
         args = [str(a) for a in (argv or ())]
         i = 1
         while i < len(args):
             a = args[i]
             if a == "-c":
-                return ""
+                return "", False
+            mod = ""
             if a == "-m":
                 mod = args[i + 1] if i + 1 < len(args) else ""
-                return mod.rsplit(".", 1)[-1].strip().lower()
-            if a.startswith("-m") and len(a) > 2:
-                return a[2:].rsplit(".", 1)[-1].strip().lower()
+            elif a.startswith("-m") and len(a) > 2:
+                mod = a[2:]
+            if a.startswith("-m"):
+                own = mod.split(".", 1)[0].strip() in _PY_OWN_PACKAGES
+                return mod.rsplit(".", 1)[-1].strip().lower(), own
             if a in _PY_OPTS_WITH_VALUE:
                 i += 2
                 continue
@@ -1013,10 +1022,22 @@ def _python_script(argv) -> str:
                 if stem.lower().endswith(ext):
                     stem = stem[:-len(ext)]
                     break
-            return stem.strip().lower()
-        return ""
+            try:
+                full = os.path.normcase(os.path.abspath(a))
+                root = os.path.normcase(os.path.abspath(_PROJECT_DIR))
+                own = full.startswith(root + os.sep)
+            except Exception:
+                own = False
+            return stem.strip().lower(), own
+        return "", False
     except Exception:
-        return ""
+        return "", False
+
+
+def _python_script(argv) -> str:
+    """The stem _python_target reads from a command line ('' for none).
+    Never raises."""
+    return _python_target(argv)[0]
 
 
 def _voice_server_stem() -> str:
@@ -1047,19 +1068,24 @@ def _voice_server_stem() -> str:
 
 def _python_role(argv, voice_server: str = "") -> str:
     """The spoken name of a Python process from its command line: a JARVIS
-    role (_PY_ROLE_NAMES, or the configured voice server's script), "the
-    Python script <name>" for anything else that runs a script, "" when
-    nothing can be read from it. Never raises."""
+    role (_PY_ROLE_NAMES, or the configured voice server's script), "my
+    <name>" for any other script of JARVIS's own folder or packages (ovh-f,
+    2026-11-17: "my demo helper"), "the Python script <name>" for anything
+    else that runs a script, "" when nothing can be read from it. Never
+    raises."""
     try:
-        stem = _python_script(argv)
+        stem, own = _python_target(argv)
         if not stem:
             return ""
         if voice_server and stem == voice_server:
             return _PY_ROLE_VOICE_SERVER
         if stem in _PY_ROLE_NAMES:
             return _PY_ROLE_NAMES[stem]
-        words = " ".join(stem.replace("_", " ").replace("-", " ").split())
-        return f"the Python script {words}" if words else ""
+        words = " ".join(stem.replace("_", " ").replace("-", " ")
+                         .replace(".", " ").split())
+        if not words:
+            return ""
+        return f"my {words}" if own else f"the Python script {words}"
     except Exception:
         return ""
 
@@ -1114,61 +1140,6 @@ def _mem_app_name(name: str, argv=None, voice_server: str = "") -> str:
     return stem
 
 
-# Python processes are named by what they run (live 2026-11-16: "Python at
-# 28 GB" in a memory line, which names nothing he can act on): JARVIS's own
-# helpers ("my face tracker") apart from anything else run in Python. At most
-# this many command lines are read per answer, and only for processes big
-# enough to matter.
-MEM_PY_LABEL_MAX = 12
-MEM_PY_LABEL_MIN_GB = 0.25
-_PY_IMAGES = frozenset({"python", "pythonw", "python3", "py", "pyw"})
-_PY_SCRIPT_RE = re.compile(r"[\\/]?([A-Za-z0-9_.-]+?)\.pyw?$", re.IGNORECASE)
-
-
-def _python_cmdline(pid: int) -> list:
-    """The process's command line (psutil), [] when it cannot be read (gone,
-    access denied, no psutil). The machine hook tests replace. Never
-    raises."""
-    if not _HAS_PSUTIL:
-        return []
-    try:
-        return list(psutil.Process(int(pid)).cmdline() or [])
-    except Exception:
-        return []
-
-
-def _python_label(pid: int) -> str:
-    """How to say a Python process: "my face tracker" for a script in
-    JARVIS's own folder, "Python running snapshot tool" for another script
-    or module, plain "Python" when the command line says nothing. Never
-    raises."""
-    try:
-        args = [str(a) for a in _python_cmdline(pid)]
-        target, own = "", False
-        for i, a in enumerate(args[1:], start=1):
-            if a == "-m" and i + 1 < len(args):
-                target = args[i + 1].rsplit(".", 1)[-1]
-                own = args[i + 1].split(".", 1)[0] in ("skills", "core",
-                                                       "tools", "hud")
-                break
-            m = _PY_SCRIPT_RE.search(a)
-            if m and not a.startswith("-"):
-                target = m.group(1)
-                try:
-                    full = os.path.normcase(os.path.abspath(a))
-                    root = os.path.normcase(os.path.abspath(_PROJECT_DIR))
-                    own = full.startswith(root + os.sep)
-                except Exception:
-                    own = False
-                break
-        words = " ".join(re.split(r"[_\-.\s]+", target)).strip().lower()
-        if not words:
-            return "Python"
-        return f"my {words}" if own else f"Python running {words}"
-    except Exception:
-        return "Python"
-
-
 def _memory_users(procs=None, *, own_pid: int | None = None,
                   top: int = MEM_USERS_TOP, cmdlines=None) -> list:
     """[(spoken app name, GB)] for the `top` apps holding the most RAM,
@@ -1195,7 +1166,6 @@ def _memory_users(procs=None, *, own_pid: int | None = None,
             cmdlines = _python_cmdlines(rows) if procs is None else {}
         voice_server = _voice_server_stem() if cmdlines else ""
         totals: dict = {}
-        py_reads = 0
         for row in rows or ():
             try:
                 pid, name, wset = int(row[0]), str(row[1] or ""), float(row[2])
@@ -1205,13 +1175,6 @@ def _memory_users(procs=None, *, own_pid: int | None = None,
                      _mem_app_name(name, cmdlines.get(pid), voice_server))
             if not label or wset <= 0:
                 continue
-            stem = name.strip().lower()
-            stem = stem[:-4] if stem.endswith(".exe") else stem
-            if (pid != own and stem in _PY_IMAGES
-                    and wset >= MEM_PY_LABEL_MIN_GB * (1024 ** 3)
-                    and py_reads < MEM_PY_LABEL_MAX):
-                py_reads += 1
-                label = _python_label(pid)
             totals[label] = totals.get(label, 0.0) + wset
         ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
         out = [(label, b / (1024 ** 3)) for label, b in ranked]

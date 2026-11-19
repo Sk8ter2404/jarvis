@@ -254,7 +254,9 @@ class NightReturnTests(_QueueBase):
             self.assertNotIn(stale, said)
         self.assertEqual(len(self.spoke), 2)
         self.assertIn("too old to say (weather; weather:", log)
-        self.assertIn("too old to say (audio; mic_health:", log)
+        # ovh-d3 gave the silent-mic warning its own class, "mic_silent".
+        self.assertIn("too old to say (audio; mic_silent:", log)
+        self.assertIn("too old to say (self_diagnostic; mic_health:", log)
         self.assertIn("too old to say (ambient-listen; wake_ack:", log)
 
     def test_a_long_recap_offers_the_rest_and_records_them(self):
