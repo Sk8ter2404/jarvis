@@ -430,6 +430,24 @@ class RoutineTests(_Base):
         self.assertEqual(self.setup_calls, [])
         self.assertEqual(bc._announced, [("clap", self.mod.ACK_LINE)])
 
+    def test_the_ack_is_queued_as_summoned(self):
+        """2026-11-17 (CLAP_ACK_PASS_HOLDS_S): the acknowledgement carries
+        summoned="clap" so it may pass the room-talk hold for its 10 s life
+        (live 11 of 15 answers expired behind it); an older
+        proactive_announce without the argument still gets the line."""
+        bc = self.bc(actions={})
+        seen = []
+        bc.proactive_announce = lambda msg, source="skill", **k: (
+            seen.append((source, k)) or True)
+        self.mod.handle_double_clap(bc, _event(), now=10.0)
+        self.assertEqual(seen, [("clap", {"summoned": "clap"})])
+        bc = self.bc(actions={})
+        old = []
+        bc.proactive_announce = lambda msg, source="skill": (
+            old.append((source, msg)) or True)
+        self.mod.handle_double_clap(bc, _event(), now=100.0)
+        self.assertEqual(old, [("clap", self.mod.ACK_LINE)])
+
     def test_blank_setting_means_the_default(self):
         """The default is the acknowledgement (2026-10-02 review): a blank
         setting never runs the workspace setup."""

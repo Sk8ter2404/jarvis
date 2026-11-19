@@ -1250,6 +1250,19 @@ SCREEN_WATCH_RESET_ON_AWAY = True
 #   (should_be_proactive). Urgent lines are never held. False: only the
 #   stretch nudge and the anticipation offers wait. Applies on the next start.
 ARRIVAL_QUIET_ALL_MOMENTS = True
+# ARRIVAL_PASS_HOLDS_S (seconds, 2026-11-17; skills/daily_briefing/arrival_v2,
+#   core/owner_presence.SUMMONED_RULES) - live 11-17 06:35:30 the presence-
+#   triggered morning briefing was queued as his face appeared and held behind
+#   his video ("media playing") and the room talk it made while he got ready;
+#   at 06:53 the face had been gone 5 min ("owner away"), and it was dropped
+#   unheard at 16:02:41 after 34,031 s. For this long after it is queued, the
+#   arrival briefing passes the ROOM-TALK and MEDIA holds while he is present
+#   (presence_verdict: his voice, a face or physical input). Never "owner
+#   away", "gaming" or a speech hold. A briefing dropped unheard no longer
+#   counts the morning as briefed, and his "did anything happen while I was
+#   away" names it. 0 = it waits for a clear room, as before. Applies on the
+#   next start.
+ARRIVAL_PASS_HOLDS_S = 600
 
 # Device dialogues (core/dialogue.py): a skill that owns a talking device can
 # run a short scripted back-and-forth between JARVIS and it through the
@@ -2667,6 +2680,17 @@ CLAP_TRIGGER_MIN_PEAK = 0.12
 #   playing a clap still fires. False: only the checks at the moment of the clap.
 CLAP_MEDIA_WIDE = True
 CLAP_MEDIA_LINGER_S = 30.0
+# CLAP_ACK_PASS_HOLDS_S (seconds, 2026-11-17; core/owner_presence.SUMMONED_RULES,
+#   bobert_companion._summoned_pass) - live 11-16/11-17: 15 claps ran the
+#   routine, 4 got "You rang, sir?"; 11 answers waited behind the 45 s room-talk
+#   hold and were dropped at their 10 s age ("too old to say (clap; clap_ack").
+#   For this long after it is queued, a clap's answer passes the ROOM-TALK hold
+#   only, and only while a face or his voice says he is here and no music or
+#   media is playing or played in the last 10 s (re-read when it is spoken: the
+#   room-music detector lags a clap). Never "owner away", "media playing" or
+#   "gaming". 0 = it waits like any line (and expires), as before. Applies on
+#   the next start.
+CLAP_ACK_PASS_HOLDS_S = 10.0
 
 
 # ─── Phone pings (core/phone_ping.py, skills/phone_bridge.py) ──────────

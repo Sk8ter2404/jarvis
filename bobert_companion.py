@@ -14614,7 +14614,8 @@ def proactive_announce(message: str, source: str = "skill",
                        offer: bool = False,
                        urgent: bool = False,
                        still_valid: str | None = None,
-                       history_text: str | None = None) -> bool:
+                       history_text: str | None = None,
+                       summoned: str | None = None) -> bool:
     """Public proactive-speech API for skills.
 
     Skills that want JARVIS to speak something unprompted (print milestones,
@@ -14667,6 +14668,13 @@ def proactive_announce(message: str, source: str = "skill",
     follow-up ("open that one") needs the full answer. Capped at
     _HISTORY_TEXT_MAX_CHARS. Without it the old rule applies (a question or
     `offer` is recorded, a plain statement is not).
+
+    `summoned` (2026-11-17, core/owner_presence.SUMMONED_RULES): "clap" or
+    "arrival" - a line he caused a moment ago (his double clap, his face
+    arriving in the morning). For a short window (CLAP_ACK_PASS_HOLDS_S /
+    ARRIVAL_PASS_HOLDS_S) it speaks through the room-talk hold (and, for the
+    arrival briefing, the media hold) while he is present; never through
+    "owner away", "gaming" or a speech hold (_summoned_pass).
     """
     # ── FOCUS MODE GATE ──────────────────────────────────────────────────────
     # This is the whole point of focus / do-not-disturb: while the owner is
@@ -14754,6 +14762,8 @@ def proactive_announce(message: str, source: str = "skill",
                 :_HISTORY_TEXT_MAX_CHARS]
         if urgent:
             entry["urgent"] = True
+        if summoned:
+            entry["summoned"] = str(summoned)
         if still_valid:
             # Re-checked by the drain just before speaking
             # (skills.bambu_monitor.speech_still_valid); False drops the line.
@@ -18362,6 +18372,11 @@ _TURN_FLAG_KEYS = (
     "PENDING_SOURCE_POLICY", "PENDING_GREETING_FIRST",
     "ARRIVAL_NEWS_WAIT_FOR_BRAIN", "ARRIVAL_NEWS_WINDOW_AFTER_WARMUP",
     "ARRIVAL_SAY_WHAT_FAILED", "CLAP_MEDIA_WIDE",
+    # 2026-11-17 overhaul (proactive lines): his clap's answer and his arrival
+    # briefing pass some holds, the gap after a budget deferral, the away
+    # question's route, idle remarks across restarts.
+    "CLAP_ACK_PASS_HOLDS_S", "ARRIVAL_PASS_HOLDS_S", "PENDING_DEFER_GAP_S",
+    "AWAY_RECAP_ROUTE", "PROACTIVE_RECENT_KEEP_S", "PROACTIVE_DROP_STREAK",
 )
 
 
@@ -26296,6 +26311,7 @@ def _note_owner_voice() -> None:
 # the GIL-atomic idiom of this file.
 from core import owner_presence as _owner_presence_mod  # noqa: E402
 from core import pending_policy as _pending_policy_mod  # noqa: E402
+from core import queue_receipts as _queue_receipts_mod  # noqa: E402
 from core import brain_warmup as _brain_warmup_mod  # noqa: E402
 # time.monotonic() of the last non-wake speech the main loop captured and
 # dropped at the background-audio gate (people, or a show, talking). 0.0 = none.
@@ -26575,6 +26591,93 @@ def _media_hold_asked_for(entry) -> bool:
             return False
         hist = entry.get("history_text") if isinstance(entry, dict) else None
         return isinstance(hist, str) and bool(hist.strip())
+    except Exception:
+        return False
+
+
+# ── lines he summoned (2026-11-17, core/owner_presence.SUMMONED_RULES) ─────
+# How long after it was queued a summoned line may pass its holds (seconds,
+# core/config; 0 = never, the old hold).
+_SUMMONED_WINDOW_KEYS = {"clap": "CLAP_ACK_PASS_HOLDS_S",
+                         "arrival": "ARRIVAL_PASS_HOLDS_S"}
+# "No music or media a moment ago" for a clap's answer: the room-music
+# detector lagged the clap detector by up to ~10 s in the 11-16/17 logs.
+_SUMMONED_QUIET_S = 10.0
+
+
+def _owner_seen_or_heard() -> bool:
+    """A face within OWNER_PRESENT_FACE_WINDOW_S or his MIC voice within
+    OWNER_PRESENT_VOICE_WINDOW_S - presence without the input signal (an
+    automation's input never says he is in the room). Never raises (False)."""
+    try:
+        mono = _proactive_mono()
+        voice_at = float(_last_owner_voice_at[0] or 0.0)
+        face_at = float(last_face_seen or 0.0)
+        return bool(_owner_presence_mod.presence_verdict(
+            voice_age_s=(mono - voice_at) if voice_at > 0.0 else None,
+            face_age_s=(time.time() - face_at) if face_at > 0.0 else None,
+            input_age_s=None,
+            voice_window_s=OWNER_PRESENT_VOICE_WINDOW_S,
+            face_window_s=OWNER_PRESENT_FACE_WINDOW_S,
+            input_window_s=OWNER_PRESENT_INPUT_WINDOW_S)[0])
+    except Exception:
+        return False
+
+
+def _summoned_room_quiet() -> bool:
+    """No music or media now or within _SUMMONED_QUIET_S, read at speak time:
+    the music gate's PC / room reading and its last "playing", the media
+    hold, the Windows media session (his music too), the room-music detector
+    and the camera TV detector (counted as the media hold counts it:
+    _media_hold_tv_counts). Fails CLOSED (False): a doubt holds the line, as
+    before. Never raises."""
+    try:
+        if _pc_media_playing(refresh=False):
+            return False
+        at = _music_state.get("playing_at")
+        if (at is not None
+                and time.monotonic() - float(at) <= _SUMMONED_QUIET_S):
+            return False
+        if globals().get("MEDIA_HOLD_ENABLED", False) and _media_hold_active():
+            return False
+        if _smtc_media_playing():
+            return False
+        mod = sys.modules.get("skill_standby_audio_detect")
+        seen = getattr(mod, "music_seen_within", None) if mod else None
+        if callable(seen) and seen(_SUMMONED_QUIET_S):
+            return False
+        tv = sys.modules.get("skill_tv_detect")
+        if (tv is not None and _media_hold_tv_counts(tv)
+                and bool(tv.is_tv_on())):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _summoned_pass(item, hold_kind: str, *, log: bool = False) -> bool:
+    """Does this queued line pass the ``hold_kind`` hold because he summoned
+    it (core/owner_presence.summoned_passes)? ``log``: say so (the drain,
+    once, as it speaks it). Never raises (False)."""
+    try:
+        kind = _owner_presence_mod.summoned_kind(item)
+        if not kind or not hold_kind:
+            return False
+        window = float(globals().get(_SUMMONED_WINDOW_KEYS.get(kind, ""), 0)
+                       or 0)
+        try:
+            age = time.time() - float(item.get("ts"))
+        except (TypeError, ValueError):
+            age = 0.0
+        ok = _owner_presence_mod.summoned_passes(
+            item, hold_kind=hold_kind, age_s=age, window_s=window,
+            present=_owner_present, seen_or_heard=_owner_seen_or_heard,
+            room_quiet=_summoned_room_quiet)
+        if ok and log:
+            print(f"  [pending] {kind} line passes the {hold_kind} hold "
+                  f"(queued {age:.0f} s ago, he is here): "
+                  f"{str(item.get('message', ''))[:60]}")
+        return ok
     except Exception:
         return False
 
@@ -50919,11 +51022,12 @@ def _pending_source_in(item, sources) -> bool:
 
 
 def _pending_has_source(sources, urgent: bool = False,
-                        asked: bool = False) -> bool:
+                        asked: bool = False, summoned_hold: str = "") -> bool:
     """Peek (no claim): does the speech queue hold an entry from ``sources``
     (or, with ``urgent``, any entry flagged urgent; with ``asked``, any line
-    he asked for - _media_hold_asked_for)? True on any read error, so the
-    real drain decides. Never raises."""
+    he asked for - _media_hold_asked_for; with ``summoned_hold``, a line he
+    summoned that may pass that hold - _summoned_pass)? True on any read
+    error, so the real drain decides. Never raises."""
     try:
         with open(PENDING_SPEECH_PATH, "r", encoding="utf-8") as f:
             raw = f.read().strip()
@@ -50935,6 +51039,7 @@ def _pending_has_source(sources, urgent: bool = False,
         return any(_pending_source_in(e, sources)
                    or (urgent and _owner_presence_mod.is_urgent(e))
                    or (asked and _media_hold_asked_for(e))
+                   or (summoned_hold and _summoned_pass(e, summoned_hold))
                    for e in items)
     except FileNotFoundError:
         return False
@@ -50994,6 +51099,9 @@ def _note_pending_spoken(item, msg) -> None:
             _last_away_recap[0] = (time.time(), str(msg))
     except Exception:
         pass
+    # 2026-11-17: the skill that queued it hears it was SPOKEN (the arrival
+    # briefing counts the morning as heard only now; core/queue_receipts).
+    _queue_receipts_mod.note_spoken(item)
 
 
 def _pending_queue_nonempty() -> bool:
@@ -51013,12 +51121,15 @@ def _pending_queue_nonempty() -> bool:
 def _away_recap_shortcut(text: str) -> bool:
     """AWAY_RECAP_ROUTE (default True, 2026-11-17): "did anything happen while
     I was away / did you log anything while I was at school" drains the
-    speech queue now (_speak_pending: the "While you were away" recap and
-    every line that waited), with no brain call. When the drain says
-    nothing: the recap he already heard in the last 3 h again, "still
-    waiting" while a hold keeps lines queued, or the honest "nothing was
-    waiting" (core/owner_presence.away_answer_line). False when off or the
-    line is no such question. Never raises."""
+    speech queue now (_speak_pending(asked=True): the "While you were away"
+    recap and every line that waited, through any presence hold - he is here
+    and asking), with no brain call. When the drain says nothing: the recap
+    he already heard in the last 3 h again, "still waiting" while a speech
+    hold keeps lines queued, or the honest "nothing was waiting" (core/
+    owner_presence.away_answer_line). Lines dropped unsaid as too old while
+    he was away are named after it (core/queue_receipts.missed_phrase,
+    2026-11-17). False when off or the line is no such question. Never
+    raises."""
     try:
         if not globals().get("AWAY_RECAP_ROUTE", True):
             return False
@@ -51032,21 +51143,30 @@ def _away_recap_shortcut(text: str) -> bool:
         _last_turn_ctx_at[0] = time.monotonic()   # TTS_TURN_CONTEXT_TTL_S
         _pending_drain_spoken[0] = []
         try:
-            spoke = bool(_speak_pending())
+            # asked=True (2026-11-17): he is here and asked - no presence
+            # hold may answer "still waiting".
+            spoke = bool(_speak_pending(asked=True))
         except Exception as _e:
             print(f"  [away-recap] drain failed: {type(_e).__name__}")
             spoke = False
         said = list(_pending_drain_spoken[0] or [])
         _pending_drain_spoken[0] = None
         last = _last_away_recap[0]
+        # What was dropped unsaid while he was away (too old by the time he
+        # was back: the morning briefing, memory alerts ...), named once.
+        missed = _queue_receipts_mod.missed_phrase(
+            _queue_receipts_mod.take_missed())
+        if missed:
+            print(f"  [away-recap] also missed: {missed}")
         line = _owner_presence_mod.away_answer_line(
             spoke=spoke and bool(said),
             still_queued=(not said) and _pending_queue_nonempty(),
             last_recap=last[1] if last else "",
-            last_recap_age_s=(time.time() - last[0]) if last else None)
+            last_recap_age_s=(time.time() - last[0]) if last else None,
+            missed=missed)
         if line:
             print(f"  JARVIS: {line}")
-            _append_turn(text, line)
+            _append_turn(text, " ".join(said + [line]))
             _speak(line)
         else:
             _append_turn(text, " ".join(said))
@@ -51058,13 +51178,20 @@ def _away_recap_shortcut(text: str) -> bool:
         return False
 
 
-def _speak_pending(only_sources=None):
+def _speak_pending(only_sources=None, *, asked: bool = False):
     """If skills (like the timer) have queued reminders, speak them now.
 
     ``only_sources`` (2026-10-01): speak only entries whose queued ``source``
     (its part before any ":") is in this set and HOLD the rest, in order, for
     a later full drain. Standby passes _STANDBY_SPEAKABLE_SOURCES so a timer
     the owner set plays while JARVIS sleeps; None = speak everything.
+
+    ``asked`` (2026-11-17, _away_recap_shortcut only): he has just asked what
+    happened while he was away, so no presence hold applies (room talk, his
+    video, "owner away" - a typed ask stamps no voice - gaming, the gap after
+    a deferral); only the speech hold above still does. The pass is a return
+    drain "While you were away": stale lines fold into the recap. Live, the
+    old drain could answer his direct question with "still waiting".
 
     Race-safe consume-and-rename pattern: we rename the queue file to a
     sibling `.consuming` BEFORE iterating, so any skill that writes a new
@@ -51093,6 +51220,9 @@ def _speak_pending(only_sources=None):
     _return_away = False
     _hold_urgent = False
     _hold_asked = False
+    # The kind of presence hold in force ("room talk", "media playing", ...):
+    # a line he summoned may pass some (_summoned_pass). "" = no hold.
+    _hold_kind = ""
     if only_sources is None:
         # Standby (only_sources) leaves the governor's held line where it is,
         # exactly as before: it would only be held again below.
@@ -51101,7 +51231,17 @@ def _speak_pending(only_sources=None):
         return False  # an unmerged orphan: claiming now would clobber it
     if not os.path.exists(PENDING_SPEECH_PATH):
         return False
-    if only_sources is None:
+    if only_sources is None and asked:
+        # He asked (see the docstring): a return drain, no presence hold.
+        print("  [pending] he asked what he missed - no presence hold this "
+              "pass")
+        _presence_hold_logged[0] = ""
+        _game_hold_seen[0] = False
+        _presence_away_seen[0] = False
+        _pending_defer_gap[0] = 0.0
+        _return_drain = True
+        _return_away = True
+    elif only_sources is None:
         # PRESENCE HOLD (2026-10-02, core/owner_presence.py). While the owner
         # is away, or the room is talking, only his own reminders and the
         # guard alert are spoken; everything else waits, in order, untouched
@@ -51129,6 +51269,9 @@ def _speak_pending(only_sources=None):
             # v3.0.10 review (MEDIA_HOLD_PASS_ASKED): a result he asked for
             # speaks through the media hold (_media_hold_asked_for).
             _hold_asked = _kind == "media playing"
+            # 2026-11-17: his clap's answer / his arrival briefing may pass
+            # this hold for a moment (core/owner_presence.SUMMONED_RULES).
+            _hold_kind = _kind
         else:
             _presence_hold_logged[0] = ""
             _return_drain = (bool(PRESENCE_HOLD_ENABLED
@@ -51140,7 +51283,8 @@ def _speak_pending(only_sources=None):
     # Standby runs this every pass (as often as every 0.3 s while muted):
     # claim and rewrite the queue only when something in it may be spoken.
     if only_sources is not None and not _pending_has_source(
-            only_sources, urgent=_hold_urgent, asked=_hold_asked):
+            only_sources, urgent=_hold_urgent, asked=_hold_asked,
+            summoned_hold=_hold_kind):
         return False
     consume_path = PENDING_SPEECH_PATH + ".consuming"
     try:
@@ -51179,6 +51323,9 @@ def _speak_pending(only_sources=None):
         for _e, _why in _too_old:
             print(f"  [pending] too old to say ({_e.get('source', '?')}; "
                   f"{_why}): {str(_e.get('message', ''))[:80]}")
+            # 2026-11-17: its skill hears of it (the arrival briefing re-arms)
+            # and his "what did I miss" can name it (core/queue_receipts).
+            _queue_receipts_mod.note_dropped(_e, _why)
         if not items:
             try: os.remove(consume_path)
             except Exception: pass
@@ -51196,6 +51343,9 @@ def _speak_pending(only_sources=None):
         for _e in _dropped:
             print(f"  [pending] expired while away ({_e.get('source', '?')}): "
                   f"{str(_e.get('message', ''))[:80]}")
+            # A moment-line: its skill hears of it, but it is not news.
+            _queue_receipts_mod.note_dropped(_e, "expired while away",
+                                             remember=False)
         for _e in _folded:
             print(f"  [pending] folded into the recap ({_e.get('source', '?')}): "
                   f"{str(_e.get('message', ''))[:80]}")
@@ -51242,7 +51392,9 @@ def _speak_pending(only_sources=None):
                 and not _pending_source_in(item, only_sources)
                 and not (_hold_urgent
                          and _owner_presence_mod.is_urgent(item))
-                and not (_hold_asked and _media_hold_asked_for(item))):
+                and not (_hold_asked and _media_hold_asked_for(item))
+                and not (_hold_kind
+                         and _summoned_pass(item, _hold_kind, log=True))):
             held.append(item)
             back.append(item)
             continue

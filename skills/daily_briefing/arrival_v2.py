@@ -161,7 +161,13 @@ def _enqueue_speech(message: str) -> None:
         bc = importlib.import_module("bobert_companion")
         announcer = getattr(bc, "proactive_announce", None)
         if callable(announcer):
-            announcer(message, source="arrival_v2")
+            try:
+                # summoned (2026-11-17, ARRIVAL_PASS_HOLDS_S): his arrival
+                # caused it, so for a while it passes the room-talk and
+                # media holds while he is here.
+                announcer(message, source="arrival_v2", summoned="arrival")
+            except TypeError:
+                announcer(message, source="arrival_v2")   # an older API
             return
     except Exception:
         pass
@@ -250,12 +256,81 @@ def _daily_briefing_heard_today() -> bool:
         return False
 
 
-def _mark_fired(reason: str) -> None:
+def _mark_fired(reason: str, *, queued: bool = False) -> None:
+    """Today is covered: the briefing was queued (``queued``: it is now owed
+    to him, "heard" False until the drain speaks it - _note_heard) or a
+    stand-down covered the day."""
     state = _load_state()
     state["last_fired_date"] = time.strftime("%Y-%m-%d")
     state["last_fired_ts"]   = time.time()
     state["last_reason"]     = reason
+    if queued:
+        state["heard"] = False
+    else:
+        state.pop("heard", None)
     _save_state(state)
+
+
+# ─── did he hear it (2026-11-17, core/queue_receipts) ───────────────────
+# Live 11-17 06:35:30 the briefing was queued as his face appeared, held
+# behind his video and room talk, then "owner away" for hours, and dropped at
+# 16:02:41 as too old - while _mark_fired had counted the morning as briefed
+# from the moment it was queued. Two fixes: the briefing now passes the room-
+# talk and media holds for ARRIVAL_PASS_HOLDS_S while he is here (_enqueue_
+# speech's summoned="arrival"), and the drain reports back: spoken ->
+# "heard"; dropped unsaid -> the state stops claiming a briefed morning
+# (any morning briefer that asks later sees an unbriefed day - with the 6 h
+# age limit that is past the 06-12 window, so in practice nothing re-fires)
+# and his "did anything happen while I was away" names it
+# (bobert_companion._away_recap_shortcut, core/queue_receipts.missed_phrase).
+
+def _note_heard(entry) -> None:
+    """The drain spoke a queued arrival briefing. Never raises."""
+    try:
+        state = _load_state()
+        state["heard"] = True
+        state["heard_ts"] = time.time()
+        state["heard_date"] = time.strftime("%Y-%m-%d")
+        _save_state(state)
+        print("  [arrival_v2] the briefing was heard")
+    except Exception as e:
+        print(f"  [arrival_v2] could not note the briefing as heard: {e}")
+
+
+def _note_unheard(entry, why: str = "") -> None:
+    """The drain dropped a queued arrival briefing unsaid: when it was
+    today's and he has not heard one, today is not covered any more. Never
+    raises."""
+    try:
+        state = _load_state()
+        today = time.strftime("%Y-%m-%d")
+        if state.get("last_fired_date") != today or state.get("heard") is not False:
+            return
+        try:
+            queued_at = float((entry or {}).get("ts"))
+            if time.strftime("%Y-%m-%d", time.localtime(queued_at)) != today:
+                return       # yesterday's line: today was covered by another
+        except (TypeError, ValueError):
+            pass
+        state.pop("last_fired_date", None)
+        state["last_reason"] = f"dropped unheard ({why})" if why else "dropped unheard"
+        state["dropped_ts"] = time.time()
+        _save_state(state)
+        print(f"  [arrival_v2] the briefing was dropped unheard ({why or '?'}) "
+              f"- today no longer counts as briefed")
+    except Exception as e:
+        print(f"  [arrival_v2] could not note the dropped briefing: {e}")
+
+
+def _register_receipts() -> None:
+    """Hear from the speech-queue drain what became of our line. Never
+    raises (an older core without the module: the old behaviour)."""
+    try:
+        from core import queue_receipts
+        queue_receipts.register("arrival_v2", on_spoken=_note_heard,
+                                on_dropped=_note_unheard)
+    except Exception as e:
+        print(f"  [arrival_v2] no speech-queue receipts: {e}")
 
 
 # ─── presence detection ─────────────────────────────────────────────────
@@ -800,7 +875,9 @@ def _fire_arrival(reason: str, *, force: bool = False) -> str:
         return ""
     print(f"  [arrival_v2] queuing ({reason}): {text[:120]}...")
     _enqueue_speech(text)
-    _mark_fired(reason)
+    # Covered for today while it is owed to him; "heard" once spoken, and
+    # uncovered again if it is dropped unsaid (_note_heard / _note_unheard).
+    _mark_fired(reason, queued=True)
     # v3.0.10 (ARRIVAL_QUIET_MINUTES): the stretch nudge and the anticipation
     # offers wait a few minutes after this (live 2026-10-29 07:21-07:23: four
     # proactive lines in 90 s as he walked in).
@@ -860,6 +937,8 @@ def register(actions):
 
     actions["morning_arrival_v2"]   = morning_arrival_v2
     actions["arrival_briefing_v2"]  = morning_arrival_v2
+
+    _register_receipts()
 
     t = threading.Thread(
         target=_watch_for_arrival,

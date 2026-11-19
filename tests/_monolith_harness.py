@@ -928,12 +928,25 @@ class MonolithGlobalsTestCase(unittest.TestCase):
                 _aq._arrived_at[0] = 0.0
         except Exception:
             pass
+        # 2026-11-17 (core/queue_receipts): a skill's receipt hook registered
+        # by an earlier test, or lines an earlier test's drain dropped, must
+        # not reach this test (its away answer would name them).
+        try:
+            from core import queue_receipts as _qr
+            _qr.reset()
+        except Exception:
+            pass
         _before = dict(vars(bc))
         try:
             return super().run(result)
         finally:
             _restore_monolith_pristine(bc)
             _heal_leaked_mocks(bc, _before, self.id())
+            try:
+                from core import queue_receipts as _qr
+                _qr.reset()
+            except Exception:
+                pass
             _cfg.MODEL_ROUTING = _saved_route
             _cfg.AMBIENT_LEARNING_FORCE_LOCAL = _saved_force
             _cfg.AMBIENT_LISTEN_ENABLED = _saved_ambient

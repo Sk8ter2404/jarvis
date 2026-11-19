@@ -118,7 +118,7 @@ class AwayRecapShortcutTests(_Base):
         self._p(bc, "_pending_queue_nonempty", return_value=False)
 
     def _drain_says(self, *lines, source="recap:presence"):
-        def fake():
+        def fake(*_a, **_k):
             for ln in lines:
                 self.bc._speak(ln)
                 self.bc._note_pending_spoken({"source": source}, ln)

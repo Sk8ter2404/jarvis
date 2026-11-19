@@ -226,6 +226,12 @@ class NightReturnTests(_QueueBase):
         super().setUp()
         self._owner_spoke(30)                # "Insane Jarvis." at 23:49:05
         self._cell("_presence_away_seen", True)
+        # The live default (core/config.py); the harness's monolith lacks it.
+        self._p(self.bc, "PENDING_GREETING_FIRST", True, create=True)
+        # The live scene is 23:49: a "Good evening" line is current then, and
+        # stale at midday (pending_policy.EVENING_UNTIL_HOUR) - pin the clock.
+        from core import pending_policy as _pp
+        self._p(_pp, "_local_hour", return_value=23)
 
     def test_live_night_return_says_only_what_is_still_true(self):
         self._write([self._e(FORECAST, "weather", 5.8 * H)]

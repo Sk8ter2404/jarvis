@@ -554,7 +554,14 @@ def _announce(bc, text: str) -> None:
     try:
         fn = getattr(bc, "proactive_announce", None)
         if callable(fn):
-            fn(text, source="clap")
+            try:
+                # summoned (2026-11-17, CLAP_ACK_PASS_HOLDS_S): his clap's
+                # answer may pass the room-talk hold for its few seconds of
+                # life while he is seen or heard and the room is quiet (live
+                # 11 of 15 answers expired behind that hold).
+                fn(text, source="clap", summoned="clap")
+            except TypeError:
+                fn(text, source="clap")      # an older proactive_announce
             return
         fn = getattr(bc, "_speak", None)
         if callable(fn):

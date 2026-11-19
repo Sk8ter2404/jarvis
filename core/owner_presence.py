@@ -72,6 +72,65 @@ _FRAGMENT_MAX = 70        # characters per recap fragment
 _RECAP_SOURCE = "recap:presence"
 
 
+# ── lines he summoned (2026-11-17) ───────────────────────────────────────────
+# A queued line may carry ``summoned`` (proactive_announce(summoned=...)): he
+# caused it a moment ago, so for a short window it passes the holds named
+# here - never "owner away" or "gaming", and never a speech hold. Per kind:
+#   (holds it may pass, needs his face or his voice - polled input is not
+#    enough, needs a quiet room - no music or media now or a moment ago)
+#   clap    - "You rang, sir?" answers his double clap. Live 11-16/11-17 11 of
+#             15 claps got no answer: the ack waited behind the 45 s room-talk
+#             hold and expired at its 10 s age. Many of those claps came with
+#             music, so the room must be quiet too (re-checked at speak time).
+#             It also passes the short gap after a drain-budget deferral
+#             (PENDING_DEFER_GAP_S), which would outlast its 10 s life.
+#   arrival - the presence-triggered morning briefing. Live 11-17 06:35:30 it
+#             was queued as his face appeared and held behind his video and
+#             room talk while he was getting ready, then "owner away" for
+#             hours, and dropped unheard at 16:02:41.
+# The hold kinds are bobert_companion._presence_hold_reason's (and the drain's
+# deferral gap) before any " (".
+SUMMONED_RULES = {
+    "clap":    (frozenset({"room talk", "after the drain budget"}), True, True),
+    "arrival": (frozenset({"room talk", "media playing"}), False, False),
+}
+
+
+def summoned_kind(entry) -> str:
+    """The entry's ``summoned`` kind when it is one SUMMONED_RULES knows."""
+    try:
+        kind = entry.get("summoned") if isinstance(entry, dict) else None
+        return kind if isinstance(kind, str) and kind in SUMMONED_RULES else ""
+    except Exception:
+        return ""
+
+
+def summoned_passes(entry, *, hold_kind: str, age_s, window_s,
+                    present, seen_or_heard, room_quiet) -> bool:
+    """May this summoned line be spoken through ``hold_kind`` now? Only a
+    hold its kind lists, only within ``window_s`` of being queued (0 = off),
+    only while ``present()`` (presence_verdict); a kind that needs it also
+    ``seen_or_heard()`` (a face or his voice) and ``room_quiet()``. The three
+    readings are callables, read only when needed. Never raises (False)."""
+    try:
+        rule = SUMMONED_RULES.get(summoned_kind(entry))
+        if not rule or hold_kind not in rule[0]:
+            return False
+        window = float(window_s or 0)
+        age = float(age_s)
+        if window <= 0 or math.isnan(age) or age > window:
+            return False
+        if not present():
+            return False
+        if rule[1] and not seen_or_heard():
+            return False
+        if rule[2] and not room_quiet():
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def source_root(entry) -> str:
     """The queued entry's source before any ':' ('' when it has none)."""
     try:
@@ -364,6 +423,13 @@ AWAY_NOTHING_WAITING_LINE = (
 AWAY_STILL_HELD_LINE = (
     "A few notices are still waiting, sir - I'll read them out in a moment.")
 AWAY_RECAP_REPEAT_S = 3 * 3600.0   # a recap said this recently is said again
+# Lines dropped unsaid while he was away (core/queue_receipts.missed_phrase,
+# 2026-11-17): named after the answer.
+# Worded so it stays true when a line went stale while he was here too.
+AWAY_MISSED_LINE = ("Also, {missed} went unsaid, sir - out of date before "
+                    "I could say it.")
+AWAY_ONLY_MISSED_LINE = ("Nothing is waiting now, sir, but {missed} went "
+                         "unsaid - out of date before I could say it.")
 
 
 def is_away_recap_ask(text) -> bool:
@@ -381,24 +447,33 @@ def is_away_recap_ask(text) -> bool:
 
 
 def away_answer_line(*, spoke: bool, still_queued: bool = False,
-                     last_recap: str = "", last_recap_age_s=None) -> str:
+                     last_recap: str = "", last_recap_age_s=None,
+                     missed: str = "") -> str:
     """What JARVIS says after draining the queue for an away question.
     '' when the drain spoke (the lines themselves were the answer). Else the
     recap he already gave within AWAY_RECAP_REPEAT_S, word for word; else
-    "still waiting" when lines are held on the queue (room talk, a hold);
-    else the honest "nothing was waiting". Never raises."""
+    "still waiting" when lines are held on the queue (a speech hold); else
+    the honest "nothing was waiting". ``missed`` (2026-11-17, core/
+    queue_receipts.missed_phrase: "the morning briefing and two memory
+    warnings") names what was dropped unsaid: AWAY_MISSED_LINE after the
+    answer (alone when the drain spoke), or AWAY_ONLY_MISSED_LINE instead of
+    "nothing was waiting". Never raises."""
     try:
+        missed = str(missed or "").strip()
+        extra = AWAY_MISSED_LINE.format(missed=missed) if missed else ""
         if spoke:
-            return ""
+            return extra
         recap = str(last_recap or "").strip()
         try:
             age = float(last_recap_age_s)
         except (TypeError, ValueError):
             age = None
         if recap and age is not None and 0 <= age <= AWAY_RECAP_REPEAT_S:
-            return recap
+            return f"{recap} {extra}".strip()
         if still_queued:
-            return AWAY_STILL_HELD_LINE
+            return f"{AWAY_STILL_HELD_LINE} {extra}".strip()
+        if missed:
+            return AWAY_ONLY_MISSED_LINE.format(missed=missed)
         return AWAY_NOTHING_WAITING_LINE
     except Exception:
         return AWAY_NOTHING_WAITING_LINE
