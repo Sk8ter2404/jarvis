@@ -14,8 +14,9 @@ Each test builds a synthetic oversized prompt and captures the /api/chat POST
 (or the last hop before the model). The prompt that goes out must:
   * fit the window (estimated with core.prompt_budget, reply room reserved);
   * keep the system prompt byte-identical and the current message intact;
-  * shed the cheap low-rank tail parts first, then the OLDEST history, then
-    whole per-turn sections (review 2026-10-02);
+  * shed the cheap low-rank tail parts first, then ONE routed section when
+    that alone is enough (2026-11-17), then the OLDEST history, then whole
+    per-turn sections (review 2026-10-02);
   * say so in one ``[prompt-budget]`` line;
 and a turn's history trim is kept in conversation_history, so the next turn
 and the idle re-prime share the trimmed prefix (review 2026-10-02). A prompt
@@ -534,6 +535,158 @@ class ReviewTruncationDetectionTests(_Base):
         _payload, stdout = self._turn(_MANY, _long_history(3, n=300))
         self.assertFalse(any("TRUNCATED" in n for n in self._notes(stdout)))
         self.assertEqual(pb.OBSERVED_WINDOW.limit, 0)
+
+
+class OneSectionBeforeHistoryTurnTests(_Base):
+    """2026-11-17 (brain-03), through the real _call_llm. Live 16:11:01: a
+    turn ~1,208 tokens over budget dropped 6 history messages and then
+    TASK QUEUE anyway (~2.4k tokens, enough on its own), and the history
+    trim was kept for good ("kept the history trim: 6 oldest message(s) left
+    the conversation"). The live window and max_tokens throughout."""
+
+    def _calibrate(self, text, history, over_by):
+        """Re-size the stable system prompt so this turn's unbudgeted prompt
+        is ~``over_by`` estimated tokens over the turn budget."""
+        bc = self.bc
+        self._big_system_prompt(42769)          # the live 11-17 sys_chars
+        with mock.patch.object(bc, "_LOCAL_PROMPT_BUDGET", False):
+            payload, _out = self._turn(text, history)
+        self.posted.clear()
+        est = self._est(payload)
+        delta = int((self._budget() + over_by - est)
+                    * pb.CHARS_PER_TOKEN)
+        self._big_system_prompt(42769 + delta)
+        with mock.patch.object(bc, "_LOCAL_PROMPT_BUDGET", False):
+            payload, _out = self._turn(text, history)
+        self.posted.clear()
+        got = self._est(payload) - self._budget()
+        self.assertGreater(got, over_by - 60, "calibration")
+        self.assertLess(got, over_by + 60, "calibration")
+
+    def test_one_section_goes_and_the_conversation_keeps_its_history(self):
+        bc = self.bc
+        history = _long_history(3, n=300)
+        block = pr.turn_pc_block(_MANY, bc.PC_CONTROL_PROMPT)
+        sections = dict(pr.split_turn_block(block))
+        self.assertIn("TASK QUEUE", sections)
+        self._calibrate(_MANY, history, over_by=1208)
+        payload, stdout = self._turn(_MANY, history)
+        self.assertLessEqual(self._est(payload), self._budget())
+        # Every history message went out, unchanged...
+        self.assertEqual(payload["messages"][1:-1], history)
+        # ...and the conversation still holds them.
+        self.assertEqual(bc.conversation_history[:len(history)], history)
+        last = payload["messages"][-1]["content"]
+        self.assertNotIn(sections["TASK QUEUE"], last)
+        for head, body in sections.items():
+            if head != "TASK QUEUE":
+                self.assertIn(body, last, head)
+        notes = self._fit_notes(stdout)
+        self.assertEqual(len(notes), 1, stdout)
+        self.assertIn("TASK QUEUE", notes[0])
+        self.assertNotIn("oldest history", notes[0])
+        self.assertNotIn("kept the history trim", stdout)
+
+    def test_a_trim_the_sections_caused_is_for_this_call_only(self):
+        # Over by more than any one section; the history trim makes it fit,
+        # but the history alone would have fit: the conversation keeps it.
+        bc = self.bc
+        history = _long_history(6, n=1500)
+        self._calibrate(_MANY, history, over_by=2900)
+        sys_now, _m = bc._local_chat_prompt(self.stable, [])
+        alone = pb.estimate_chat_tokens(
+            sys_now, history + [{"role": "user", "content": _MANY}])
+        self.assertLessEqual(alone, self._budget(), "precondition")
+        payload, stdout = self._turn(_MANY, history)
+        self.assertLessEqual(self._est(payload), self._budget())
+        self.assertLess(len(payload["messages"]) - 2, len(history),
+                        "precondition: this call trimmed history")
+        self.assertEqual(bc.conversation_history[:len(history)], history)
+        self.assertNotIn("kept the history trim", stdout)
+        self.assertIn("history trim not kept", stdout)
+
+    def test_the_owners_yes_is_never_traded_for_history(self):
+        # The accepted-offer and recent-actions notes rank RANK_DIRECTIVE.
+        import inspect
+        src = inspect.getsource(self.bc._call_llm)
+        for label in ("recent actions", "accepted offer"):
+            i = src.index(f'("{label}"')
+            self.assertIn("RANK_DIRECTIVE", src[i:i + 200], label)
+
+
+class FollowupUnusedSectionTests(_Base):
+    """2026-11-17 (brain-03): live 16:54:00 a follow-up round dropped 17
+    history messages and kept SYSTEM HEALTH and TASK QUEUE, which documented
+    nothing the round had run. A re-sent section that documents none of the
+    round's actions now ranks INHERITED."""
+
+    def test_which_sections_are_unused(self):
+        bc = self.bc
+        block = pr.turn_pc_block(_MANY, bc.PC_CONTROL_PROMPT)
+        heads = [h for h, _b in pr.split_turn_block(block)]
+        bambu = next(h for h in heads if "BAMBU" in h)
+        documented = pr.documented_actions(
+            dict(pr.split_turn_block(block))[bambu], set(bc.ACTIONS))
+        self.assertTrue(documented)
+        unused = bc._followup_unused_sections(
+            block, [(documented[0], "ok")])
+        self.assertNotIn(bambu, unused)
+        self.assertEqual(unused, set(heads) - {bambu})
+        # Only pseudo results: the round still has to emit an action.
+        self.assertEqual(bc._followup_unused_sections(
+            block, [("_unverified_claim", "x"), ("_dropped_step", "y")]),
+            set())
+        self.assertEqual(bc._followup_unused_sections("", [("a_b", 1)]),
+                         set())
+        self.assertEqual(bc._followup_unused_sections(block, None), set())
+
+    def test_an_overflowing_round_sheds_them_before_any_history(self):
+        bc = self.bc
+        block = pr.turn_pc_block(_MANY, bc.PC_CONTROL_PROMPT)
+        sections = dict(pr.split_turn_block(block))
+        bambu = next(h for h in sections if "BAMBU" in h)
+        action = pr.documented_actions(sections[bambu], set(bc.ACTIONS))[0]
+        history = _long_history(3, n=300)
+        seen = {}
+
+        def _fake(sys_prompt, messages, **kw):
+            seen["msgs"] = messages
+            return "ok"
+        self._p(bc, "_local_then_cloud_or_honest", _fake)
+        self._p(bc, "_last_turn_pc_block", [block])
+        chain = [{"role": "user", "content": _MANY},
+                 {"role": "assistant", "content": f"[ACTION: {action}]"}]
+        results = [(action, "Layer 212 of 480.")]
+
+        def _round():
+            self._p(bc, "_last_stable_sys_prompt", [self.stable])
+            bc.conversation_history[:] = [dict(m) for m in history] + chain
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                bc.get_followup_response(results)
+            return seen["msgs"], out.getvalue()
+
+        # Size the round ~3,500 tokens over its budget (max_tokens=400):
+        # more than any one section, less than the sections that document
+        # nothing it ran - so only the demotion keeps the history.
+        self._big_system_prompt(42769)
+        with mock.patch.object(bc, "_LOCAL_PROMPT_BUDGET", False):
+            msgs, _o = _round()
+        s, m = bc._local_chat_prompt(self.stable, msgs)
+        over = pb.estimate_chat_tokens(s, m) - self._budget(400)
+        self._big_system_prompt(
+            42769 + int((3500 - over) * pb.CHARS_PER_TOKEN))
+        msgs, stdout = _round()
+        s, m = bc._local_chat_prompt(self.stable, msgs)
+        self.assertLessEqual(pb.estimate_chat_tokens(s, m), self._budget(400))
+        # Every history message and the chain went out.
+        self.assertEqual(msgs[:len(history)], history)
+        self.assertEqual(msgs[len(history):len(history) + 2], chain)
+        # The section that documents what ran is still there.
+        self.assertIn(sections[bambu], msgs[-1]["content"])
+        notes = self._notes(stdout)
+        self.assertEqual(len(notes), 1, stdout)
+        self.assertNotIn("oldest history", notes[0])
 
 
 if __name__ == "__main__":

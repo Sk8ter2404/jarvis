@@ -103,6 +103,33 @@ class SchemaTests(_Base):
         self.assertRegex(rec["day"], r"^\d{4}-\d{2}-\d{2}$")
         self.assertEqual(rec["llm_calls"], 1)
 
+    def test_the_ltm_recall_rides_the_record(self):
+        # 2026-11-17 (brain-11): a recall that missed its budget used to be
+        # silent; the record now says how each turn's recall ended. Numbers
+        # and the outcome word only.
+        tt.begin()
+        tt.note_ltm(3, 41, "hit")
+        tt.note_ltm(0, 600, "timeout")          # the first call wins
+        rec = tt.commit(LINE, "ok")
+        self.assertEqual(rec["ltm"], {"hit": True, "n": 3, "ms": 41,
+                                      "outcome": "hit"})
+        tt.begin()
+        tt.note_ltm(0, 612, "timeout")
+        rec = tt.commit(LINE, "ok")
+        self.assertEqual(rec["ltm"], {"hit": False, "n": 0, "ms": 612,
+                                      "outcome": "timeout"})
+        tt.begin()
+        tt.note_ltm("x", None, "?")             # junk never raises
+        tt.note_ltm(2, 30, "made-up")           # unknown word -> hit / none
+        rec = tt.commit(LINE, "ok")
+        self.assertEqual(rec["ltm"]["outcome"], "hit")
+        tt.begin()
+        rec = tt.commit(LINE, "ok")
+        self.assertNotIn("ltm", rec)
+        tt.note_ltm(1, 1, "hit")                # no open turn: ignored
+        self.assertEqual(set(tt.LTM_OUTCOMES),
+                         {"hit", "none", "timeout", "busy", "error"})
+
     def test_missing_marks_leave_stage_out(self):
         line = LINE.replace("stt_start=3", "stt_start=-").replace(
             "audible_ms=5207", "audible_ms=-")
@@ -442,6 +469,27 @@ class ReportTests(unittest.TestCase):
         self.assertEqual(s["by_outcome"], {"ok": 5, "error": 1})
         only = rep.summarize(recs, kind="inject")
         self.assertEqual(only["turns"], 1)
+
+    def test_the_ltm_recall_summary(self):
+        # 2026-11-17 (brain-11): the figure LTM_RECALL_BUDGET_S is tuned by.
+        recs = [{"kind": "voice", "ltm": {"hit": True, "n": 2, "ms": v,
+                                          "outcome": "hit"}}
+                for v in (30, 40, 50)]
+        recs.append({"kind": "voice", "ltm": {"hit": False, "n": 0,
+                                              "ms": 600,
+                                              "outcome": "timeout"}})
+        recs.append({"kind": "voice", "ltm": {"hit": False, "n": 0, "ms": 0,
+                                              "outcome": "busy"}})
+        recs.append({"kind": "voice"})
+        s = rep.summarize(recs)
+        self.assertEqual(s["ltm"]["n"], 5)
+        self.assertEqual(s["ltm"]["outcomes"],
+                         {"hit": 3, "timeout": 1, "busy": 1})
+        self.assertEqual(s["ltm"]["p50"], 45)       # busy has no timing
+        out = rep.render("2026-11-17", s)
+        self.assertIn("ltm recall: 5 turn(s): busy=1, hit=3, timeout=1", out)
+        self.assertIn("ltm recall: none recorded",
+                      rep.render("2026-11-17", rep.summarize([])))
 
     def test_rotated_parts_and_torn_lines_are_read(self):
         a = {"kind": "voice", "stages": {}}

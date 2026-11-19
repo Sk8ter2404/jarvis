@@ -2200,11 +2200,14 @@ def _with_turn_context(messages: list, turn_ctx: str) -> list:
 # the model with most of its system prompt gone. Live: 2 turns on 2026-10-01
 # read prompt_eval_count=8195. _fit_local_messages estimates every local
 # prompt and, only when it is over budget, drops the low-rank per-turn parts
-# (the cheap tail), then the oldest history, then the sections, then the rest
-# of the history. It never touches the system prompt or the final message (nor
+# (the cheap tail), then ONE routed section when that alone is enough
+# (2026-11-17), then the oldest history, then the sections, then the rest of
+# the history. It never touches the system prompt or the final message (nor
 # a follow-up round's owner request). Calibration, ranks and trim order:
 # core/prompt_budget.py. Review fixes 2026-10-02: a turn's history trim is kept
-# for good (_persist_budget_history_trim), a prompt that cannot fit still sheds
+# for good (_persist_budget_history_trim; since 2026-11-17 only when the
+# history overflowed on its own, never when routed sections caused it), a
+# prompt that cannot fit still sheds
 # everything it can, a follow-up round clips its results, and a reply whose
 # prompt_eval_count shows Ollama cut the prompt anyway is logged and shrinks
 # the next budgets (_note_prompt_window). JARVIS_LOCAL_PROMPT_BUDGET=0 turns
@@ -2223,15 +2226,17 @@ class _BudgetedMessages(list):
     Also carries what the fit did: ``fits``, ``trimmed``, ``ctx_chars`` (the
     per-turn context actually attached, for the turn-timing line) and
     ``dropped_head`` (the history messages it dropped, oldest first, for
-    _persist_budget_history_trim) and ``note`` (the ``[prompt-budget]`` line
-    for a trimmed or still-over fit, '' otherwise - printed unless the
-    caller passed log=False)."""
+    _persist_budget_history_trim), ``history_overflow`` (that trim was the
+    history's own - prompt_budget.Fit.history_overflow) and ``note`` (the
+    ``[prompt-budget]`` line for a trimmed or still-over fit, '' otherwise -
+    printed unless the caller passed log=False)."""
     num_ctx = 0
     window = 0
     fits = True
     trimmed = False
     ctx_chars = 0
     dropped_head = ()
+    history_overflow = False
     note = ""
 
 
@@ -2333,6 +2338,7 @@ def _fit_local_messages(system: str, messages: list, parts=(), *,
         out.ctx_chars = sum(len(p.text) for p in parts
                             if p.label not in dropped)
         out.dropped_head = tuple(list(messages)[:fit.dropped_history])
+        out.history_overflow = bool(fit.history_overflow)
         return out
     except Exception as _e:
         print(f"  [prompt-budget] {where}: check failed "
@@ -2351,12 +2357,26 @@ def _persist_budget_history_trim(fitted) -> int:
     (a window too small for the system prompt: a 30B-class tag, an observed
     truncation) sheds its history for that call only, so the conversation is
     whole again once the window is - and only when those messages are still
-    the front of the live list. Returns how many went. Never raises."""
+    the front of the live list.
+
+    2026-11-17 (live 16:11:01, 6 messages deleted by a turn whose overflow
+    one routed section explained): kept only when the trim was the
+    history's OWN (``history_overflow``: with every section part out, the
+    whole history still overflows, so every turn would). A trim this turn's
+    routed sections caused is for this call only - the next turn routes its
+    own sections and the conversation is whole again; it logs one
+    ``[prompt-budget] history trim not kept`` line. Returns how many went.
+    Never raises."""
     try:
         if not getattr(fitted, "fits", True):
             return 0
         gone = tuple(getattr(fitted, "dropped_head", ()) or ())
         if not gone:
+            return 0
+        if not getattr(fitted, "history_overflow", True):
+            print(f"  [prompt-budget] history trim not kept: this turn's "
+                  f"routed sections caused the overflow, so its {len(gone)} "
+                  f"oldest message(s) stay in the conversation")
             return 0
         n = _trim_conversation_history(drop_front=gone)
         if n:
@@ -25129,8 +25149,15 @@ def _cached_system_param(full_prompt: str):
 # plus the staging guard (test injects must not pollute real memory).
 _ltm_queue: "queue.Queue[tuple[str, str]] | None" = None
 _ltm_worker_started = [False]
-_LTM_RETRIEVE_BUDGET_S = 0.6   # max wall-clock a turn will wait on recall
+# Max wall-clock a turn's recall may take, counted from its start
+# (LTM_RECALL_BUDGET_S, core/config.py; clamped in _ltm_recall_budget_s).
+_LTM_RETRIEVE_BUDGET_S = globals().get("LTM_RECALL_BUDGET_S", 0.6)
 _LTM_RETRIEVE_K = 6
+# Recall threads still running (_ltm_recall_start). A wedged or starved
+# embedder must not pile one thread per turn behind its encode lock: past
+# this many, a turn skips its recall and says so.
+_LTM_RECALL_MAX_INFLIGHT = 2
+_ltm_recall_threads: list = []
 # The facts the most recent recall put in the prompt (_ltm_context):
 # {"ts": float, "facts": [fact entry, ...]}, or None. In memory only; read by
 # the "where did you learn that" action (_act_where_learned, 2026-10-02).
@@ -25229,6 +25256,16 @@ def _ltm_boot_warm() -> None:
             loader = getattr(ltm, "_try_import_embedder", None)
             if callable(loader) and loader() is not None:
                 print("  [ltm] embedder ready")
+                # ...and run ONE recall (2026-11-17): the first encode and
+                # the first vector query pay their own warm-up, which used
+                # to land on the owner's first turn and miss its budget.
+                # Read-only; the number is the boot baseline for
+                # LTM_RECALL_BUDGET_S.
+                _t0 = time.monotonic()
+                ltm.retrieve_facts("hello", k=1)
+                print(f"  [ltm] warm recall ms="
+                      f"{int((time.monotonic() - _t0) * 1000)} (recall "
+                      f"budget {int(_ltm_recall_budget_s() * 1000)} ms)")
         except Exception as e:
             print(f"  [ltm] embedder warm-up failed: {e}")
 
@@ -25418,30 +25455,103 @@ def _ltm_enqueue(role: str, text: str) -> None:
         pass
 
 
-def _ltm_context(user_text: str) -> str:
+def _ltm_recall_budget_s() -> float:
+    """The recall budget in seconds (_LTM_RETRIEVE_BUDGET_S, from
+    LTM_RECALL_BUDGET_S), clamped to 0.05-3.0 so a typo can neither switch
+    recall off silently nor hold the voice thread for long. Never raises."""
+    try:
+        return min(3.0, max(0.05, float(_LTM_RETRIEVE_BUDGET_S)))
+    except Exception:
+        return 0.6
+
+
+def _ltm_recall_start(user_text: str):
+    """Start this turn's long-term-memory recall on a daemon thread and
+    return its handle for _ltm_context, or None when recall is off, the text
+    is blank or the store is unavailable. Never blocks, never raises.
+
+    _call_llm starts it at the top of the turn (2026-11-17), so the mood
+    classification and the prompt routing run alongside the embedding and
+    the voice thread waits only for what is left of the budget. At most
+    _LTM_RECALL_MAX_INFLIGHT recalls run at once: past that the turn skips
+    its recall (handle {"busy": True}) and logs one "[ltm] recall skipped"
+    line instead of queueing another thread behind a stuck encode."""
+    try:
+        if not _ltm_enabled() or not user_text or not user_text.strip():
+            return None
+        ltm = _ltm_module()
+        if ltm is None:
+            return None
+        alive = [t for t in _ltm_recall_threads if t.is_alive()]
+        _ltm_recall_threads[:] = alive
+        if len(alive) >= _LTM_RECALL_MAX_INFLIGHT:
+            print(f"  [ltm] recall skipped: {len(alive)} earlier recall(s) "
+                  f"still running - no memories this turn")
+            _turn_trace_call("note_ltm", 0, 0, "busy")
+            return {"busy": True, "text": user_text}
+        h = {"text": user_text, "t0": time.monotonic(), "result": [],
+             "done": threading.Event(), "lock": threading.Lock(),
+             "ms": None, "late": False, "error": False}
+
+        def _fetch():
+            try:
+                h["result"].extend(
+                    ltm.retrieve_facts(user_text, k=_LTM_RETRIEVE_K) or [])
+            except Exception as e:
+                h["error"] = True
+                print(f"  [ltm] retrieve failed: {e}")
+            finally:
+                ms = int((time.monotonic() - h["t0"]) * 1000)
+                with h["lock"]:
+                    h["ms"] = ms
+                    late = h["late"]
+                h["done"].set()
+                if late:
+                    # The number to tune LTM_RECALL_BUDGET_S by.
+                    print(f"  [ltm] recall finished late ms={ms} "
+                          f"n={len(h['result'])} (budget "
+                          f"{int(_ltm_recall_budget_s() * 1000)} ms)")
+
+        t = threading.Thread(target=_fetch, name="ltm-recall", daemon=True)
+        _ltm_recall_threads.append(t)
+        t.start()
+        return h
+    except Exception:
+        return None
+
+
+def _ltm_context(user_text: str, started=None) -> str:
     """Top-k semantic facts relevant to this utterance, formatted as a
     system-prompt addendum — or '' when disabled, cold, or slow. The hard
     time budget means a cold embedder simply skips a turn or two while it
-    loads in the background instead of stalling the voice loop."""
-    if not _ltm_enabled() or not user_text or not user_text.strip():
-        return ""
-    ltm = _ltm_module()
-    if ltm is None:
-        return ""
-    result: list = []
-    done = threading.Event()
+    loads in the background instead of stalling the voice loop.
 
-    def _fetch():
-        try:
-            result.extend(ltm.retrieve_facts(user_text, k=_LTM_RETRIEVE_K) or [])
-        except Exception as e:
-            print(f"  [ltm] retrieve failed: {e}")
-        finally:
-            done.set()
-
-    threading.Thread(target=_fetch, name="ltm-recall", daemon=True).start()
-    if not done.wait(timeout=_LTM_RETRIEVE_BUDGET_S):
+    ``started``: the handle _ltm_recall_start returned for this same text
+    earlier in the turn; without one (or for other text) the recall starts
+    here. The wait is what is left of _ltm_recall_budget_s() since the
+    recall started, so the voice thread never waits longer than before.
+    Logs ONE line per turn (2026-11-17; a miss used to be silent):
+    "[ltm] recall n=K ms=T", or "[ltm] recall timeout ms=T (budget B ms)";
+    the turn trace gets ltm={hit, n, ms, outcome}."""
+    h = started
+    if not isinstance(h, dict) or h.get("text") != user_text:
+        h = _ltm_recall_start(user_text)
+    if not h or h.get("busy"):
         return ""
+    budget = _ltm_recall_budget_s()
+    left = budget - (time.monotonic() - h["t0"])
+    if not h["done"].wait(timeout=max(0.0, left)):
+        with h["lock"]:
+            missed = h["ms"] is None
+            if missed:
+                h["late"] = True
+        if missed:
+            waited = int((time.monotonic() - h["t0"]) * 1000)
+            print(f"  [ltm] recall timeout ms={waited} (budget "
+                  f"{int(budget * 1000)} ms) - no memories this turn")
+            _turn_trace_call("note_ltm", 0, waited, "timeout")
+            return ""
+    result = h["result"]
     lines = []
     recalled = []
     for f in result[:_LTM_RETRIEVE_K]:
@@ -25455,6 +25565,11 @@ def _ltm_context(user_text: str) -> str:
             if isinstance(tags, (list, tuple)) and "project" in tags:
                 t = "(auto-learned project mention, unverified) " + t
             lines.append(f"- {t[:300]}")
+    ms = h["ms"] if isinstance(h.get("ms"), int) else 0
+    outcome = "hit" if lines else ("error" if h.get("error") else "none")
+    print(f"  [ltm] recall n={len(lines)} ms={ms}"
+          + (" (retrieve failed)" if outcome == "error" else ""))
+    _turn_trace_call("note_ltm", len(lines), ms, outcome)
     if not lines:
         return ""
     # What "where did you learn that" asks about (_act_where_learned): the
@@ -27651,6 +27766,10 @@ def _call_llm(user_text: str) -> str:
     # local. _trim_conversation_history drops leading non-'user' messages, so
     # running it here guarantees the very first request is well-formed. 2026-07-08.
     _trim_conversation_history()
+    # Long-term-memory recall starts NOW (2026-11-17): the mood classifier
+    # and the prompt routing below run alongside the embedding, and
+    # _ltm_context further down waits only for what is left of its budget.
+    _ltm_pending = _ltm_recall_start(user_text)
     _ltm_enqueue("user", user_text)
 
     # Classify this utterance's tone / voice mood / emotion (stamps the
@@ -27777,7 +27896,7 @@ def _call_llm(user_text: str) -> str:
             print(f"  [prompt-router] slim failed ({_pr_err}); full prompt")
             _base_prompt = _system_prompt
 
-    _ltm_txt = _ltm_context(user_text)
+    _ltm_txt = _ltm_context(user_text, started=_ltm_pending)
     # PROMPT_SLIM_MODE: the learned facts / projects / topics this turn shares
     # a word with (they left the cached prompt; see _slim_local_system_prompt)
     # - '' otherwise. The follow-up rounds get the copy without the LTM
@@ -27810,13 +27929,15 @@ def _call_llm(user_text: str) -> str:
         # "Wait, what? It sent that?" (v3.0.10, RECALL_ACTION_GROUNDING): the
         # actions that really ran in the last minute, so the reply cannot
         # deny one; '' on every other turn.
+        # RANK_DIRECTIVE (2026-11-17): never traded for history, dropped
+        # after every routed section.
         ("recent actions", _recall_action_note(user_text),
-         _prompt_budget.RANK_SECTION),
-        # Last, nearest the owner's words; ranked with the action grammar,
+         _prompt_budget.RANK_DIRECTIVE),
+        # Last, nearest the owner's words; ranked above the action grammar,
         # since it IS what this turn has to do.
         ("accepted offer",
          _offer_reply.directive(_offer_yes) if _offer_yes else "",
-         _prompt_budget.RANK_SECTION),
+         _prompt_budget.RANK_DIRECTIVE),
     ]
     _turn_addenda = "".join(_t for _l, _t, _r in _addenda_parts)
 
@@ -46588,6 +46709,42 @@ def _followup_extra(action_results) -> str:
     )
 
 
+def _followup_unused_sections(pc_block: str, action_results) -> set:
+    """The section names in ``pc_block`` (the turn's routed bodies, which a
+    follow-up round re-sends) that document NONE of the actions this round
+    ran. get_followup_response ranks them prompt_budget.RANK_INHERITED, so an
+    overflowing round sheds them before any history (2026-11-17: live
+    16:54:00 a follow-up dropped 17 history messages and kept SYSTEM HEALTH
+    and TASK QUEUE, ~10k characters that documented nothing it had run).
+
+    Empty - nothing demoted - when the round ran no real action: results
+    named only by a ``_`` pseudo-action (_unverified_claim, _dropped_step,
+    ...) mean the round still has to EMIT one, and the sections are where it
+    is documented. A section documents an action when its body carries an
+    ``[ACTION: name`` token or names a registered action
+    (prompt_router.documented_actions). Never raises; set() on a fault."""
+    try:
+        if not pc_block:
+            return set()
+        ran = set()
+        for item in action_results or ():
+            name = str(item[0] or "").strip().lower()
+            if name and not name.startswith("_"):
+                ran.add(name)
+        if not ran:
+            return set()
+        from core import prompt_router as _pr
+        known = set(globals().get("ACTIONS") or ())
+        out = set()
+        for head, body in _pr.split_turn_block(pc_block):
+            documented = {a.lower() for a in _pr.documented_actions(body, known)}
+            if head and not (documented & ran):
+                out.add(head)
+        return out
+    except Exception:
+        return set()
+
+
 def _fit_followup_round(local_sys: str, action_results, local_parts):
     """The local follow-up round's messages, fitted to the budget with the
     owner's request pinned (review 2026-10-02: on this round the final
@@ -46721,11 +46878,17 @@ def get_followup_response(action_results: list[tuple[str, str]]) -> str:
             # can shed the least important ones from an overflowing round.
             # PROMPT_SLIM_MODE: the turn's learned hints too - that system
             # prompt no longer holds the facts / topics / projects.
+            # A re-sent section that documents none of the actions this round
+            # ran ranks INHERITED (2026-11-17): an overflowing round sheds it
+            # before any history (live 16:54:00 dropped 17 history messages
+            # and kept two such sections).
             _local_parts = _turn_budget_parts(
                 _last_turn_pc_block[0],
                 _followup_addenda_parts + [
                     ("learned hints", _last_turn_hints[0],
-                     _prompt_budget.RANK_MEMORY)])
+                     _prompt_budget.RANK_MEMORY)],
+                inherited=_followup_unused_sections(_last_turn_pc_block[0],
+                                                    action_results))
         try:
             _fitted = _fit_followup_round(_local_sys, action_results,
                                           _local_parts)
@@ -53282,6 +53445,152 @@ def _consume_blue_green_handoff() -> tuple[float | None, list]:
     return pending_last_speech, pending_timers
 
 
+# ── The conversation across a quick restart (2026-11-17) ──────────────────
+# core/conversation_resume.py has the rules. Live 2026-11-17: three restarts
+# between 16:59 and 17:05 (two through the tray's hardened teardown) each
+# started from an empty conversation while "[session_resume] no greeting:
+# restart 0 min after the last session" called it the same session. Only the
+# blue/green swap (--resume-handoff) carried a tail across. _act_restart now
+# saves one (_save_conversation_for_restart) through the same handoff file
+# with kind "restart", and the next prod start takes it back
+# (_resume_conversation_after_restart) when the owner's last turn is recent.
+
+# Epoch seconds of the owner's last turn before a restart, when this process
+# restored that conversation: a second restart before any new turn still
+# carries the tail with its real age. 0.0 = none.
+_restored_last_turn_at: list = [0.0]
+
+
+def _conversation_resume_on() -> bool:
+    return bool(globals().get("CONVERSATION_RESUME_ON_RESTART", True))
+
+
+def _last_turn_epoch() -> float:
+    """Epoch seconds of the conversation's last turn: this process's last
+    owner turn or reply (_last_convo_activity / _last_owner_turn_at, both
+    monotonic, converted), else the turn a restart restored. 0.0 when there
+    is none. Never raises."""
+    try:
+        mono = max(float(_last_convo_activity[0] or 0.0),
+                   float(_last_owner_turn_at[0] or 0.0))
+        at = 0.0
+        if mono > 0:
+            at = time.time() - max(0.0, time.monotonic() - mono)
+        return max(at, float(_restored_last_turn_at[0] or 0.0))
+    except Exception:
+        return 0.0
+
+
+def _save_conversation_for_restart(reason: str = "restart") -> int:
+    """_act_restart, before the successor is spawned: write the newest
+    CONVERSATION_RESUME_MAX_MESSAGES messages (credential-looking ones and
+    their replies left out, core.conversation_resume.tail_for_restart) plus
+    the session's opening utterances to data/handoff.json with kind
+    "restart". Prod only, never in guest mode, nothing when there was no
+    turn. Logs one "[conversation-resume] saved" line. Returns how many
+    messages were saved. One small atomic write; never raises."""
+    try:
+        if not _conversation_resume_on():
+            return 0
+        if _bgm is None or BLUE_GREEN_ROLE != "prod":
+            return 0
+        if _guest_mode.is_on():
+            print("  [conversation-resume] guest mode: nothing saved for "
+                  "the restart")
+            return 0
+        last = _last_turn_epoch()
+        if last <= 0:
+            return 0
+        from core import conversation_resume as _cr
+        max_age = globals().get("CONVERSATION_RESUME_MAX_AGE_S",
+                                _cr.DEFAULT_MAX_AGE_S)
+        try:
+            if time.time() - last > float(max_age):
+                # The next start would refuse it anyway: no conversation
+                # text goes to disk for nothing.
+                print(f"  [conversation-resume] nothing saved: the last turn "
+                      f"was {(time.time() - last) / 60.0:.0f} min ago")
+                return 0
+        except Exception:
+            pass
+        tail = _cr.tail_for_restart(
+            list(conversation_history),
+            globals().get("CONVERSATION_RESUME_MAX_MESSAGES",
+                          _cr.DEFAULT_MAX_MESSAGES),
+            _is_secret_fact)
+        if not tail:
+            return 0
+        pairs = [(t, ts) for t, ts in zip(list(_session_opening_turns),
+                                          list(_session_opening_ts))
+                 if isinstance(t, str) and not _is_secret_fact(t)]
+        now = time.time()
+        payload = _cr.build_payload(
+            tail, last, now, [t for t, _ts in pairs],
+            [ts for _t, ts in pairs],
+            bool(_session_opening_lost[0])
+            or len(pairs) < len(_session_opening_turns), reason)
+        if not _bgm.write_handoff_state(payload):
+            print("  [conversation-resume] could not save the conversation "
+                  "for the restart")
+            return 0
+        print(f"  [conversation-resume] saved {len(tail)} message(s) for the "
+              f"restart (last turn {max(0, int(now - last))} s ago)")
+        return len(tail)
+    except Exception as e:
+        print(f"  [conversation-resume] save failed: {type(e).__name__}")
+        return 0
+
+
+def _resume_conversation_after_restart() -> int:
+    """Boot, prod, not a blue/green relaunch: put back the conversation an
+    ordinary restart saved (_save_conversation_for_restart) when the owner's
+    last turn was at most CONVERSATION_RESUME_MAX_AGE_S ago, and seed the
+    session's opening utterances from it (_seed_session_opening). Only into
+    an empty conversation. Logs one "[conversation-resume] restored" or
+    "not restored" line whenever a handoff file was there. Returns how many
+    messages came back. Never raises."""
+    try:
+        if not _conversation_resume_on() or _handoff_resumed[0]:
+            return 0
+        if (_bgm is None or BLUE_GREEN_ROLE != "prod"
+                or _bgm.RESUME_HANDOFF_FLAG in sys.argv):
+            return 0
+        if conversation_history:
+            return 0
+        had_file = os.path.exists(_bgm.HANDOFF_FILE)
+        payload = _bgm.consume_handoff_state(kind="restart")
+        if payload is None:
+            if had_file:
+                print("  [conversation-resume] not restored: the handoff "
+                      "file is not a fresh restart handoff")
+            return 0
+        from core import conversation_resume as _cr
+        now = time.time()
+        msgs, why = _cr.accept(
+            payload, now,
+            globals().get("CONVERSATION_RESUME_MAX_AGE_S",
+                          _cr.DEFAULT_MAX_AGE_S),
+            globals().get("CONVERSATION_RESUME_MAX_MESSAGES",
+                          _cr.DEFAULT_MAX_MESSAGES),
+            _is_secret_fact)
+        if not msgs:
+            print(f"  [conversation-resume] not restored: {why}")
+            return 0
+        conversation_history.extend(msgs)
+        _restored_last_turn_at[0] = float(payload.get("last_turn_at") or 0.0)
+        _seed_session_opening(payload.get("session_opening_turns"),
+                              payload.get("session_opening_ts"),
+                              lost=payload.get("session_opening_lost") is True,
+                              tail=msgs)
+        print(f"  [conversation-resume] restored {len(msgs)} message(s) from "
+              f"before the restart (last turn "
+              f"{_cr.age_s(payload, now):.0f} s ago)")
+        return len(msgs)
+    except Exception as e:
+        print(f"  [conversation-resume] restore failed: {type(e).__name__}")
+        return 0
+
+
 # Words a bare wake / greeting is made of: "Jarvis, wake up", "Hey Jarvis, you
 # there?", "Jarvis, good morning", "Jarvis, I need you". A wake utterance whose
 # rest is only these is a wake and gets the greeting; anything else after the
@@ -55188,6 +55497,11 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     setup_logging()
     if _log_file_path:
         print(f"Logging session to: {_log_file_path}")
+    # ...and the conversation an ordinary restart saved (2026-11-17,
+    # CONVERSATION_RESUME_ON_RESTART): after the logging starts, so its one
+    # "[conversation-resume]" line lands in the session log; before the boot
+    # greeting and the idle re-prime, which read conversation_history.
+    _resume_conversation_after_restart()
 
     # Launch the system-tray applet NOW, not at the end of boot: the icon used
     # to be missing for the 11-56 s the rest of boot takes (preflight, Whisper,

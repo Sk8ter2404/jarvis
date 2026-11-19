@@ -18,6 +18,9 @@ parts) and prints:
   * actions run / failed (and the ones that failed most), follow-up rounds
     and why chains were cut;
   * the validators that fired;
+  * the long-term-memory recall (2026-11-17): turns that recalled, how they
+    ended (hit / none / timeout / busy / error) and its ms p50 / p95 - the
+    figure LTM_RECALL_BUDGET_S is tuned by;
   * the shadow-mode counters of W02 [head-hold], W09 [learn-prefilter], W11
     [action-fit] and W21 [loop-guard] ("would ..." lines), from the records.
     With --logs the same lines are also counted in that day's session logs
@@ -139,12 +142,14 @@ def summarize(recs: list, kind=None) -> dict:
            "by_outcome": {}, "latency": {}, "pe_state": {}, "actions": {},
            "cuts": {}, "validators": {},
            "shadow": dict({t: 0 for t in SHADOW_TAGS}, **{AMBIENT_KEY: 0}),
-           "rounds": 0}
+           "rounds": 0, "ltm": {"n": 0, "outcomes": {}, "p50": None,
+                                "p95": None}}
 
     def bump(d, k, n=1):
         d[k] = d.get(k, 0) + n
 
     stage_vals = {s: [] for s in STAGES}
+    ltm_ms = []
     ran = failed = 0
     failed_by = {}
     ran_by = {}
@@ -180,6 +185,16 @@ def summarize(recs: list, kind=None) -> dict:
         for tag, n in (r.get("shadow") or {}).items():
             if isinstance(n, int):
                 bump(out["shadow"], str(tag), n)
+        ltm = r.get("ltm")
+        if isinstance(ltm, dict):
+            out["ltm"]["n"] += 1
+            bump(out["ltm"]["outcomes"], str(ltm.get("outcome") or "?"))
+            v = ltm.get("ms")
+            if (isinstance(v, (int, float)) and not isinstance(v, bool)
+                    and ltm.get("outcome") != "busy"):
+                ltm_ms.append(v)
+    out["ltm"]["p50"] = pct(ltm_ms, 50)
+    out["ltm"]["p95"] = pct(ltm_ms, 95)
     for s in STAGES:
         xs = stage_vals[s]
         out["latency"][s] = {"n": len(xs), "p50": pct(xs, 50),
@@ -229,6 +244,13 @@ def render(day: str, s: dict, log_counts=None) -> str:
     if s["cuts"]:
         L.append("  chain cuts: " + ", ".join(
             f"{k} x{v}" for k, v in sorted(s["cuts"].items())))
+    lt = s.get("ltm") or {}
+    if lt.get("n"):
+        L.append(f"  ltm recall: {lt['n']} turn(s): " + ", ".join(
+            f"{k}={v}" for k, v in sorted(lt["outcomes"].items()))
+            + f"; ms p50 {_fmt(lt['p50'])} p95 {_fmt(lt['p95'])}")
+    else:
+        L.append("  ltm recall: none recorded")
     if s["validators"]:
         L.append("  validators fired: " + ", ".join(
             f"{k} x{v}" for k, v in sorted(s["validators"].items())))
