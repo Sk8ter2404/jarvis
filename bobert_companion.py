@@ -18183,6 +18183,7 @@ _TURN_FLAG_KEYS = (
     "PROACTIVE_NO_ACTION_CLAIMS",
     "LEARN_PREFILTER",
     "BOOT_PARALLEL_LOAD",
+    "BOOT_CHANGELOG_BACKGROUND",
     "SPEECH_HYGIENE",
     "PROMPT_DIRECTIVE_V3",
     "PROMPT_ROUTED_V3",
@@ -21712,6 +21713,87 @@ def _quiet_faster_whisper_log() -> None:
         _logging.getLogger("faster_whisper").setLevel(_logging.WARNING)
     except Exception:
         pass
+
+
+# ── the release-notes line at boot (BOOT_CHANGELOG_BACKGROUND, 3.0.26) ─────
+def _changelog_background_on() -> bool:
+    """BOOT_CHANGELOG_BACKGROUND, read live. Never raises (True: the
+    default)."""
+    try:
+        v = globals().get("BOOT_CHANGELOG_BACKGROUND", True)
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "on", "yes")
+        return bool(v)
+    except Exception:
+        return True
+
+
+def _changelog_summary_text(last_ver, cur_ver, entry: str) -> str:
+    """One to three spoken sentences about the newest CHANGELOG entry via
+    the quick LLM helper; '' for an empty entry or any failure. Never
+    raises."""
+    if not entry:
+        return ""
+    system = (
+        "You are J.A.R.V.I.S. Summarise the following CHANGELOG.md "
+        "entry into ONE to THREE concise sentences spoken in your "
+        "own voice for the user (he/sir). Lead with phrasing like "
+        "'Sir, since we last spoke...'. Call out new capabilities "
+        "by name and the rough number of bug fixes if visible. "
+        "End with a brief pointer to the full changelog at "
+        "C:\\JARVIS\\CHANGELOG.md. Plain prose only — no markdown, "
+        "no bullets, no headers."
+    )
+    user = (
+        f"Previous announced version: {last_ver}\n"
+        f"Current version: {cur_ver}\n\n"
+        f"Latest changelog entry:\n\n{entry[:8000]}"
+    )
+    try:
+        return (_llm_quick(system, user, max_tokens=300,
+                           caller="boot_changelog_summary",
+                           background=True) or "").strip()
+    except Exception as e:
+        print(f"  [changelog] LLM summarise failed: {e}")
+        return ""
+
+
+def _changelog_announce(last_ver, cur_ver, entry: str,
+                        history: list) -> None:
+    """Summarise and speak the release notes. With BOOT_CHANGELOG_BACKGROUND
+    the summary is made on a daemon thread and queued through
+    proactive_announce (focus mode, presence hold and the standby rules
+    apply, as for any unprompted line; a '[boot] changelog ...' line says
+    so); off, it is made and spoken here, before the loop. Never raises."""
+    def work(background: bool) -> None:
+        summary = _changelog_summary_text(last_ver, cur_ver, entry)
+        if not summary:
+            print(f"  [changelog] no summary produced — skipping speech "
+                  f"(latest_entry_len={len(entry)})")
+            return
+        print(f"  [changelog] announcing v{last_ver}→v{cur_ver}: "
+              f"{summary}")
+        try:
+            if background:
+                proactive_announce(summary, source="changelog",
+                                   history_text=summary)
+            else:
+                _speak(summary)
+                history.append({"role": "assistant", "content": summary})
+        except Exception as e:
+            print(f"  [changelog] speak failed: {e}")
+
+    try:
+        if _changelog_background_on():
+            print("  [boot] changelog summary runs in the background "
+                  "(BOOT_CHANGELOG_BACKGROUND): the loop does not wait "
+                  "for the LLM")
+            threading.Thread(target=work, args=(True,), daemon=True,
+                             name="boot-changelog").start()
+        else:
+            work(False)
+    except Exception as e:
+        print(f"  [changelog] announcement failed: {e}")
 
 
 def _boot_whisper_worker() -> None:
@@ -55685,41 +55767,12 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                     _latest_entry = (
                         _after_hdr[:_sep.start()] if _sep else _after_hdr
                     ).strip()
-                _summary = ""
-                if _latest_entry:
-                    _system = (
-                        "You are J.A.R.V.I.S. Summarise the following CHANGELOG.md "
-                        "entry into ONE to THREE concise sentences spoken in your "
-                        "own voice for the user (he/sir). Lead with phrasing like "
-                        "'Sir, since we last spoke...'. Call out new capabilities "
-                        "by name and the rough number of bug fixes if visible. "
-                        "End with a brief pointer to the full changelog at "
-                        "C:\\JARVIS\\CHANGELOG.md. Plain prose only — no markdown, "
-                        "no bullets, no headers."
-                    )
-                    _user = (
-                        f"Previous announced version: {_last_ver}\n"
-                        f"Current version: {_cur_ver}\n\n"
-                        f"Latest changelog entry:\n\n{_latest_entry[:8000]}"
-                    )
-                    try:
-                        _summary = (_llm_quick(_system, _user, max_tokens=300,
-                                               caller="boot_changelog_summary",
-                                               background=True) or "").strip()
-                    except Exception as _le:
-                        print(f"  [changelog] LLM summarise failed: {_le}")
-                if _summary:
-                    print(f"  [changelog] announcing v{_last_ver}→v{_cur_ver}: {_summary}")
-                    try:
-                        _speak(_summary)
-                        conversation_history.append(
-                            {"role": "assistant", "content": _summary}
-                        )
-                    except Exception as _spe:
-                        print(f"  [changelog] speak failed: {_spe}")
-                else:
-                    print(f"  [changelog] no summary produced — skipping speech "
-                          f"(latest_entry_len={len(_latest_entry)})")
+                # BOOT_CHANGELOG_BACKGROUND (3.0.26, reliability-11): the
+                # summary is an LLM call and every release boot made one on
+                # this thread BEFORE "Listening". On, it runs on a daemon
+                # thread and the line goes through the proactive queue.
+                _changelog_announce(_last_ver, _cur_ver, _latest_entry,
+                                    conversation_history)
                 # Stamp regardless of whether the summary spoke so a missing
                 # LLM backend or empty entry doesn't loop on every boot.
                 _stamp_version_announced(_vdata, _cur_ver, _ver_path)
@@ -55744,6 +55797,14 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         # Warm the local model's prompt cache for the first turn (the boot is
         # done: the system prompt has its final, post-skills shape).
         _main_loop_started_at[0] = time.monotonic()
+        # [boot] how long the process was deaf (3.0.26, reliability-11):
+        # the number that says whether a boot step is worth moving.
+        try:
+            import psutil as _ps_boot
+            print(f"  [boot] ready to listen {time.time() - _ps_boot.Process().create_time():.1f} s "
+                  f"after the process started")
+        except Exception:
+            pass
         _start_boot_reprime()
         # Arm the presence hold on queued proactive speech (starts the
         # physical-input watcher; see _presence_watch_start).

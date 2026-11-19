@@ -1387,6 +1387,16 @@ STT_REPLACEMENTS_PARAKEET: dict = {}
 #       is set to WARNING; they were 41% of the session log).
 #   Changes apply on the next start.
 BOOT_PARALLEL_LOAD         = False
+# BOOT_CHANGELOG_BACKGROUND (3.0.26, reliability-11): after a version bump the
+# boot summarises CHANGELOG.md with an LLM call and speaks it before the main
+# loop starts, so JARVIS was deaf for as long as the brain took (a busy GPU:
+# tens of seconds) on exactly the boots that follow a release. True (default)
+# = the summary is made on a daemon thread and queued through the proactive
+# speech queue (spoken at the next idle pass; focus mode, the presence hold
+# and standby apply as for any unprompted line; log line "[boot] changelog
+# summary runs in the background"). False = made and spoken on the boot
+# thread before "Listening", as before. Changes apply on the next start.
+BOOT_CHANGELOG_BACKGROUND  = True
 
 # ─── Where the listening models run (core/listen_devices.py, 2026-10-04) ──
 # PARAKEET_DEVICE / SMART_TURN_DEVICE / VOICE_ID_DEVICE: 'cpu' | 'listen' |
