@@ -557,14 +557,21 @@ def open_camera(index, *, backend: str = "msmf", width=None, height=None,
     def _outcome(result):
         if isinstance(outcome, dict):
             outcome["result"] = result
-    # OPEN ONCE, IN THE FINAL FORMAT (2026-09-29). When a size is requested
-    # the pixel format is set FIRST, then width, then height, all before the
-    # first read - so the device is configured once, as MJPG, instead of
-    # starting in its default (usually uncompressed YUY2) mode and being
+    # OPEN ONCE, IN THE FINAL FORMAT (2026-09-29, order corrected 2026-11-17).
+    # When a size is requested the device is configured before the first read,
+    # so it is not started in its default (usually uncompressed YUY2) mode and
     # renegotiated. MJPG is a fraction of YUY2's USB2 bandwidth, and on the
     # owner's rig two webcams and a stream deck share one USB2 link whose
-    # periodic budget they exceed on paper. Escape hatch: JARVIS_CAMERA_FOURCC
-    # ("none" = do not request a format; any other 4 chars = that format).
+    # periodic budget they exceed on paper. ORDER MATTERS PER BACKEND:
+    #   * MSMF: pixel format, then width, then height (measured 30 fps).
+    #   * DirectShow: width, then height, THEN the pixel format. A size change
+    #     renegotiates the media type and the driver falls back to YUY2, which
+    #     the old FOURCC-first order lost (measured 2026-11-17, OpenCV 4.13: a
+    #     USB2 webcam at 1280x720 gave 3.6-3.8 fps with gaps up to 0.9 s on
+    #     YUY2 - 720p YUY2 is only offered at 10 fps - against MJPG 15 fps in
+    #     the same dim light, 30 fps in normal light).
+    # Escape hatch: JARVIS_CAMERA_FOURCC ("none" = do not request a format;
+    # any other 4 chars = that format).
     fourcc = (os.environ.get("JARVIS_CAMERA_FOURCC") or PREFERRED_FOURCC).strip()
     if cv2_mod is None:
         try:
@@ -597,17 +604,30 @@ def open_camera(index, *, backend: str = "msmf", width=None, height=None,
                 _outcome("not-opened")
                 return None
             if width and height:
-                if len(fourcc) == 4 and fourcc.lower() != "none":
+                want_fourcc = len(fourcc) == 4 and fourcc.lower() != "none"
+
+                def _set_fourcc():
+                    if not want_fourcc:
+                        return
                     try:
                         cap.set(cv2_mod.CAP_PROP_FOURCC,
                                 cv2_mod.VideoWriter_fourcc(*fourcc))
                     except Exception:
                         pass        # a driver without that format keeps its own
+
+                if backend != "msmf":
+                    pass            # DirectShow: size first, format last
+                else:
+                    _set_fourcc()
                 try:
                     cap.set(cv2_mod.CAP_PROP_FRAME_WIDTH, int(width))
                     cap.set(cv2_mod.CAP_PROP_FRAME_HEIGHT, int(height))
                 except Exception:
                     pass
+                if backend != "msmf":
+                    _set_fourcc()
+            _log_negotiated(cap, cv2_mod, backend, index, fourcc, width, height,
+                            _note)
             if buffersize:
                 # Several drivers reject this; it is an optimisation, not a
                 # requirement, and DirectShow silently ignores it.
@@ -634,6 +654,37 @@ def open_camera(index, *, backend: str = "msmf", width=None, height=None,
             _outcome("error")
             return None
     return None
+
+
+def _fourcc_text(value) -> str:
+    """OpenCV's CAP_PROP_FOURCC float/int as its 4-char code ('?' if unreadable)."""
+    try:
+        v = int(value)
+        if v <= 0:
+            return "?"
+        txt = "".join(chr((v >> (8 * i)) & 0xFF) for i in range(4))
+        return txt if txt.isprintable() else "?"
+    except Exception:
+        return "?"
+
+
+def _log_negotiated(cap, cv2_mod, backend, index, want, width, height, note) -> None:
+    """Log the format and size the driver actually settled on - once per open.
+
+    Reading properties is cheap and never starts the stream. Everything is
+    guarded: a fake or a driver without these properties just logs nothing."""
+    if not (width and height):
+        return
+    try:
+        got = _fourcc_text(cap.get(cv2_mod.CAP_PROP_FOURCC))
+        gw = int(cap.get(cv2_mod.CAP_PROP_FRAME_WIDTH))
+        gh = int(cap.get(cv2_mod.CAP_PROP_FRAME_HEIGHT))
+    except Exception:
+        return
+    note("[camera] %s index %s negotiated %s %dx%d (asked %s %sx%s)%s"
+         % (backend, index, got, gw, gh, want, width, height,
+            "" if (str(want).lower() == "none" or got == want or got == "?")
+            else " - FORMAT NOT HONOURED"))
 
 
 def _wait_for_frame(cap, budget_s: float) -> bool:
