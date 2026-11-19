@@ -459,6 +459,15 @@ class EmptyRescueTests(_CaptureBase):
         self.assertEqual(self._rescue(0.0, mode="always"), ("empty", 0))
         self.assertEqual(self._rescue(5.0, mode="off"), ("", 0))
 
+    def test_speech_awake_never_rescues_while_asleep(self):
+        bc = self.bc
+        bc._sleep_mode[0] = True
+        self.addCleanup(bc._sleep_mode.__setitem__, 0, False)
+        self.assertEqual(self._rescue(5.0, mode="speech_awake"), ("", 0))
+        bc._sleep_mode[0] = False
+        self.assertEqual(self._rescue(5.0, mode="speech_awake"), ("empty", 1))
+        self.assertEqual(self._rescue(0.0, mode="speech_awake"), ("", 1))
+
     def test_a_text_is_never_asked_about_speech(self):
         self._p(self.bc, "_parakeet_wake_lost", return_value=False)
         self.assertEqual(self._rescue(0.0, text="turn the lights off"),

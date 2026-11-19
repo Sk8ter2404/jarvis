@@ -1363,6 +1363,9 @@ STT_RESCUE_NO_WAKE         = "hint"
 #            own head check) finds at least STT_RESCUE_EMPTY_MIN_SPEECH_S of
 #            speech anywhere in the clip, pre-roll included - or cannot tell (then it
 #            rescues: a slower turn, never a lost one)
+#   'speech_awake' as 'speech' while awake; asleep (sleep mode) never: the
+#            quiet-name rescue is given up for no TV rescues. Not shipped;
+#            decide after a day of the "[stt] empty rescue skipped" counts.
 #   'always' the old behaviour      'off' never
 STT_RESCUE_EMPTY           = "speech"
 STT_RESCUE_EMPTY_MIN_SPEECH_S = 0.25

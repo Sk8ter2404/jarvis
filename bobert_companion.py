@@ -18859,12 +18859,13 @@ _empty_rescue_skipped = [0]
 
 
 def _empty_rescue_mode() -> str:
-    """STT_RESCUE_EMPTY normalised: 'speech' | 'always' | 'off' (anything
-    else is 'speech'). Never raises."""
+    """STT_RESCUE_EMPTY normalised: 'speech' | 'speech_awake' | 'always' |
+    'off' (anything else is 'speech'). Never raises."""
     try:
         m = str(globals().get("STT_RESCUE_EMPTY", "speech")
                 or "speech").strip().lower()
-        return m if m in ("speech", "always", "off") else "speech"
+        return (m if m in ("speech", "speech_awake", "always", "off")
+                else "speech")
     except Exception:
         return "speech"
 
@@ -18882,8 +18883,13 @@ def _empty_rescue_speech_check(audio):
         return None
     if mode == "off":
         return lambda: False
+    # 'speech_awake': asleep, the only thing worth a second decode is the
+    # wake word, and Silero calls TV and other people's talk "speech" too.
+    asleep = mode == "speech_awake" and bool(_sleep_mode[0])
 
     def _check():
+        if asleep:
+            return False
         try:
             secs = _tail_vad.speech_seconds(audio, SAMPLE_RATE)
         except Exception:
