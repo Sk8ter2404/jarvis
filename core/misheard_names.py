@@ -23,6 +23,7 @@ open offer a yes would have run. Two minutes later he shut JARVIS down.
   * closest_apps(name, installed)  up to two installed app names that look or
                             sound like it, for the failure line, so the
                             follow-up round names only apps that exist.
+  * closest_sites(name, shortcuts)  the same over his saved SITE_SHORTCUTS.
   * followup_rule(results)  the follow-up round's rule for such a failure.
 
 Bounded on purpose ("never make a short common word match a feature by
@@ -32,8 +33,9 @@ accident"):
   * every word must sound like its partner (the same phonetic key of 2+
     letters, which starts with the same letter) or be spelled within
     _SPELL_RATIO of it (5+ letters each);
-  * the same number of words, or the same letters run together
-    ("work shop" / "workshop");
+  * the same number of words (spelled-out letters count as one: "h u d"),
+    or exactly the same letters run together ("work shop" / "workshop"), so
+    an extra word never vanishes ("hug hologram" is not "hologram");
   * only articles, "app" and punctuation are dropped before comparing;
   * a name that fits two different features fits none.
 
@@ -81,10 +83,12 @@ _TAIL_WORDS = frozenset({"app", "application", "program"})
 
 def _words(name) -> list:
     """Lower-case words of ``name`` without leading articles or an "app"
-    tail; [] for anything that is not a short string."""
+    tail, spelled-out letters joined ("h u d" -> "hud"); [] for anything that
+    is not a short string."""
     if not isinstance(name, str) or len(name) > _MAX_NAME_CHARS:
         return []
-    words = re.findall(r"[a-z0-9]+", name.lower().replace("'", ""))
+    words = _letters_joined(
+        re.findall(r"[a-z0-9]+", name.lower().replace("'", "")))
     while words and words[0] in _LEAD_WORDS:
         words = words[1:]
     while len(words) > 1 and words[-1] in _TAIL_WORDS:
@@ -141,14 +145,33 @@ def names_alike(spoken, known) -> bool:
                     and _word_alike(sw[0], kw[0]))
         if len(sw) == len(kw):
             return all(_word_alike(a, b) for a, b in zip(sw, kw))
-        joined_s, joined_k = "".join(sw), "".join(kw)
-        return (len(joined_k) >= _MIN_ONE_WORD_LEN
-                and (joined_s == joined_k
-                     or phonetic_key(joined_s) == phonetic_key(joined_k)
-                     and difflib.SequenceMatcher(
-                         None, joined_s, joined_k).ratio() >= _SPELL_RATIO))
+        # Different word counts: only the SAME letters run together ("work
+        # shop" / "workshop", "hand menu" / "handmenu"). Never a sound-alike
+        # of the joined letters: h / w / y count as vowels in the key, so a
+        # whole short word would vanish into it ("hug hologram" keys like
+        # "hologram", "hand menu hi" like "hand menu").
+        joined_k = "".join(kw)
+        return len(joined_k) >= _MIN_ONE_WORD_LEN and "".join(sw) == joined_k
     except Exception:
         return False
+
+
+def _letters_joined(words: list) -> list:
+    """``words`` with every run of 2+ single letters spelled out as one word
+    ("hollow h u d" -> "hollow hud"); a lone letter stays a word."""
+    out, run = [], []
+    for w in words + [""]:
+        if len(w) == 1 and w.isalpha():
+            run.append(w)
+            continue
+        if len(run) >= 2:
+            out.append("".join(run))
+        else:
+            out.extend(run)
+        run = []
+        if w:
+            out.append(w)
+    return out
 
 
 def _registered(feature: Feature, registered) -> bool:
@@ -262,12 +285,40 @@ def closest_apps_note(close) -> str:
     return f"; the closest installed apps are {' and '.join(close)}"
 
 
+def closest_sites(name, shortcuts, n: int = 2) -> list:
+    """Up to ``n`` SITE_SHORTCUTS names (the owner's saved sites, only those
+    with an http(s) URL) that look or sound like ``name`` - the same bounds as
+    closest_apps. An exact name already opened its page before launch_app got
+    here, so it is never returned. [] on junk. Never raises."""
+    try:
+        if not isinstance(shortcuts, dict):
+            return []
+        keys = [k for k, v in shortcuts.items()
+                if isinstance(k, str) and k.strip() and isinstance(v, str)
+                and v.startswith(("http://", "https://"))]
+        return closest_apps(name, keys, n=n)
+    except Exception:
+        return []
+
+
+def closest_sites_note(close) -> str:
+    """The failure line's tail for closest_sites' answer: "; a saved site
+    with a similar name is A" / "...sites ... are A and B"; "" for none (a
+    saved site is no app, so there is nothing to deny)."""
+    close = [str(c) for c in (close or ()) if str(c).strip()]
+    if not close:
+        return ""
+    if len(close) == 1:
+        return f"; a saved site with a similar name is {close[0]}"
+    return f"; saved sites with similar names are {' and '.join(close)}"
+
+
 NOT_FOUND_MARK = "not found as an app on this pc"
 FOLLOWUP_RULE = (
     "- A launch that says 'not found as an app on this PC' also says what IS "
-    "installed: offer only an app that result names, the website, or a web "
-    "search. Never guess another app or game name, and never say you will "
-    "assume one.\n")
+    "installed: offer only an app or saved site that result names, the "
+    "website, or a web search. Never guess another app or game name, and "
+    "never say you will assume one.\n")
 
 
 def suggest_on() -> bool:

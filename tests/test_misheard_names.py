@@ -215,6 +215,20 @@ class FeatureForTests(unittest.TestCase):
                   "", "a", "the app", None, 42, "x" * 80):
             self.assertIsNone(self.label(n), n)
 
+    def test_an_extra_word_never_vanishes_into_the_sound_key(self):
+        # h / w / y count as vowels in the key, so a run-together name could
+        # swallow a whole short word: "hughologram" keys like "hologram".
+        for n in ("hug hologram", "hug hologram hud", "holy hologram",
+                  "holographic display holy", "hello hologram",
+                  "hologram hud way", "hand menu hi", "hand menu a",
+                  "hologram a", "holo gram x"):
+            self.assertIsNone(self.label(n), n)
+        # ... while letters merely run together still match.
+        self.assertEqual(self.label("hollow h u d"), "the holo HUD")
+        self.assertEqual(self.label("handmenu"), "the hand menu")
+        self.assertTrue(mn.names_alike("work shop", "workshop"))
+        self.assertFalse(mn.names_alike("hug hologram", "hologram"))
+
     def test_a_feature_that_is_not_loaded_is_never_offered(self):
         self.assertIsNone(self.label("Hollow Hood", registered={"hand_menu"}))
         self.assertIsNone(self.label("Hollow Hood", registered=set()))
@@ -300,6 +314,25 @@ class ClosestAppsTests(unittest.TestCase):
         self.assertEqual(len(got), 2)
         self.assertEqual(got[0], "Example One")
 
+    def test_saved_sites(self):
+        sites = {"example forge": "https://example.test/forge",
+                 "zorblat tickets": "https://example.test/z",
+                 "not a page": "file:///c:/x", 7: "https://example.test/7"}
+        self.assertEqual(mn.closest_sites("Example Forj", sites),
+                         ["example forge"])
+        self.assertEqual(mn.closest_sites("zorblat tikets", sites),
+                         ["zorblat tickets"])
+        for n in ("example forge",       # exact: it already opened its page
+                  "Hollow Hood", "not a page", "Steam", "", None):
+            self.assertEqual(mn.closest_sites(n, sites), [], n)
+        self.assertEqual(mn.closest_sites("Example Forj", None), [])
+        self.assertEqual(mn.closest_sites("Example Forj", ["x"]), [])
+        self.assertEqual(mn.closest_sites_note([]), "")
+        self.assertEqual(mn.closest_sites_note(["example forge"]),
+                         "; a saved site with a similar name is example forge")
+        self.assertEqual(mn.closest_sites_note(["a1", "b2"]),
+                         "; saved sites with similar names are a1 and b2")
+
     def test_note(self):
         self.assertEqual(mn.closest_apps_note([]),
                          "; no installed app has a similar name")
@@ -360,6 +393,7 @@ class LaunchNotFoundTests(unittest.TestCase):
                 (A, dict(attribute="_site_shortcut_url", return_value=None)),
                 (A, dict(attribute="_website_name_url", return_value=None)),
                 (A, dict(attribute="_start_apps", side_effect=lambda: self.apps)),
+                (config, dict(attribute="SITE_SHORTCUTS", new={})),
                 (A.shutil, dict(attribute="which", return_value=None)),
                 (A.sys, dict(attribute="platform", new="win32"))):
             self._start(mock.patch.object(target, **kw))
@@ -416,6 +450,22 @@ class LaunchNotFoundTests(unittest.TestCase):
         res, _log = self.launch("Hollow Knight")
         self.assertTrue(res.endswith(")"), res)
         self.assertNotIn("installed app", res)
+
+    def test_a_saved_site_that_sounds_like_it_is_named(self):
+        # Live config default shape: SITE_SHORTCUTS is the owner's dict, read
+        # live from core.config (here a synthetic one).
+        self.apps = (("Example Racer", "id.racer"),)
+        with mock.patch.object(config, "SITE_SHORTCUTS",
+                               {"example forge": "https://example.test/f"}):
+            res, _log = self.launch("Example Forj")
+            self.assertTrue(res.endswith(
+                "; no installed app has a similar name; a saved site with a "
+                "similar name is example forge"), res)
+            self.apps = ()             # Start menu unreadable: the site only
+            res, _log = self.launch("Example Forj")
+            self.assertTrue(res.endswith(
+                "); a saved site with a similar name is example forge"), res)
+        self.popen.assert_not_called()
 
     def test_the_setting_off_is_the_3025_line(self):
         self.apps = (("Example Racer", "id.racer"),)

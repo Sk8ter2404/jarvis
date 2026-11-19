@@ -2441,8 +2441,9 @@ UNRESOLVED_OPEN_ASK = True
 # match); a fit is OFFERED as a terminal line ("I've no app called Hollow
 # Hood, sir. Shall I open the holo HUD instead?", log "[launch-feature]"),
 # never run, and a yes opens it. Otherwise the failure line names the closest
-# installed Start-menu apps (or says none is close) and the follow-up round
-# may offer only those, the website or a web search. False: the 3.0.25 line
+# installed Start-menu apps (or says none is close) and any SITE_SHORTCUTS name
+# that sounds like it, and the follow-up round may offer only those, the
+# website or a web search. False: the 3.0.25 line
 # and follow-up exactly. Read live.
 LAUNCH_NOT_FOUND_SUGGEST = True
 # DECLINE_RECHECK_MODE (core/prompt_router.decline_recheck, applied in

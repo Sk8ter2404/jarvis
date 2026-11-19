@@ -1623,18 +1623,24 @@ def _closest_apps_note(name) -> str:
     the installed apps closest to ``name`` (core.misheard_names.closest_apps
     over the Start-menu list), or saying none is close - so the follow-up
     round offers only apps that exist (live 2026-11-17 17:12:59 it offered
-    "Hollow Knight", which is not installed). "" when the setting is off or
+    "Hollow Knight", which is not installed) - then any saved site
+    (SITE_SHORTCUTS, read live) that sounds like it. The apps part is "" when
     the Start-menu list could not be read: then nothing is claimed either
-    way. Never raises."""
+    way. "" when the setting is off. Never raises."""
     try:
         if not _launch_suggest_on():
             return ""
-        apps = _start_apps()
-        if not apps:
-            return ""
         from core import misheard_names as _mn
-        return _mn.closest_apps_note(
-            _mn.closest_apps(name, [n for n, _aid in apps]))
+        apps = _start_apps()
+        note = (_mn.closest_apps_note(
+            _mn.closest_apps(name, [n for n, _aid in apps])) if apps else "")
+        try:
+            from core import config as _cfg
+            note += _mn.closest_sites_note(_mn.closest_sites(
+                name, getattr(_cfg, "SITE_SHORTCUTS", None)))
+        except Exception:
+            pass
+        return note
     except Exception:
         return ""
 

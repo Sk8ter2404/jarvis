@@ -48,6 +48,7 @@ class _MisheardBase(_OfferBase):
         self._p(A, "_website_name_url", return_value=None)
         self._p(A, "_site_shortcut_url", return_value=None)
         self._p(A.sys, "platform", "win32")
+        self._p(cfg, "SITE_SHORTCUTS", {})
         self._stub("holo_mode_on", "Holo mode up, sir.")
         self._stub("holo_mode_off", "Holo mode closed, sir.")
         self._stub("hand_menu", "Hand menu up, sir.")
