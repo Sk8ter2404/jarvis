@@ -316,11 +316,16 @@ def word_times(tokens, timestamps, text) -> "list | None":
 
 
 # ── the rescue ────────────────────────────────────────────────────────────
-def rescue_reason(text, *, wake_lost, head_speech) -> str:
+def rescue_reason(text, *, wake_lost, head_speech, empty_speech=None) -> str:
     """Why Whisper must decode this capture after all ('' = keep Parakeet's
     text). Only names a reason, never the text:
 
-      'empty'   — Parakeet heard nothing;
+      'empty'   — Parakeet heard nothing, and ``empty_speech()`` (v3.0.26,
+                  STT_RESCUE_EMPTY) says the clip holds speech, or cannot
+                  tell (None) — or no ``empty_speech`` was given (the old
+                  rule: every empty decode is rescued). False = keep the
+                  empty text: 1,686 empty rescues of 11-13..11-17 made 6
+                  usable lines, and on noise Whisper invents "you";
       'no-wake' — wake_lost(text): the live wake gates would drop the line
                   for want of a wake word (wake-word mode, music with
                   AMBIENT_MUSIC_REFUSE_WAKE, the post-dialogue hold,
@@ -333,7 +338,10 @@ def rescue_reason(text, *, wake_lost, head_speech) -> str:
     them rescues ('check-failed'): a slower turn, never a lost one."""
     try:
         if not (text or "").strip():
-            return "empty"
+            if empty_speech is None:
+                return "empty"
+            speech = empty_speech()
+            return "empty" if (speech is None or speech) else ""
         if not wake_lost(text):
             return ""
         speech = head_speech()

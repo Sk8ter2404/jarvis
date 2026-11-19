@@ -352,6 +352,10 @@ class R6PrimaryTests(_Base):
     def test_rescue_on_empty_text(self):
         bc = self.bc
         self._p(bc, "_stt_alt", _FakeEngine(text="", logprobs=()))
+        # An empty decode is rescued when the clip holds speech (STT_RESCUE_
+        # EMPTY 'speech', v3.0.26; the no-speech case is in
+        # test_monolith_capture_chain.EmptyRescueTests).
+        self._p(bc._tail_vad, "speech_seconds", return_value=1.0)
         tr = self._p(bc, "transcribe", return_value=W_RES)
         self.assertIs(bc._transcribe_capture(self.audio), W_RES)
         tr.assert_called_once()

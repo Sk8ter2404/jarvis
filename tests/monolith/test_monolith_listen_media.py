@@ -523,6 +523,21 @@ class PregateTests(_Base):
         hit = bc._pregate_hit[0]
         self.assertEqual(hit["n0"], 60 * _CHUNK - int(3.0 * _SR))
 
+    def test_the_confirm_boosts_the_raw_cut_from_its_whole_cut_level(self):
+        # v3.0.26 clip basis: a raw bus cut keeps the whole-cut RMS level the
+        # gain always used, not the loudest chunk (2-3x less gain).
+        bc = self.bc
+        bus = self._confirm_env("Jarvis, pause the music.")
+        calls = []
+        self._p(bc, "apply_capture_auto_gain",
+                lambda a, p, clip_peak=None: calls.append((p, clip_peak))
+                or (a, 1.0))
+        with mock.patch("builtins.print"):
+            bc._pregate_confirm_one(bus.last_frame_time() - 1.5, 0.33, False)
+        self.assertEqual(len(calls), 1)
+        self.assertGreater(calls[0][0], 0.0)
+        self.assertEqual(calls[0][1], calls[0][0])
+
     def test_a_cut_that_is_not_addressed_is_dropped(self):
         bc = self.bc
         bus = self._confirm_env("and that is the recipe")

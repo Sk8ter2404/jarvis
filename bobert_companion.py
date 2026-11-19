@@ -3194,7 +3194,11 @@ def _learn_gate_classify(item: tuple) -> None:
             voice, score = _learn_voice_verdict(audio, sample_rate)
     ok, why = _learn_gate().decide(ts, injected=injected, wake=wake,
                                    voice=voice, overheard=not owner_directed)
-    _score = f", voice {score:.2f}" if isinstance(score, float) and score else ""
+    # The clip form (VOICE_ID_CLIP, v3.0.26) rides the score so a live
+    # session can compare its wake-turn scores with the 0.69 median of the
+    # processed clip (11-16..11-17).
+    _score = (f", voice {score:.2f} ({_voice_clip_mode()} clip)"
+              if isinstance(score, float) and score else "")
     print(f"  [learn-gate] {'learning from' if ok else 'not learning from'} "
           f"this turn: {why}{_score}")
     if ok:
@@ -17896,10 +17900,11 @@ if TURN_TAIL_PROBE:
 # would-be end.
 # What the models hear: the PROCESSED chunks (_process_capture_chunk), from
 # the clip's first pre-roll sample. Smart Turn hears the clip so far x ONE
-# auto-gain, from the capture's peak so far — exactly the clip Whisper would
-# get had the turn ended at that check (Whisper's clip is scaled once, by the
-# final peak: apply_capture_auto_gain). Silero is streamed, so it hears each
-# chunk x the gain so far.
+# auto-gain, from the clip's level so far (CAPTURE_AUTO_GAIN_BASIS 'clip',
+# v3.0.26: its loudest processed chunk; 'raw': the capture's raw peak) —
+# exactly the clip Whisper would get had the turn ended at that check
+# (Whisper's clip is scaled once, by the final level: apply_capture_auto_gain).
+# Silero is streamed, so it hears each chunk x the gain so far.
 # A Smart Turn check runs on the capture thread (about 25 ms on this CPU,
 # inside one 64 ms chunk), after its chunk's speculative snapshot. One that
 # takes longer than a chunk would make the loop fall behind the microphone —
@@ -18040,14 +18045,28 @@ class _EotCapture:
     every fault: a fault turns Smart Turn off for the session and the rest
     of this capture runs exactly as without it."""
 
-    __slots__ = ("dec", "tail", "peak", "turn", "dead")
+    __slots__ = ("dec", "tail", "peak", "clip_peak", "turn", "dead")
 
     def __init__(self, turn):
         self.dec = None           # its EotDecider (_eot_begin)
         self.tail = deque(maxlen=_EOT_TAIL_CHUNKS)   # last ~8 s, un-gained
         self.peak = 0.0           # the capture's peak RMS so far
+        # The processed clip's loudest chunk so far (CAPTURE_AUTO_GAIN_BASIS
+        # 'clip', v3.0.26): the level the capture's one gain is computed from.
+        self.clip_peak = 0.0
         self.turn = turn          # the SmartTurn the boot warmer warmed
         self.dead = False
+
+    def note_level(self, level) -> None:
+        """The clip's level so far before its first feed() (record_speech at
+        the trip: the pre-roll AND the tripping chunk), so the pre-roll is
+        heard at the gain the clip has once it starts - as `peak_rms`, which
+        already counts the tripping chunk, does for the 'raw' basis. Never
+        raises."""
+        try:
+            self.clip_peak = max(self.clip_peak, float(level))
+        except Exception:
+            pass
 
     def feed(self, chunk, peak_rms, silence_n) -> bool:
         """Feed one processed `chunk` (`peak_rms`: the capture's peak RMS so
@@ -18060,7 +18079,10 @@ class _EotCapture:
         try:
             self.tail.append(chunk)
             self.peak = peak_rms
-            heard, _gain = apply_capture_auto_gain(chunk, peak_rms)
+            self.clip_peak = max(self.clip_peak,
+                                 _capture_chain.peak_chunk_rms(chunk))
+            heard, _gain = apply_capture_auto_gain(chunk, peak_rms,
+                                                   clip_peak=self.clip_peak)
             end = self.dec.update(heard, silence_n)
             return self.dec.mode == "on" and bool(end)
         except Exception as e:
@@ -18078,7 +18100,8 @@ class _EotCapture:
         try:
             t0 = _eot_clock()
             clip, _gain = apply_capture_auto_gain(
-                np.concatenate(self.tail), self.peak)
+                np.concatenate(self.tail), self.peak,
+                clip_peak=self.clip_peak)
             p = self.turn.predict(clip)
             dt = _eot_clock() - t0
             if dt > _EOT_CHECK_BUDGET_S:
@@ -18860,10 +18883,62 @@ def _no_wake_rescue_wanted(text: str) -> bool:
         return True
 
 
+_empty_rescue_skipped = [0]
+
+
+def _empty_rescue_mode() -> str:
+    """STT_RESCUE_EMPTY normalised: 'speech' | 'speech_awake' | 'always' |
+    'off' (anything else is 'speech'). Never raises."""
+    try:
+        m = str(globals().get("STT_RESCUE_EMPTY", "speech")
+                or "speech").strip().lower()
+        return (m if m in ("speech", "speech_awake", "always", "off")
+                else "speech")
+    except Exception:
+        return "speech"
+
+
+def _empty_rescue_speech_check(audio):
+    """The ``empty_speech`` callable core/stt_parakeet.rescue_reason asks
+    when Parakeet heard nothing (STT_RESCUE_EMPTY, v3.0.26): None for
+    'always' (every empty decode is rescued, the old rule); a check that
+    says no for 'off'; for 'speech' (the default) the speech detector's
+    (Silero, the head check's _tail_vad) "at least
+    STT_RESCUE_EMPTY_MIN_SPEECH_S of speech anywhere in the clip, pre-roll
+    included" — None (rescue) when it cannot tell. Never raises."""
+    mode = _empty_rescue_mode()
+    if mode == "always":
+        return None
+    if mode == "off":
+        return lambda: False
+    # 'speech_awake': asleep, the only thing worth a second decode is the
+    # wake word, and Silero calls TV and other people's talk "speech" too.
+    asleep = mode == "speech_awake" and bool(_sleep_mode[0])
+
+    def _check():
+        if asleep:
+            return False
+        try:
+            secs = _tail_vad.speech_seconds(audio, SAMPLE_RATE)
+        except Exception:
+            return None
+        if secs is None:
+            return None
+        try:
+            need = float(globals().get("STT_RESCUE_EMPTY_MIN_SPEECH_S", 0.25))
+        except Exception:
+            need = 0.25
+        return float(secs) >= max(0.0, need)
+    return _check
+
+
 def _parakeet_rescue(text: str, audio) -> str:
     """core/stt_parakeet.rescue_reason with the live wake gates
-    (_parakeet_wake_lost) and the Silero head check (_parakeet_head_speech,
-    the tail probe's detector).
+    (_parakeet_wake_lost), the Silero head check (_parakeet_head_speech,
+    the tail probe's detector) and, for an empty decode, the speech check
+    STT_RESCUE_EMPTY picks (_empty_rescue_speech_check, v3.0.26: an empty
+    decode with no speech in it is not re-decoded; counted on the 10-minute
+    "[vad-floor]" line and a "[stt] empty rescue skipped" line).
 
     BOOT_PARALLEL_LOAD (v3 W10): while the boot's background Whisper load
     is still running, a rescue is skipped ('' = keep Parakeet's text) with
@@ -18873,7 +18948,18 @@ def _parakeet_rescue(text: str, audio) -> str:
     why = _stt_parakeet.rescue_reason(
         text,
         wake_lost=_parakeet_wake_lost,
-        head_speech=lambda: _parakeet_head_speech(audio))
+        head_speech=lambda: _parakeet_head_speech(audio),
+        empty_speech=_empty_rescue_speech_check(audio))
+    if not (text or "").strip():
+        _skipped = not why
+        _vad_book_note("rescue", _skipped)
+        if _skipped:
+            _empty_rescue_skipped[0] += 1
+            n = _empty_rescue_skipped[0]
+            if n == 1 or n % 100 == 0:
+                print(f"  [stt] empty rescue skipped: no speech in the "
+                      f"capture ({n} so far this session, "
+                      f"STT_RESCUE_EMPTY={_empty_rescue_mode()})")
     if why and _whisper_bg_loading():
         print(f"  [stt] rescue skipped (whisper loading): {why}")
         return ""
@@ -19010,7 +19096,8 @@ def _parakeet_shadow_rescue(text, audio, ctx) -> str:
         text,
         wake_lost=lambda t: bool(_wake_gate_verdict(t, gate)),
         head_speech=lambda: _parakeet_head_speech(audio,
-                                                  ctx.get("preroll")))
+                                                  ctx.get("preroll")),
+        empty_speech=_empty_rescue_speech_check(audio))
 
 
 def _parakeet_shadow_live(t_offer, ctx) -> dict:
@@ -19103,8 +19190,59 @@ if _stt_r6_route() is not None:
 # (_ambient_learn_from_gated) WITHOUT plumbing the buffer through the return
 # signature. None on the inject path (no real audio) and after a non-mic turn.
 # Mirrors the single-global idiom of _last_recording_peak above. 2026-06-07.
+# v3.0.26: it is the voice-ID clip (VOICE_ID_CLIP; _voice_clip_for) - by
+# default record_speech's frames BEFORE noise suppression / AGC, the form the
+# voiceprint was enrolled from - and _last_capture_stt the clip STT heard
+# (processed, before auto-gain), for the wake re-anchor's re-decode.
 _last_capture_audio: "np.ndarray | None" = None
 _last_capture_sr: int = 0
+_last_capture_stt: list = [None]
+
+
+def _capture_auto_gain_logged(audio):
+    """apply_capture_auto_gain for the main loop's capture: the raw peak
+    record_speech measured guards silence, the clip's own level sets the gain
+    (CAPTURE_AUTO_GAIN_BASIS). Every boost is counted on the 10-minute
+    "[vad-floor]" line; its own "[auto-gain]" line prints only in the tray's
+    Debug Mode (v3.0.26: 5,773 such lines in two days). Never raises."""
+    out, gain = apply_capture_auto_gain(audio, _last_recording_peak)
+    if gain > 1.0:
+        try:
+            from core import config as _cfg
+            cap = float(getattr(_cfg, "CAPTURE_AUTO_GAIN_MAX", 10.0))
+        except Exception:
+            cap = 10.0
+        _vad_book_note("gain", (gain, gain >= cap - 1e-6))
+        if _debug_mode[0]:
+            print(f"  [auto-gain] quiet input rms={_last_recording_peak:.4f} "
+                  f"-> x{gain:.1f} ({_auto_gain_basis()} basis)")
+    return out, gain
+
+
+def _ambient_offer_main_transcript(text, conf) -> None:
+    """Ambient dedupe (AMBIENT_MAIN_DEDUPE, skills/ambient_listen.py): the
+    main loop decoded this capture, so the ambient listener - which skipped
+    the tap batches the capture covered - keeps THIS transcript (its own
+    gates still judge it) instead of decoding the same audio again. Hands
+    over the text, the raw peak, the voice-ID clip and the capture's span;
+    the skill only queues it (bounded) for its own thread. Never blocks,
+    never raises."""
+    try:
+        if _capture_spans and len(_capture_spans[-1]) > 2:
+            _capture_spans[-1][2] = True     # decoded: the tap may skip it
+    except Exception:
+        pass
+    try:
+        mod = sys.modules.get("skill_ambient_listen")
+        fn = getattr(mod, "note_main_transcript", None) if mod else None
+        if not callable(fn):
+            return
+        span = (tuple(_capture_spans[-1][:2]) if _capture_spans else None)
+        fn(text, conf if isinstance(conf, dict) else {},
+           float(_last_recording_peak or 0.0), _last_capture_audio,
+           int(_last_capture_sr or 0), span)
+    except Exception:
+        pass
 
 # 2026-05-30 [self-heal]: guard for the silent-mic warning emitted by
 # record_speech when raw mic RMS stays at zero past MIC_SILENT_WARN_SECONDS
@@ -20128,6 +20266,187 @@ def _open_primed_stream(audio, sr, device):
 _record_speech_taps: "list[queue.Queue]" = []
 _record_speech_taps_lock = threading.Lock()
 
+# ── the capture chain (v3.0.26, core/capture_chain.py) ────────────────────
+# VAD floor (VAD_FLOOR_*): the main loop's idle listens start a capture over
+# the room's measured floor, never under VAD_THRESHOLD. The floor and the
+# 10-minute "[vad-floor]" book live across captures (the mic closes between
+# them unless MIC_BUS_MODE is on). Only record_speech's own thread writes the
+# floor (one capture holds the mic at a time).
+from core import capture_chain as _capture_chain  # noqa: E402
+_vad_floor = _capture_chain.NoiseFloor()
+_vad_book = _capture_chain.CaptureBook()
+# The previous chunk was a noise blip held under the floor (counts episodes).
+_vad_held_prev = [False]
+# The last capture's raw clip (VOICE_ID_CLIP 'raw'): the frames that joined
+# it BEFORE _process_capture_chunk (the echo-cancelled copy while
+# MEDIA_AEC_MODE cancels), the same length as the clip record_speech
+# returned. None when that capture kept none. Read by _voice_clip_for.
+_last_capture_raw: list = [None]
+# The loudest 64 ms chunk RMS of the processed clip record_speech returned
+# (CAPTURE_AUTO_GAIN_BASIS 'clip' reads it as the clip's level).
+_last_recording_clip_peak = [0.0]
+# Ambient dedupe (AMBIENT_MAIN_DEDUPE, skills/ambient_listen.py): when each
+# recent main-loop capture's clip started and ended (time.monotonic), and
+# the one recording now. The ambient tap does not decode again a batch
+# these spans cover; the main loop hands it its own transcript instead.
+_capture_spans: "deque" = deque(maxlen=32)
+_capture_open_since = [None]
+# A playback that ended this recently still counts as JARVIS speaking for
+# the VAD floor (no sampling; the start threshold stays VAD_THRESHOLD).
+_VAD_FLOOR_PLAYBACK_TAIL_S = 1.5
+# The most chunks of a held noise/onset episode the pre-roll keeps past
+# PRE_BUFFER (64 ms each: about 2 s), so memory stays bounded under steady noise.
+_VAD_HELD_KEEP_MAX = 31
+
+
+def _vad_floor_mode() -> str:
+    return _capture_chain.floor_mode(globals().get("VAD_FLOOR_MODE", "off"))
+
+
+def _vad_floor_knobs() -> "tuple[float, float, int]":
+    """(factor, max ratio, confirm chunks), each clamped sane. Never
+    raises."""
+    try:
+        factor = max(1.0, float(globals().get("VAD_FLOOR_FACTOR", 2.5)))
+    except Exception:
+        factor = 2.5
+    try:
+        ratio = max(1.0, float(globals().get("VAD_FLOOR_MAX_RATIO", 1.25)))
+    except Exception:
+        ratio = 1.25
+    try:
+        confirm = min(4, max(1, int(globals().get("VAD_START_CONFIRM_CHUNKS",
+                                                  1))))
+    except Exception:
+        confirm = 1
+    return factor, ratio, confirm
+
+
+def _vad_playback_recent() -> bool:
+    """JARVIS is playing, or stopped under _VAD_FLOOR_PLAYBACK_TAIL_S ago
+    (core/self_echo's playback clock). Never raises (False)."""
+    try:
+        end = _self_echo.last_playback_end()
+        return (end is not None
+                and _self_echo.now() - float(end) < _VAD_FLOOR_PLAYBACK_TAIL_S)
+    except Exception:
+        return False
+
+
+def _vad_book_note(kind: str, value=None) -> None:
+    """One count for the "[vad-floor]" line. Never raises."""
+    try:
+        now = time.monotonic()
+        if kind == "capture":
+            _vad_book.note_capture(value or {}, now)
+        elif kind == "turn":
+            _vad_book.note_turn(value or {}, now)
+        elif kind == "held":
+            _vad_book.note_held(now)
+        elif kind == "rescue":
+            _vad_book.note_rescue(bool(value), now)
+        elif kind == "gain":
+            gain, capped = value
+            _vad_book.note_gain(gain, capped, now)
+    except Exception:
+        pass
+
+
+def _vad_book_tick(force: bool = False) -> None:
+    """Print the "[vad-floor]" line when its 10 minutes are up. Never
+    raises."""
+    try:
+        mode = _vad_floor_mode()
+        factor, ratio, confirm = _vad_floor_knobs()
+        base = float(VAD_THRESHOLD)
+        thr = (_vad_floor.start_threshold(base, factor, ratio)
+               if mode != "off" else base)
+        line = _vad_book.line(time.monotonic(), mode=mode,
+                              floor=_vad_floor.floor(), start_thr=thr,
+                              base=base, cap=base * ratio, confirm=confirm,
+                              force=force)
+        if line:
+            print(f"  {line}")
+    except Exception:
+        pass
+
+
+def _vad_floor_note_turn() -> None:
+    """The last mic capture became an owner turn or a wake: its VAD numbers
+    join the book (the quietest turn's margin; in 'shadow', whether 'on'
+    would have lost it). Never raises."""
+    try:
+        meta = (_last_capture_meta[0] or {}).get("vad")
+        if isinstance(meta, dict) and not meta.get("turn_noted"):
+            meta["turn_noted"] = True
+            _vad_book_note("turn", meta)
+    except Exception:
+        pass
+
+
+def _voice_clip_mode() -> str:
+    try:
+        m = str(globals().get("VOICE_ID_CLIP", "raw") or "raw").strip().lower()
+        return m if m in ("raw", "processed") else "raw"
+    except Exception:
+        return "raw"
+
+
+def _voice_clip_for(audio):
+    """The clip voice-ID, the media gate and the learners score for the
+    capture record_speech just returned as ``audio`` (VOICE_ID_CLIP): its
+    raw frames ('raw', the default - the form the voiceprint was enrolled
+    from) when record_speech kept them for this very clip (same length),
+    else ``audio`` itself (the old, processed clip). Never raises."""
+    try:
+        if audio is None or _voice_clip_mode() != "raw":
+            return audio
+        raw = _last_capture_raw[0]
+        if raw is not None and len(raw) == len(audio):
+            return raw
+    except Exception:
+        pass
+    return audio
+
+
+def capture_spans_since(t0: float) -> list:
+    """[(start, end), ...] in time.monotonic of the main loop's captures
+    that ended after ``t0``, plus the one recording now as (start, None).
+    For skills/ambient_listen's dedupe. Never raises ([])."""
+    try:
+        out = [(float(sp[0]), float(sp[1])) for sp in list(_capture_spans)
+               if float(sp[1]) >= float(t0)]
+        live = _capture_open_since[0]
+        if live is not None:
+            out.append((float(live), None))
+        return out
+    except Exception:
+        return []
+
+
+def capture_spans_offered_since(t0: float) -> list:
+    """The subset of capture_spans_since the main loop DECODED and handed a
+    transcript for (even an empty one): a capture it dropped (too short,
+    muted, yielded) is never in it, so the ambient tap decodes those frames
+    itself instead of losing them. Never raises ([])."""
+    try:
+        return [(float(sp[0]), float(sp[1])) for sp in list(_capture_spans)
+                if len(sp) > 2 and sp[2] and float(sp[1]) >= float(t0)]
+    except Exception:
+        return []
+
+
+def _capture_span_close() -> None:
+    """The capture that was recording has ended (or was dropped): its span
+    joins _capture_spans. Never raises."""
+    try:
+        start = _capture_open_since[0]
+        if start is not None:
+            _capture_open_since[0] = None
+            _capture_spans.append([float(start), time.monotonic(), False])
+    except Exception:
+        pass
+
 # Hard ceiling on a single utterance. Once recording starts, the only other
 # way out is SILENCE_SECS of sustained quiet — but if the mic feeds
 # continuous above-threshold audio (music, a noisy room, a stuck driver
@@ -20397,6 +20716,37 @@ def record_speech(timeout: float | None = None, *,
     _cap_ctx: dict = {}
     _force_trip = False
     _seed_secs = 0.0
+    # The capture chain (v3.0.26, core/capture_chain.py). _raw_pre /
+    # _raw_chunks: every chunk that joins pre_ring / chunks, kept as it was
+    # BEFORE _process_capture_chunk (VOICE_ID_CLIP 'raw': voice-ID scores
+    # the form the voiceprint was enrolled from). The VAD floor's start rule
+    # and the [vad-floor] book apply to the main loop's own listens only
+    # (smart_endpoint); an in-turn capture starts on VAD_THRESHOLD as ever.
+    _raw_pre: list = []
+    _raw_chunks: list = []
+    _main_listen = bool(smart_endpoint and not _offthread_claimed)
+    _floor_mode = _vad_floor_mode() if _main_listen else "off"
+    _floor_factor, _floor_ratio, _confirm_n = _vad_floor_knobs()
+    if not _main_listen:
+        _confirm_n = 1
+    _above_n = 0              # chunks in a row over the start threshold
+    _trip_thr = VAD_THRESHOLD  # the start threshold the capture tripped on
+    _shadow_thr = None        # 'shadow': the threshold 'on' would have used
+    _single = None            # the chunk after the trip fell under it
+    _trip_idx = -1
+    _n_seen = 0
+    _forced = False
+    # The held episode (v3.0.26, the v2.0.104 lesson): chunks from the first
+    # one over VAD_THRESHOLD that did not start a capture (under the floor's
+    # start threshold, or VAD_START_CONFIRM_CHUNKS not yet met) until the
+    # silence that would have ended a capture started on VAD_THRESHOLD. The
+    # pre-roll keeps them all (up to _VAD_HELD_KEEP_MAX past PRE_BUFFER), so
+    # a capture the floor started late still begins where VAD_THRESHOLD
+    # would have started it: no word of his onset is lost to the floor.
+    _held_n = 0               # chunks of the held episode so far (0 = none)
+    _held_quiet = 0           # chunks in a row under VAD_THRESHOLD inside it
+    if not _offthread_claimed:
+        _last_capture_raw[0] = None
 
     audio_q: queue.Queue = queue.Queue()
     # An off-thread in-turn capture (a dashboard-run action asking the owner
@@ -20681,20 +21031,26 @@ def record_speech(timeout: float | None = None, *,
                     pre_ring = [_process_capture_chunk(c, SAMPLE_RATE,
                                                        skip_ns=True)
                                 for c in _seed["chunks"]][-PRE_BUFFER:]
+                    _raw_pre = [np.array(c, dtype=np.float32, copy=True)
+                                for c in _seed["chunks"]][-PRE_BUFFER:]
                 _seed = None
             if _seed is not None:
                 _eot = None              # Smart Turn never saw the seed
                 _spec_stt_reset()
                 _seed_chunks = [_process_capture_chunk(c, SAMPLE_RATE)
                                 for c in _seed["chunks"]]
+                _seed_raw = [np.array(c, dtype=np.float32, copy=True)
+                             for c in _seed["chunks"]]
                 if recording:
                     chunks = list(_seed_chunks)
+                    _raw_chunks = _seed_raw
                     silence_n = 0
                     record_start_ts = time.time() - _seed["secs"]
                     _se_clip_ts = _seed["t0"]
                     pre_samples = 0
                 else:
                     pre_ring = list(_seed_chunks)
+                    _raw_pre = _seed_raw
                     _force_trip = True
                     _seed_secs = float(_seed["secs"])
             # Hard utterance ceiling: if continuous above-threshold audio
@@ -20799,7 +21155,48 @@ def record_speech(timeout: float | None = None, *,
                 _keep, SAMPLE_RATE,
                 skip_ns=(not recording and rms < VAD_THRESHOLD * 0.75),
                 **_pcc_kw)
-            if rms > VAD_THRESHOLD:
+            # VAD floor (v3.0.26, VAD_FLOOR_* / VAD_START_CONFIRM_CHUNKS):
+            # what STARTS a main-loop listen's capture. Only the start: once
+            # recording, every chunk over VAD_THRESHOLD is voice exactly as
+            # before, so no capture ends sooner. Around JARVIS's playback
+            # the start stays VAD_THRESHOLD and the floor is not sampled.
+            _n_seen += 1
+            _voiced = rms > VAD_THRESHOLD
+            if not recording and _main_listen and not _force_trip:
+                if _voiced:
+                    _held_n += 1
+                    _held_quiet = 0
+                elif _held_n:
+                    _held_quiet += 1
+                    if _held_quiet >= silence_lim:
+                        _held_n = _held_quiet = 0
+                    else:
+                        _held_n += 1
+                _start_thr = VAD_THRESHOLD
+                if _floor_mode != "off" and not _vad_playback_recent():
+                    _vad_floor.note_idle(rms)
+                    _adaptive = _vad_floor.start_threshold(
+                        VAD_THRESHOLD, _floor_factor, _floor_ratio)
+                    if _floor_mode == "on":
+                        _start_thr = _adaptive
+                    else:
+                        _shadow_thr = _adaptive
+                _over = rms > _start_thr
+                _above_n = _above_n + 1 if _over else 0
+                _held = _voiced and not _over
+                if _held and not _vad_held_prev[0]:
+                    _vad_book_note("held")
+                _vad_held_prev[0] = _held
+                _voiced = _over and _above_n >= _confirm_n
+                if _voiced:
+                    _trip_thr = _start_thr
+                    _trip_idx = _n_seen
+            elif not recording and _voiced and _force_trip:
+                _forced = True
+            if (recording and _single is None and _trip_idx >= 0
+                    and _n_seen == _trip_idx + 1):
+                _single = not (rms > _trip_thr)
+            if _voiced:
                 if not recording:
                     recording = True
                     _force_trip = False
@@ -20824,9 +21221,20 @@ def record_speech(timeout: float | None = None, *,
                                    int(sum(np.asarray(c).size
                                            for c in pre_ring)))
                     chunks.extend(pre_ring)
+                    _raw_chunks.extend(_raw_pre)
+                    # Ambient dedupe: this clip's span, from its first
+                    # pre-roll sample (the tap heard the same frames).
+                    if _fanout:
+                        _capture_open_since[0] = time.monotonic() - (
+                            (len(pre_ring) + 1) * CHUNK
+                            / float(SAMPLE_RATE or 16000))
                     # Smart Turn hears the clip from its first sample: the
                     # pre-roll joins it here, so it is fed here.
                     if _eot is not None:
+                        _eot.note_level(max(
+                            [_capture_chain.peak_chunk_rms(c)
+                             for c in pre_ring]
+                            + [_capture_chain.peak_chunk_rms(processed)]))
                         for _pre in pre_ring:
                             _eot.feed(_pre, peak_rms, 0)
                     _heartbeat()
@@ -20834,6 +21242,8 @@ def record_speech(timeout: float | None = None, *,
                     pause_face_tracking()
                     set_state("listening")
                 chunks.append(processed.copy())
+                _raw_chunks.append(np.array(_keep, dtype=np.float32,
+                                            copy=True))
                 silence_n = 0
                 # Smart Turn: voice (silence_n 0) — after a would-be end,
                 # this is what marks the turn resumed=1.
@@ -20849,10 +21259,22 @@ def record_speech(timeout: float | None = None, *,
                 if not recording and rms > silent_peak:
                     silent_peak = rms
                 pre_ring.append(processed.copy())
-                if len(pre_ring) > PRE_BUFFER and not _force_trip:
+                _raw_pre.append(np.array(_keep, dtype=np.float32, copy=True))
+                # The pre-roll: PRE_BUFFER chunks, plus - for a main-loop
+                # listen's held episode (see _held_n above) - the episode's
+                # own chunks (up to _VAD_HELD_KEEP_MAX), so a capture the
+                # floor starts late still begins where VAD_THRESHOLD would
+                # have started it.
+                _pre_lim = PRE_BUFFER + (
+                    min(_held_n, _VAD_HELD_KEEP_MAX)
+                    if (_main_listen and not recording) else 0)
+                while len(pre_ring) > _pre_lim and not _force_trip:
                     pre_ring.pop(0)
+                    if len(_raw_pre) > len(pre_ring):
+                        _raw_pre.pop(0)
                 if recording:
                     chunks.append(processed.copy())
+                    _raw_chunks.append(_raw_pre[-1])
                     silence_n += 1
                     # Speculative transcription: bet the utterance is over and
                     # hide Whisper inside the remaining hangover. Only one
@@ -20884,6 +21306,12 @@ def record_speech(timeout: float | None = None, *,
                               f"(threshold {VAD_THRESHOLD})")
                     return None
     finally:
+        # Ambient dedupe: this capture's span (if it recorded) is closed,
+        # whichever way the capture ended. Pure Python, never raises.
+        if _fanout:
+            _capture_span_close()
+        if _main_listen and not recording:
+            _vad_book_tick()       # a quiet stretch still gets its line
         # A bus capture closes only its subscription: the bus's stream stays
         # open (MIC_BUS_MODE).
         if _bus_cap is not None:
@@ -20956,18 +21384,58 @@ def record_speech(timeout: float | None = None, *,
     _pg = _cap_ctx.get("pregate")
     if _bus_cap is not None and _cap_ctx.get("last_start") is not None:
         _mic_bus_clip_end[0] = int(_cap_ctx["last_start"])
+    # VAD floor book (v3.0.26): this main-loop capture's start numbers.
+    # 'would_hold' ('shadow'): 'on' would never have started it - no chunk
+    # of it beat the floor's threshold. A seeded capture (the bus's ring /
+    # a confirmed wake) is no VAD decision.
+    _vad_meta = None
+    if _main_listen and not _forced and _trip_idx >= 0:
+        _vad_meta = {
+            "peak": float(peak_rms), "start_thr": float(_trip_thr),
+            "single": bool(_single),
+            "would_hold": bool(_floor_mode == "shadow"
+                               and _shadow_thr is not None
+                               and peak_rms <= float(_shadow_thr))}
     _last_capture_meta[0] = {
         "pregate": bool(_pg),
         "pregate_seq": int(_pg.get("seq", 0)) if isinstance(_pg, dict) else 0,
-        "why": _eot_why, "bus": _bus_cap is not None}
+        "why": _eot_why, "bus": _bus_cap is not None, "vad": _vad_meta}
     _listen_note("captures")
     _clip_out = np.concatenate(chunks).flatten()
     # R6 rescue: where the owner's speech starts in this clip.
     _last_capture_preroll[0] = (int(_clip_out.size), pre_samples)
+    # The capture chain (v3.0.26): the processed clip's own level (the
+    # auto-gain's basis) and, for voice-ID, the same clip before
+    # processing - published only when it lines up sample for sample.
+    _last_recording_clip_peak[0] = _capture_chain.peak_chunk_rms(_clip_out)
+    if not _offthread_claimed:
+        try:
+            _raw_out = (np.concatenate(_raw_chunks).flatten()
+                        if _raw_chunks else None)
+        except Exception:
+            _raw_out = None
+        _last_capture_raw[0] = (_raw_out if _raw_out is not None
+                                and _raw_out.size == _clip_out.size else None)
+    if _vad_meta is not None:
+        _vad_book_note("capture", _vad_meta)
+    if _main_listen:
+        _vad_book_tick()
     return _clip_out
 
 
-def apply_capture_auto_gain(audio_f32, peak_rms):
+def _auto_gain_basis() -> str:
+    """CAPTURE_AUTO_GAIN_BASIS, read live from core.config: 'clip'
+    (default) | 'raw'. Never raises."""
+    try:
+        from core import config as _cfg
+        v = str(getattr(_cfg, "CAPTURE_AUTO_GAIN_BASIS", "clip")
+                or "clip").strip().lower()
+        return v if v in ("clip", "raw") else "clip"
+    except Exception:
+        return "clip"
+
+
+def apply_capture_auto_gain(audio_f32, peak_rms, clip_peak=None):
     """CONSERVATIVE input auto-gain (normalization) for the captured mic buffer,
     applied right BEFORE faster-whisper sees it on both the normal-turn and the
     standby/wake path.
@@ -20976,20 +21444,36 @@ def apply_capture_auto_gain(audio_f32, peak_rms):
     returns an EMPTY string and the wake word "JARVIS" is never detected. This
     boosts such audio toward a usable level WITHOUT degrading already-good audio.
 
+    ``peak_rms`` is the capture's RAW peak (record_speech's VAD measure): at or
+    below CAPTURE_AUTO_GAIN_NOISE_FLOOR the clip is silence / room hiss and is
+    never amplified. What the gain is computed FROM is CAPTURE_AUTO_GAIN_BASIS
+    (v3.0.26):
+
+      * 'clip' (default): the level of the clip being boosted — ``clip_peak``,
+        or, when None, its own loudest 1,024-sample chunk RMS
+        (core/capture_chain.peak_chunk_rms). That clip is the noise-suppressed,
+        AGC'd one (up to 8x already), so the raw peak no longer multiplies a
+        different, louder signal: 3,725 of 5,773 logged decisions sat at the
+        x10 cap and the clip was then hard-clipped (11-13..11-17). The boost
+        then goes through a soft limiter (capture_chain.soft_limit) instead of
+        a hard clip.
+      * 'raw': the old rule, from ``peak_rms``, then a hard clip.
+
     Returns ``(audio_f32, applied_gain)``:
 
-      * auto-gain disabled, ``peak_rms`` already ≥ the loud-enough target, OR
-        ``peak_rms`` at/below a tiny noise floor (so pure silence / room hiss is
-        never amplified into Whisper hallucinations) → the audio is returned
+      * auto-gain disabled, the level already ≥ the loud-enough target, OR
+        ``peak_rms`` at/below the noise floor → the audio is returned
         UNCHANGED with ``applied_gain == 1.0``.
-      * otherwise the gain is ``min(MAX_GAIN, TARGET_PEAK / max(peak_rms, eps))``;
-        the buffer is multiplied and HARD-CLIPPED to ``[-1.0, 1.0]`` to prevent
-        overflow distortion, then returned with that gain.
+      * otherwise the gain is ``min(MAX_GAIN, TARGET_PEAK / level)``; the
+        buffer is multiplied, limited into ``[-1.0, 1.0]`` and returned with
+        that gain.
 
-    Never raises: any failure returns the ORIGINAL audio at gain 1.0 so a bad
-    sample or a missing config knob can never break the capture path. The
-    thresholds are read live from ``core.config`` so the Settings-GUI /
-    ``user_settings.json`` override path reaches them.
+    ``clip_peak``: the level of the WHOLE clip a piece belongs to, for a caller
+    that boosts a clip chunk by chunk (Smart Turn's streamed Silero) so every
+    chunk gets the one gain. Never raises: any failure returns the ORIGINAL
+    audio at gain 1.0 so a bad sample or a missing config knob can never break
+    the capture path. The thresholds are read live from ``core.config`` so the
+    Settings-GUI / ``user_settings.json`` override path reaches them.
     """
     try:
         if audio_f32 is None:
@@ -21001,17 +21485,29 @@ def apply_capture_auto_gain(audio_f32, peak_rms):
         max_gain = float(getattr(_cfg, "CAPTURE_AUTO_GAIN_MAX", 10.0))
         noise_floor = float(getattr(_cfg, "CAPTURE_AUTO_GAIN_NOISE_FLOOR", 0.005))
         peak = float(peak_rms)
-        # Already loud enough, or so quiet it's silence/room hiss → leave it.
-        # (peak <= noise_floor guards against amplifying pure noise into
-        # hallucinated transcripts; peak >= target means normal audio, untouched.)
-        if not (noise_floor < peak < target):
+        basis = _auto_gain_basis()
+        # Silence / room hiss (raw peak at the floor) → leave it: amplified,
+        # pure noise becomes hallucinated transcripts.
+        if peak <= noise_floor:
             return audio_f32, 1.0
-        gain = min(max_gain, target / max(peak, 1e-9))
+        if basis == "raw":
+            level = peak
+        elif clip_peak is not None:
+            level = float(clip_peak)
+        else:
+            level = _capture_chain.peak_chunk_rms(audio_f32)
+        # Already loud enough → untouched.
+        if not (0.0 < level < target):
+            return audio_f32, 1.0
+        gain = min(max_gain, target / max(level, 1e-9))
         if gain <= 1.0:
             return audio_f32, 1.0
         boosted = np.asarray(audio_f32, dtype=np.float32) * np.float32(gain)
-        # Hard-clip so the boost can never overflow [-1, 1] into harsh distortion.
-        np.clip(boosted, -1.0, 1.0, out=boosted)
+        if basis == "raw":
+            # The old hard clip, so 'raw' is exactly the old behaviour.
+            np.clip(boosted, -1.0, 1.0, out=boosted)
+        else:
+            _capture_chain.soft_limit(boosted)
         return boosted, float(gain)
     except Exception:
         # A normalization failure must never break capture — return the input.
@@ -40571,7 +41067,10 @@ def _pregate_confirm_one(t_hit: float, score: float, speaking: bool) -> str:
             _listen_note("pregate_drops")
             return "dropped"
         peak = float(np.sqrt(np.mean(np.square(cut, dtype=np.float64))))
-        audio, _g = apply_capture_auto_gain(cut, peak)
+        # A RAW bus cut: its level is the whole cut's RMS (the pre-v3.0.26
+        # basis), not the 'clip' basis' loudest chunk, which would give a
+        # quiet wake cut 2-3x less gain.
+        audio, _g = apply_capture_auto_gain(cut, peak, clip_peak=peak)
         text, _conf = _wake_confirm_decode(audio)
         ok = _text_has_wake_prefix(text)
         if speaking:
@@ -40786,9 +41285,20 @@ def _wake_reanchor(text: str, conf) -> "str | None":
         if not why and _wake_vetoed(_name_time(conf, r.name_word),
                                     "re-anchor"):
             why = "vetoed"
+        # The re-decode hears what STT heard (the processed clip, v3.0.26:
+        # `audio` is the voice-ID clip, raw by default); the raw cut's RMS
+        # still guards silence. The same clip when they do not line up.
+        _stt_clip = _last_capture_stt[0]
+        _stt_cut = (_stt_clip[int(cut_s * sr):]
+                    if (not why and _stt_clip is not None and audio is not None
+                        and len(_stt_clip) == len(audio)) else None)
         if not why:
             peak = float(np.sqrt(np.mean(np.square(cut, dtype=np.float64))))
-            dec, _g = apply_capture_auto_gain(cut, peak)
+            # The processed re-decode clip takes the clip basis; the RAW cut
+            # fallback keeps its whole-cut level (as the pregate does).
+            dec, _g = apply_capture_auto_gain(
+                _stt_cut if _stt_cut is not None else cut, peak,
+                clip_peak=None if _stt_cut is not None else peak)
             new_text, _c = _wake_confirm_decode(dec)
             if not _text_has_wake_prefix(new_text):
                 why = "re-decode"
@@ -40804,6 +41314,7 @@ def _wake_reanchor(text: str, conf) -> "str | None":
         _reanchor_taken[0] = {"t0": (_t0 + float(cut_s)
                                      if _t0 is not None else None)}
         globals()["_last_capture_audio"] = cut
+        _last_capture_stt[0] = _stt_cut
         print(f"  [wake-reanchor] took sentence {r.sentence}: the command "
               f"starts {cut_s:.1f} s into a {cap_s:.1f} s capture "
               f"({len(new_text)} chars)")
@@ -52912,6 +53423,7 @@ def _capture_utterance(injected_text, memory):
     # The mic path below overwrites this with the raw captured buffer.
     _last_capture_audio = None
     _last_capture_sr = 0
+    _last_capture_stt[0] = None
     # Self-echo gate: only the mic path below publishes capture timing.
     _last_capture_window[0] = None
     # The idle listen's queued-work baseline is taken BEFORE the drain below
@@ -53076,25 +53588,28 @@ def _capture_utterance(injected_text, memory):
 
     # Keep the spectral music detector primed in normal mode too, so its
     # sustained-music state survives any sleep→standby transition triggered by
-    # a music marker below. Feed it the RAW audio (pre auto-gain) so its
-    # tuning is unaffected by the normalization stage below.
+    # a music marker below. Fed record_speech's clip before auto-gain (the
+    # processed clip, as it was tuned on) so the normalization stage below
+    # leaves its tuning alone.
     _audio_music_feed(audio, SAMPLE_RATE)
 
-    # Stash the RAW (pre auto-gain) buffer so the background-audio gate can run
-    # voice-ID on this exact utterance in _ambient_learn_from_gated. resemblyzer
-    # wants natural, un-normalized audio, so capture it here before auto-gain.
-    _last_capture_audio = audio
+    # The clip voice-ID scores for this utterance (_ambient_learn_from_gated,
+    # the learn gate, the follow-up window, the media / room-TV gates):
+    # VOICE_ID_CLIP 'raw' (v3.0.26) = record_speech's frames before noise
+    # suppression / AGC, the form the voiceprint was enrolled from;
+    # 'processed' = this pre-auto-gain clip as before. resemblyzer wants
+    # natural, un-normalized audio either way, so it is taken before auto-gain.
+    _last_capture_audio = _voice_clip_for(audio)
     _last_capture_sr = SAMPLE_RATE
-    # Media gate: read the PC's playback level now, while Whisper decodes.
-    _media_probe_start(audio)
+    _last_capture_stt[0] = audio
+    # Media gate: read the PC's playback level now, while Whisper decodes
+    # (keyed on the buffer the gate will check).
+    _media_probe_start(_last_capture_audio)
 
     # CONSERVATIVE auto-gain: a quiet mic records speech too softly for Whisper
     # (empty transcript). Boost a sub-target buffer toward a usable peak just
     # before transcription; a no-op for already-loud/normal audio.
-    audio, _ag = apply_capture_auto_gain(audio, _last_recording_peak)
-    if _ag > 1.0:
-        print(f"  [auto-gain] quiet input rms={_last_recording_peak:.4f} "
-              f"-> x{_ag:.1f}")
+    audio, _ag = _capture_auto_gain_logged(audio)
 
     print("  Transcribing…")
     _prof("stt_start")
@@ -53112,6 +53627,10 @@ def _capture_utterance(injected_text, memory):
               f"({len(text or '')} chars)")
         set_state("idle")
         return None
+    # Ambient dedupe (AMBIENT_MAIN_DEDUPE): the ambient tap skipped the
+    # batches this capture covered; it keeps this transcript instead of
+    # decoding the same audio again. Never blocks, never raises.
+    _ambient_offer_main_transcript(text, conf)
     return text, conf
 
 
@@ -53652,6 +54171,7 @@ def _handle_sleep_standby(injected_text: str | None):
     # Inject/neural paths have no real capture; the mic path below overwrites.
     _last_capture_audio = None
     _last_capture_sr = 0
+    _last_capture_stt[0] = None
     # The idle listen's queued-work baseline, BEFORE the drain below (see
     # _idle_work_baseline).
     _work_sig_top = _pending_work_signature()
@@ -53709,26 +54229,25 @@ def _handle_sleep_standby(injected_text: str | None):
         _capture_yield_reason[0] = None   # standby just re-loops either way
         if audio is None or len(audio) < SAMPLE_RATE * 0.4:
             return None
-        # The RAW capture (pre auto-gain), published the way _capture_utterance
-        # does, so a command carried out of this wake gets voice-ID, the learn
-        # gate and the background-audio learner on its real audio.
-        _last_capture_audio = audio
+        # The voice-ID clip (VOICE_ID_CLIP, see _capture_utterance), published
+        # the way _capture_utterance does, so a command carried out of this
+        # wake gets voice-ID, the learn gate and the background-audio learner
+        # on its real audio.
+        _last_capture_audio = _voice_clip_for(audio)
         _last_capture_sr = SAMPLE_RATE
+        _last_capture_stt[0] = audio
         # Media gate: a command carried out of this wake is checked too.
-        _media_probe_start(audio)
+        _media_probe_start(_last_capture_audio)
         # Feed the chunk to the spectral music detector so the standby loop
         # can spot sustained song audio and refuse lyric near-misses on the
-        # wake-word check below. Fed the RAW audio (pre auto-gain) so the
+        # wake-word check below. Fed the clip before auto-gain so the
         # music-refuse guard's tuning is unaffected by the normalization below.
         _audio_music_feed(audio, SAMPLE_RATE)
         # CONSERVATIVE auto-gain: on a QUIET mic the captured buffer is too soft
         # for the wake check — Whisper returns '' and the neural detector never
         # fires, so "JARVIS" is missed. Boost a sub-target buffer toward a usable
         # peak BEFORE both wake paths; a no-op for already-loud/normal audio.
-        audio, _ag = apply_capture_auto_gain(audio, _last_recording_peak)
-        if _ag > 1.0:
-            print(f"  [auto-gain] quiet input rms={_last_recording_peak:.4f} "
-                  f"-> x{_ag:.1f}")
+        audio, _ag = _capture_auto_gain_logged(audio)
         # ── EXPERIMENTAL: neural wake detector (WAKE_WORD_AUTOSTART) ──────────
         # Off by default: _standby_wake_detected() returns None unless the flag
         # is on AND openWakeWord/Porcupine import, in which case the line below
@@ -53765,6 +54284,10 @@ def _handle_sleep_standby(injected_text: str | None):
             print(f"  [mic-mute] muted during transcription — transcript "
                   f"dropped ({len(text or '')} chars)")
             return None
+        # Ambient dedupe (see _capture_utterance): a real decode only, never
+        # the neural detector's stand-in text.
+        if _wake_hit is None:
+            _ambient_offer_main_transcript(text, _wake_conf)
     # Known-device speech (core/device_speech_filter.py): a line a device in
     # the room speaks can never wake JARVIS and is never fed to the ambient
     # learner. Checked BEFORE the wake match — a device boot line led by the
@@ -53827,6 +54350,8 @@ def _handle_sleep_standby(injected_text: str | None):
         except Exception:
             pass
         print("  [wake] Waking up")
+        if injected_text is None:
+            _vad_floor_note_turn()           # the [vad-floor] turn margin
         # Owner-only learning: a standby wake opens the follow-up window, so
         # the conversation it starts can teach (core/learn_gate.py) -- unless
         # the wake capture is confidently someone else's voice (2026-10-01).
@@ -56412,6 +56937,8 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                 print(f"  You:    {text}")
                 _tt("mark", "you")
                 _eot_shadow_flush()   # R7: this owner turn's [eot-shadow] line
+                if _injected_text is None:
+                    _vad_floor_note_turn()   # the [vad-floor] turn margin
                 # The day's first accepted owner turn is its wake event, the
                 # morning chain's trigger (B096). Stamped BEFORE the turn is
                 # marked just below (the silence snapshot reads his previous

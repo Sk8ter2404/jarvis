@@ -182,9 +182,12 @@ class DetectFaceModeTests(_Base):
         self._detect(cas, "turbo")
         self.assertEqual(set(seen), {(720, 1280)})
 
-    def test_shipped_default_is_shadow_at_a_low_rate(self):
+    def test_shipped_default_is_off_and_shadow_stays_low_rate(self):
+        # v3.0.26: the shadow run is over (the cheap path agreed on presence
+        # only 76 % of the time, 11-13..11-17), so the default is the old
+        # full-resolution path; the knobs stay valid for a later re-run.
         from core import config
-        self.assertEqual(getattr(config, "FACE_DETECT_FAST_MODE", None), "shadow")
+        self.assertEqual(getattr(config, "FACE_DETECT_FAST_MODE", None), "off")
         self.assertGreaterEqual(config.FACE_DETECT_SHADOW_EVERY_N, 10)
         self.assertLess(config.FACE_DETECT_FAST_WIDTH, 1280)
         self.assertLess(config.FACE_DETECT_FAST_MIN_FRAC, 0.07,

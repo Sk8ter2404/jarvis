@@ -566,6 +566,17 @@ AMBIENT_SCREEN_VLM_ENABLED = False
 #   transcribed and kept, in order, once your sentence is done. False by
 #   default. Set via user_settings.json; applies on the next daemon start.
 AMBIENT_STT_YIELD = False
+# AMBIENT_MAIN_DEDUPE (v3.0.26) — on the record_speech tap path the ambient
+#   mic daemon hears the SAME frames as the main loop, and the main loop
+#   already decodes every capture (asleep too): the 11-16 overnight session
+#   transcribed TV around the clock twice (12,505 kept batches, 881 in one
+#   hour while he slept). 'on' (default): a 2.5 s batch mostly inside a
+#   main-loop capture is not decoded again; the main loop hands the daemon its
+#   own transcript of that capture (same gates, the same transcript log; no
+#   wake nudge - the main loop heard it). Audio between captures is decoded
+#   as before. 'off' = every batch is decoded, as before. Applies on the
+#   next daemon start.
+AMBIENT_MAIN_DEDUPE = "on"
 # AMBIENT_LEARN_FROM_EVERYONE — overheard speech from a voice that is NOT the
 #   enrolled owner (a lecture, a meeting whose people agreed to it) still
 #   teaches facts, through the same media / short-fragment / speech-validity /
@@ -1386,6 +1397,20 @@ STT_ENGINE                 = "whisper"   # 'whisper' | 'parakeet'
 #            name ("Jervis", "Travis", "Jerry", "Gary", "Jersey")
 #   'always' the old behaviour      'off' never
 STT_RESCUE_NO_WAKE         = "hint"
+# STT_RESCUE_EMPTY (v3.0.26): when Parakeet hears NOTHING, Whisper used to
+# decode the clip again every time. 11-13..11-17: 1,686 such rescues made 6
+# usable lines; on noise Whisper hallucinates "you" / "Thank you." and the
+# turns a rescue landed in paid 1.5-2.4 s.
+#   'speech' (default) only when the speech detector (Silero, the rescue's
+#            own head check) finds at least STT_RESCUE_EMPTY_MIN_SPEECH_S of
+#            speech anywhere in the clip, pre-roll included - or cannot tell (then it
+#            rescues: a slower turn, never a lost one)
+#   'speech_awake' as 'speech' while awake; asleep (sleep mode) never: the
+#            quiet-name rescue is given up for no TV rescues. Not shipped;
+#            decide after a day of the "[stt] empty rescue skipped" counts.
+#   'always' the old behaviour      'off' never
+STT_RESCUE_EMPTY           = "speech"
+STT_RESCUE_EMPTY_MIN_SPEECH_S = 0.25
 # ALARM_SET_FAST_PATH (2026-11-12): a plain "set an alarm for <time>" / "wake
 # me up at <time>" is set by the alarm skill with no brain call
 # (core/alarm_intent.py). The same line was passed through by the brain once
@@ -1448,11 +1473,14 @@ VOICE_ID_DEVICE            = "cpu"
 # transcribed twice (Parakeet, then a Whisper "rescue"), and the ambient
 # listener ran Whisper on every 2.5 s of lyrics: ~35 % of the 1650 and ~39
 # CPU-s a minute. MUSIC_GATE_MODE:
-#   'off'    (default) today's behaviour, nothing measured; nobody read the
-#            shadow counter lines, so the diagnostic is opt-in (2026-10-12);
-#   'shadow' today's behaviour, plus one "[music-gate]" counter
-#            line per minute with music: what 'on' would have skipped and
-#            whether any of it would have been an owner turn ("lost");
+#   'off'    today's behaviour, nothing measured;
+#   'shadow' (default since v3.0.26: the 11-16 overnight session transcribed
+#            TV/music around the clock with the gate off - 1,342 "media/music
+#            playing" skips AFTER the decode - so one live day of the shadow
+#            count decides 'on') today's behaviour, plus one "[music-gate]"
+#            counter line per minute with music: what 'on' would have
+#            skipped and whether any of it would have been an owner turn
+#            ("lost");
 #   'on'     over music: the ambient listener transcribes nothing, and
 #            Parakeet's rescue runs only with a "Jarvis"-like word or the
 #            owner's voice behind it (which also shortens the deaf gap
@@ -1461,7 +1489,7 @@ VOICE_ID_DEVICE            = "cpu"
 # gate's voice check) keep running in every mode. No mode shortens a capture:
 # nothing is recorded between captures, so more, shorter captures over music
 # would mean more deaf gaps (core/music_gate.py).
-MUSIC_GATE_MODE            = "off"
+MUSIC_GATE_MODE            = "shadow"
 
 # ─── Listening over videos (core/listen_media.py, 2026-10-05) ───────────
 # Over a video in wake-word mode his "Jarvis, ..." landed inside a capture
@@ -2681,6 +2709,28 @@ FOCUS_MODE_ENABLED = True
 VAD_THRESHOLD = 0.008              # mic RMS for speech; raise to ignore noise
 SILENCE_SECS  = 1.4                # seconds of quiet before processing
 SAMPLE_RATE   = 16000              # mic capture sample rate (Hz)
+# VAD floor (v3.0.26, core/capture_chain.py). VAD_THRESHOLD sat on the room's
+# own floor (idle chunks 0.004-0.008 in the 11-13..11-17 logs), so ~5,800
+# noise captures in two days were decoded. The START of a main-loop listen's
+# capture (never an in-turn capture, never its end-of-speech silence count)
+# now needs max(VAD_THRESHOLD, min(VAD_THRESHOLD x VAD_FLOOR_MAX_RATIO,
+# VAD_FLOOR_FACTOR x the 20th-percentile RMS of the last ~60 s of idle
+# chunks)) - VAD_THRESHOLD itself until ~10 s of idle audio was measured, and
+# around JARVIS's own playback (the AEC duck note above). The cap: the
+# quietest of 76 logged owner turns peaked at 0.0104; 1.25 x 0.008 = 0.010.
+#   VAD_FLOOR_MODE  'on' | 'shadow' (default until one live day shows 0
+#                   "of them turns" on the line: VAD_THRESHOLD starts every
+#                   capture; the 10-minute "[vad-floor]" line counts the
+#                   captures 'on' would not have started and how many became
+#                   turns) | 'off' (no floor, no counting)
+# VAD_START_CONFIRM_CHUNKS: chunks in a row over the start threshold before a
+#   capture starts (the pre-roll keeps the onset). 1 = today's (default; the
+#   "[vad-floor]" line counts one-chunk trips and how many became turns); 2 =
+#   a lone click or knock no longer starts a capture.
+VAD_FLOOR_MODE           = "shadow"
+VAD_FLOOR_FACTOR         = 2.5
+VAD_FLOOR_MAX_RATIO      = 1.25
+VAD_START_CONFIRM_CHUNKS = 1
 
 
 # ─── Double-clap trigger (skills/clap_trigger.py, core/clap_detector.py) ─
@@ -2812,6 +2862,23 @@ CAPTURE_AUTO_GAIN_ENABLED     = True
 CAPTURE_AUTO_GAIN_TARGET_PEAK = 0.25   # boost quiet audio up toward this peak
 CAPTURE_AUTO_GAIN_MAX         = 10.0   # never multiply by more than this
 CAPTURE_AUTO_GAIN_NOISE_FLOOR = 0.005  # peak ≤ this = silence; never amplify
+# CAPTURE_AUTO_GAIN_BASIS (v3.0.26): what the gain is computed FROM.
+#   'clip' (default) the loudest 64 ms chunk of the clip being boosted (the
+#          noise-suppressed, AGC'd clip STT hears); the raw peak still guards
+#          silence (NOISE_FLOOR above). Then a soft limiter, not a hard clip.
+#   'raw'  the old rule: TARGET / the RAW capture peak, applied to the
+#          already AGC'd clip (up to 8x), then hard-clipped - 3,725 of 5,773
+#          logged decisions sat at x10 (11-13..11-17).
+CAPTURE_AUTO_GAIN_BASIS       = "clip"
+# VOICE_ID_CLIP (v3.0.26): the audio voice-ID scores for a turn (follow-up
+# window, learn gate, media / room-TV / music gates, the ambient learner).
+#   'raw' (default) the capture's frames BEFORE noise suppression / AGC - the
+#         form the voiceprint was enrolled from (get_mic_buffer is raw);
+#         the echo-cancelled copy while MEDIA_AEC_MODE cancels;
+#   'processed' the old clip: STT's noise-suppressed, AGC'd copy (his own
+#         wake turns scored a median 0.69 against the 0.72 match line).
+# STT always hears the processed clip; only the voice check changes.
+VOICE_ID_CLIP                 = "raw"
 
 
 # ─── Audio processor tuning (AEC fallback + AGC flatness gate) ─────────
@@ -2976,7 +3043,11 @@ FACE_TRACK_IDLE_HZ          = 1.0
 #   resolution decides and 1 in FACE_DETECT_SHADOW_EVERY_N detections also
 #   runs the cheap path, logging agreement (counts + ms, no images) every
 #   FACE_DETECT_SHADOW_REPORT_N samples; "on" = the cheap path decides.
-FACE_DETECT_FAST_MODE       = "shadow"
+#   "off" by default since v3.0.26: the shadow run is over (1,123 reports,
+#   33,690 samples 11-13..11-17: the cheap path agreed on presence only 76 %
+#   of the time, mostly missing faces, and was barely faster - 44.7 vs 46.7
+#   ms mean of the medians), so it only cost CPU and log lines.
+FACE_DETECT_FAST_MODE       = "off"
 FACE_DETECT_FAST_WIDTH      = 640
 FACE_DETECT_FAST_MIN_FRAC   = 0.05
 FACE_DETECT_SHADOW_EVERY_N  = 20
@@ -4145,7 +4216,10 @@ AUDIO_AGC            = True
 # When True, "[vad] peak RMS = X" prints after each utterance so you can
 # tune VAD_THRESHOLD precisely. Flipped at runtime via the tray Debug
 # Mode toggle, which mirrors into _debug_mode[0] in core/state.py.
-VAD_DEBUG = True
+# False since v3.0.26: with it on, the per-capture [vad] / [auto-gain] lines
+# were most of a 30,000-line day (11-16 18:55 session). The 10-minute
+# "[vad-floor]" line (core/capture_chain.CaptureBook) keeps the counts.
+VAD_DEBUG = False
 
 
 # ─── Standby auto-engage loop (skills/standby_audio_detect) ────────────
@@ -4389,6 +4463,54 @@ def _merge_safety_list(key: str, val, cur):
 # the existing constant's type, and leave the default on any error. A missing
 # file (fresh install, before the GUI ever ran) is a silent no-op; a file that
 # exists but can't be read is reported (above).
+# One-time settings migration (v3.0.26). VAD_DEBUG used to ship True, and every
+# Settings-GUI save before then froze that old default into the owner's file,
+# so flipping the shipped default alone left the per-capture "[vad] peak" and
+# "[auto-gain]" lines printing live. A VAD_DEBUG true found WITHOUT the marker
+# below is that frozen default: it is turned off ONCE and the marker recorded
+# in the file ("_migrated"), so a later deliberate true is kept for good.
+# The write is best effort; the in-memory value is migrated either way, and a
+# failed write just retries on the next start.
+_SETTINGS_MIGRATIONS = (
+    ("vad_debug_default_off_3.0.26", "VAD_DEBUG", True, False),
+)
+
+
+def _migrate_stale_default_overrides(path: str, data: dict) -> None:
+    try:
+        done = data.get("_migrated")
+        if not isinstance(done, list):
+            done = []
+        changed = False
+        for tag, key, stale, fresh in _SETTINGS_MIGRATIONS:
+            if tag in done:
+                continue
+            if key in data and data[key] is stale:
+                data[key] = fresh
+                print(f"[settings] migrated {key}: {stale} was the old "
+                      f"shipped default, now {fresh} (set it again to keep)")
+            done = done + [tag]
+            changed = True
+        if not changed:
+            return
+        data["_migrated"] = done
+        import tempfile
+        d = os.path.dirname(path) or "."
+        fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp", prefix="usettings_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, sort_keys=True)
+                f.write("\n")
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
 def _apply_user_settings() -> None:
     global _USER_SETTINGS_ERROR
     _USER_SETTINGS_ERROR = None
@@ -4430,6 +4552,7 @@ def _apply_user_settings() -> None:
     _LEGACY_KEY_ALIASES = {
         "AMBIENT_LISTENING_ENABLED": "AMBIENT_LISTEN_ENABLED",
     }
+    _migrate_stale_default_overrides(path, data)
     g = globals()
     for key, val in data.items():
         key = _LEGACY_KEY_ALIASES.get(key, key)

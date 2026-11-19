@@ -73,6 +73,9 @@ def _safe_exc(prefix: str, exc: BaseException) -> str:
     return f"{prefix}: {cls}: {msg}"
 
 
+_NR_MIN_SAMPLES = 1024   # noisereduce's n_fft: shorter clips take spectral subtraction
+
+
 class AudioProcessor:
     """Three-layer real-time processor for mono float32 audio at a fixed
     sample rate. Thread-safe for process() + feed_playback() interleave."""
@@ -482,7 +485,11 @@ class AudioProcessor:
         # can leave its internal numpy arrays in a state that SIGSEGV's
         # on the next __str__ if it raises. Spectral subtraction is
         # pure numpy and handles empty/silent input deterministically.
-        if audio.size < 256:
+        # v3.0.26: under noisereduce's own 1,024-sample FFT window (a partial
+        # last chunk) it warns "nperseg is greater than input length" every
+        # session and estimates its noise from a sliver; spectral subtraction
+        # is the defined path for those.
+        if audio.size < _NR_MIN_SAMPLES:
             return self._spectral_subtract(audio)
         try:
             peak = float(np.max(np.abs(audio)))
