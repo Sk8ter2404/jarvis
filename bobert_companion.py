@@ -19194,11 +19194,16 @@ def _ambient_offer_main_transcript(text, conf) -> None:
     the skill only queues it (bounded) for its own thread. Never blocks,
     never raises."""
     try:
+        if _capture_spans and len(_capture_spans[-1]) > 2:
+            _capture_spans[-1][2] = True     # decoded: the tap may skip it
+    except Exception:
+        pass
+    try:
         mod = sys.modules.get("skill_ambient_listen")
         fn = getattr(mod, "note_main_transcript", None) if mod else None
         if not callable(fn):
             return
-        span = _capture_spans[-1] if _capture_spans else None
+        span = (tuple(_capture_spans[-1][:2]) if _capture_spans else None)
         fn(text, conf if isinstance(conf, dict) else {},
            float(_last_recording_peak or 0.0), _last_capture_audio,
            int(_last_capture_sr or 0), span)
@@ -20375,12 +20380,24 @@ def capture_spans_since(t0: float) -> list:
     that ended after ``t0``, plus the one recording now as (start, None).
     For skills/ambient_listen's dedupe. Never raises ([])."""
     try:
-        out = [(float(s), float(e)) for s, e in list(_capture_spans)
-               if float(e) >= float(t0)]
+        out = [(float(sp[0]), float(sp[1])) for sp in list(_capture_spans)
+               if float(sp[1]) >= float(t0)]
         live = _capture_open_since[0]
         if live is not None:
             out.append((float(live), None))
         return out
+    except Exception:
+        return []
+
+
+def capture_spans_offered_since(t0: float) -> list:
+    """The subset of capture_spans_since the main loop DECODED and handed a
+    transcript for (even an empty one): a capture it dropped (too short,
+    muted, yielded) is never in it, so the ambient tap decodes those frames
+    itself instead of losing them. Never raises ([])."""
+    try:
+        return [(float(sp[0]), float(sp[1])) for sp in list(_capture_spans)
+                if len(sp) > 2 and sp[2] and float(sp[1]) >= float(t0)]
     except Exception:
         return []
 
@@ -20392,7 +20409,7 @@ def _capture_span_close() -> None:
         start = _capture_open_since[0]
         if start is not None:
             _capture_open_since[0] = None
-            _capture_spans.append((float(start), time.monotonic()))
+            _capture_spans.append([float(start), time.monotonic(), False])
     except Exception:
         pass
 

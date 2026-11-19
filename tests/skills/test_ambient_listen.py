@@ -1107,6 +1107,39 @@ class MainLoopDedupeTests(_TmpDirMixin, unittest.TestCase):
             rows = [json.loads(line) for line in f if line.strip()]
         self.assertEqual(rows[-1]["via"], "main-loop")
 
+    def test_a_capture_the_main_loop_never_decoded_is_decoded_here(self):
+        # The span covers the batch but the host never offered a transcript
+        # for it (a dropped capture): parked, then decoded after the park.
+        bc = self._tap_bobert()
+        bc.capture_spans_offered_since = lambda t0: []
+        self.mod._dedupe_stats.update({"covered": 0, "reused": 0})
+        with mock.patch.object(self.mod, "_DEDUPE_PARK_S", 0.0):
+            self._run(bc, spans=lambda now: [(now - 30.0, now + 30.0)],
+                      rounds=6)
+        bc.transcribe.assert_called()
+        self.assertEqual(self.mod._buffer[-1]["text"], "tapped speech")
+        self.assertEqual(self.mod._dedupe_stats.get("released"), 1)
+
+    def test_a_decoded_capture_is_not_decoded_again_once_offered(self):
+        bc = self._tap_bobert()
+        bc.capture_spans_offered_since = lambda t0: [
+            (time.monotonic() - 30.0, time.monotonic() + 30.0)]
+        with mock.patch.object(self.mod, "_DEDUPE_PARK_S", 0.0):
+            self._run(bc, spans=lambda now: [(now - 30.0, now + 30.0)],
+                      rounds=6)
+        bc.transcribe.assert_not_called()
+
+    def test_a_capture_offered_during_the_park_is_not_decoded(self):
+        bc = self._tap_bobert()
+        offered = []
+        bc.capture_spans_offered_since = lambda t0: list(offered)
+        spans = lambda now: [(now - 30.0, now + 30.0)]
+        with mock.patch.object(self.mod, "_DEDUPE_PARK_S", 60.0):
+            self._run(bc, spans=spans, rounds=3,
+                      offer=lambda: offered.append((time.monotonic() - 30.0,
+                                                    time.monotonic() + 30.0)))
+        bc.transcribe.assert_not_called()
+
     def test_audio_between_captures_is_decoded_as_before(self):
         bc = self._tap_bobert()
         self._run(bc, spans=lambda now: [(now - 300.0, now - 200.0)])

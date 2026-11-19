@@ -1361,7 +1361,7 @@ STT_RESCUE_NO_WAKE         = "hint"
 # turns a rescue landed in paid 1.5-2.4 s.
 #   'speech' (default) only when the speech detector (Silero, the rescue's
 #            own head check) finds at least STT_RESCUE_EMPTY_MIN_SPEECH_S of
-#            speech in the clip past its pre-roll - or cannot tell (then it
+#            speech anywhere in the clip, pre-roll included - or cannot tell (then it
 #            rescues: a slower turn, never a lost one)
 #   'always' the old behaviour      'off' never
 STT_RESCUE_EMPTY           = "speech"
@@ -2648,7 +2648,8 @@ SAMPLE_RATE   = 16000              # mic capture sample rate (Hz)
 # chunks)) - VAD_THRESHOLD itself until ~10 s of idle audio was measured, and
 # around JARVIS's own playback (the AEC duck note above). The cap: the
 # quietest of 76 logged owner turns peaked at 0.0104; 1.25 x 0.008 = 0.010.
-#   VAD_FLOOR_MODE  'on' (default) | 'shadow' (VAD_THRESHOLD starts every
+#   VAD_FLOOR_MODE  'on' | 'shadow' (default until one live day shows 0
+#                   "of them turns" on the line: VAD_THRESHOLD starts every
 #                   capture; the 10-minute "[vad-floor]" line counts the
 #                   captures 'on' would not have started and how many became
 #                   turns) | 'off' (no floor, no counting)
@@ -2656,7 +2657,7 @@ SAMPLE_RATE   = 16000              # mic capture sample rate (Hz)
 #   capture starts (the pre-roll keeps the onset). 1 = today's (default; the
 #   "[vad-floor]" line counts one-chunk trips and how many became turns); 2 =
 #   a lone click or knock no longer starts a capture.
-VAD_FLOOR_MODE           = "on"
+VAD_FLOOR_MODE           = "shadow"
 VAD_FLOOR_FACTOR         = 2.5
 VAD_FLOOR_MAX_RATIO      = 1.25
 VAD_START_CONFIRM_CHUNKS = 1
@@ -4392,6 +4393,54 @@ def _merge_safety_list(key: str, val, cur):
 # the existing constant's type, and leave the default on any error. A missing
 # file (fresh install, before the GUI ever ran) is a silent no-op; a file that
 # exists but can't be read is reported (above).
+# One-time settings migration (v3.0.26). VAD_DEBUG used to ship True, and every
+# Settings-GUI save before then froze that old default into the owner's file,
+# so flipping the shipped default alone left the per-capture "[vad] peak" and
+# "[auto-gain]" lines printing live. A VAD_DEBUG true found WITHOUT the marker
+# below is that frozen default: it is turned off ONCE and the marker recorded
+# in the file ("_migrated"), so a later deliberate true is kept for good.
+# The write is best effort; the in-memory value is migrated either way, and a
+# failed write just retries on the next start.
+_SETTINGS_MIGRATIONS = (
+    ("vad_debug_default_off_3.0.26", "VAD_DEBUG", True, False),
+)
+
+
+def _migrate_stale_default_overrides(path: str, data: dict) -> None:
+    try:
+        done = data.get("_migrated")
+        if not isinstance(done, list):
+            done = []
+        changed = False
+        for tag, key, stale, fresh in _SETTINGS_MIGRATIONS:
+            if tag in done:
+                continue
+            if key in data and data[key] is stale:
+                data[key] = fresh
+                print(f"[settings] migrated {key}: {stale} was the old "
+                      f"shipped default, now {fresh} (set it again to keep)")
+            done = done + [tag]
+            changed = True
+        if not changed:
+            return
+        data["_migrated"] = done
+        import tempfile
+        d = os.path.dirname(path) or "."
+        fd, tmp = tempfile.mkstemp(dir=d, suffix=".tmp", prefix="usettings_")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2, sort_keys=True)
+                f.write("\n")
+            os.replace(tmp, path)
+        except Exception:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
 def _apply_user_settings() -> None:
     global _USER_SETTINGS_ERROR
     _USER_SETTINGS_ERROR = None
@@ -4433,6 +4482,7 @@ def _apply_user_settings() -> None:
     _LEGACY_KEY_ALIASES = {
         "AMBIENT_LISTENING_ENABLED": "AMBIENT_LISTEN_ENABLED",
     }
+    _migrate_stale_default_overrides(path, data)
     g = globals()
     for key, val in data.items():
         key = _LEGACY_KEY_ALIASES.get(key, key)

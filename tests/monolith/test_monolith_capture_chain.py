@@ -5,7 +5,8 @@ record_speech runs for real over tests/test_speculative_stt.py's fake mic
 stream (reused, never re-implemented); only the hardware / UI edges are
 stubbed. Pinned here:
 
-  * VAD floor (VAD_FLOOR_MODE 'on', shipped): a main-loop listen's capture
+  * VAD floor (VAD_FLOOR_MODE 'on'; ships 'shadow' until one live day's
+    '[vad-floor]' line shows 0 turns lost): a main-loop listen's capture
     starts only over the measured floor (capped at 1.25 x VAD_THRESHOLD),
     the chunks under it stay in the pre-roll (the onset is kept), and the
     floor never applies to an in-turn capture, around JARVIS's playback, or
@@ -41,8 +42,13 @@ _CHUNK = _spec._CHUNK
 
 @requires_monolith
 class _CaptureBase(MonolithGlobalsTestCase):
+    # The floor mode these tests run under; None = the shipped default.
+    FLOOR_MODE = "on"
+
     def setUp(self):
         super().setUp()
+        if self.FLOOR_MODE is not None:
+            self._p(self.bc, "VAD_FLOOR_MODE", self.FLOOR_MODE)
         import numpy as np
         from core import capture_chain as cc
         self.np, self.cc = np, cc
@@ -108,6 +114,20 @@ class _CaptureBase(MonolithGlobalsTestCase):
 
     def _preroll(self):
         return self.bc._last_capture_preroll[0][1]
+
+
+class VadFloorShippedDefaultTests(_CaptureBase):
+    """The shipped mode is 'shadow': a quiet utterance over VAD_THRESHOLD
+    still starts a capture (nothing can go deaf), and the would-be hold is
+    only counted."""
+    FLOOR_MODE = None
+
+    def test_shipped_mode_is_shadow_and_starts_on_the_base(self):
+        self.assertEqual(self.bc.VAD_FLOOR_MODE, "shadow")
+        self._prime(0.0045)
+        self.assertIsNotNone(self._capture([0.009] * 20))
+        self.assertAlmostEqual(self._vad_meta()["start_thr"], 0.008)
+        self.assertTrue(self._vad_meta()["would_hold"])
 
 
 class VadFloorCaptureTests(_CaptureBase):
@@ -320,6 +340,21 @@ class VoiceClipTests(_CaptureBase):
         self.assertAlmostEqual(peak, 0.012)
         self.assertIs(clip, raw)
         self.assertEqual((sr, span), (16000, (1.0, 2.0)))
+
+    def test_only_a_decoded_capture_joins_the_offered_spans(self):
+        # A capture the main loop dropped is a span (covers the batch) but
+        # never an offered one; offering a transcript marks the last span.
+        bc = self.bc
+        bc._capture_spans.clear()
+        bc._capture_open_since[0] = bc.time.monotonic() - 1.0
+        bc._capture_span_close()
+        t0 = bc.time.monotonic() - 60.0
+        self.assertEqual(len(bc.capture_spans_since(t0)), 1)
+        self.assertEqual(bc.capture_spans_offered_since(t0), [])
+        bc._ambient_offer_main_transcript("", {})
+        self.assertEqual(len(bc.capture_spans_offered_since(t0)), 1)
+        self.assertEqual(bc.capture_spans_offered_since(
+            bc.time.monotonic() + 60.0), [])
 
     def test_standby_publishes_the_raw_clip_and_hands_over_its_text(self):
         np = self.np

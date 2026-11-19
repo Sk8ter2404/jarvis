@@ -135,6 +135,12 @@ AMBIENT_MAIN_DEDUPE_DEFAULT = "on"
 _DEDUPE_MIN_COVER = 0.6
 _DEDUPE_TOL_S = 0.3
 _DEDUPE_LOG_EVERY = 200
+# A batch inside a capture the main loop has not (yet) handed a transcript
+# for is parked this long before it is decoded here after all: a capture the
+# main loop dropped (too short, muted, yielded) never produces one, and its
+# frames must not vanish from the log.
+_DEDUPE_PARK_S = 8.0
+_DEDUPE_PARK_MAX = 6
 _main_transcripts: "deque[tuple]" = deque(maxlen=16)
 _dedupe_live: list = [False]
 _dedupe_stats: dict = {"covered": 0, "reused": 0}
@@ -203,6 +209,20 @@ def _host_spans(b, t0: float) -> list:
         return list(fn(float(t0))) if callable(fn) else []
     except Exception:
         return []
+
+
+def _host_offered_spans(b, t0: float):
+    """The host's capture spans since ``t0`` that it DECODED and handed a
+    transcript for (bobert_companion.capture_spans_offered_since), or None on
+    a host without it (then every covering span counts, as before)."""
+    try:
+        fn = getattr(b, "capture_spans_offered_since", None)
+        if not callable(fn):
+            return None
+        out = fn(float(t0))
+        return list(out) if isinstance(out, (list, tuple)) else None
+    except Exception:
+        return None
 
 
 def _note_dedupe(kind: str) -> None:
@@ -1246,6 +1266,9 @@ def _worker_loop() -> None:
     # AMBIENT_STT_YIELD: None when the flag is off (see _SttYield).
     stt_yield = (_SttYield(b, "ambient-listen")
                  if getattr(b, "AMBIENT_STT_YIELD", False) is True else None)
+    # Covered batches whose capture the main loop has not offered a
+    # transcript for yet: (audio, stamps, parked monotonic time).
+    parked_cov: list = []
     # AMBIENT_MAIN_DEDUPE: only on the tap path (the main loop heard these
     # very frames); read once per worker start, like AMBIENT_STT_YIELD.
     dedupe = tap_q is not None and _dedupe_on()
@@ -1367,6 +1390,38 @@ def _worker_loop() -> None:
         finally:
             _music_gate_report(b, gate, out)
 
+    def _release_parked(audio_p) -> None:
+        """Decode a parked batch here after all (the main loop never did)."""
+        _note_dedupe("released")
+        rms_p = (float(np.sqrt(np.mean(audio_p * audio_p)))
+                 if audio_p.size else 0.0)
+        if rms_p >= 0.003:
+            _keep_batch(_apply_audio_processing(
+                audio_p, sample_rate, enable_aec=False,
+                record_mic_stats=False, private=True), rms_p)
+
+    def _resolve_parked() -> None:
+        """Parked covered batches: dropped once the main loop's transcript of
+        their capture was offered (counted as deduped); decoded here after
+        _DEDUPE_PARK_S (or when more than _DEDUPE_PARK_MAX wait) because the
+        main loop never decoded that capture."""
+        if not parked_cov:
+            return
+        now_m = time.monotonic()
+        keep = []
+        for item in parked_cov:
+            audio_p, stamps_p, t_park = item
+            offered = _host_offered_spans(b, float(stamps_p[0][0]) - 2.0)
+            if offered is None or _batch_cover(stamps_p, offered)                     >= _DEDUPE_MIN_COVER:
+                _note_dedupe("covered")
+            elif now_m - t_park >= _DEDUPE_PARK_S:
+                _release_parked(audio_p)
+            else:
+                keep.append(item)
+        parked_cov[:] = keep
+        while len(parked_cov) > _DEDUPE_PARK_MAX:
+            _release_parked(parked_cov.pop(0)[0])
+
     try:
         while not _stop_evt.is_set():
             # Sample own-voice playback every tick (~0.1 s) so the wake
@@ -1385,6 +1440,7 @@ def _worker_loop() -> None:
                     audio_q.clear()
                 pending.clear()
                 pending_t.clear()
+                parked_cov.clear()
                 _main_transcripts.clear()
                 pending_samples = 0
                 if not _paused[0]:
@@ -1409,6 +1465,7 @@ def _worker_loop() -> None:
                 except IndexError:
                     break
                 _keep_main(*item)
+            _resolve_parked()
 
             with q_lock:
                 while audio_q:
@@ -1435,7 +1492,13 @@ def _worker_loop() -> None:
             if dedupe and stamps:
                 spans = _host_spans(b, float(stamps[0][0]) - 2.0)
                 if _batch_cover(stamps, spans) >= _DEDUPE_MIN_COVER:
-                    _note_dedupe("covered")
+                    offered = _host_offered_spans(b, float(stamps[0][0]) - 2.0)
+                    if offered is None or _batch_cover(stamps, offered)                             >= _DEDUPE_MIN_COVER:
+                        _note_dedupe("covered")
+                    else:
+                        # The main loop has not (yet) decoded this capture:
+                        # wait for its transcript, else decode it here.
+                        parked_cov.append((audio, stamps, time.monotonic()))
                     _prev_mic_batch[0] = None
                     _heartbeat = time.time()
                     continue
@@ -1473,6 +1536,7 @@ def _worker_loop() -> None:
     finally:
         _dedupe_live[0] = False
         _main_transcripts.clear()
+        parked_cov.clear()
         # Tap path: detach from record_speech's fan-out and stop the drain
         # thread. Stream path: close our dedicated InputStream. Exactly one of
         # these is live depending on which acquisition branch ran above.

@@ -91,7 +91,7 @@ class NoiseFloorTests(unittest.TestCase):
         self.assertEqual(config.VAD_THRESHOLD, self.BASE)
         self.assertEqual(config.VAD_FLOOR_FACTOR, self.FACTOR)
         self.assertEqual(config.VAD_FLOOR_MAX_RATIO, self.RATIO)
-        self.assertEqual(config.VAD_FLOOR_MODE, "on")
+        self.assertEqual(config.VAD_FLOOR_MODE, "shadow")
         self.assertEqual(config.VAD_START_CONFIRM_CHUNKS, 1)
 
     def test_unmeasured_floor_is_the_base(self):
@@ -202,6 +202,47 @@ class CaptureBookTests(unittest.TestCase):
         self.assertIsNotNone(self._line(book, 10.0, force=True))
         book.reset()
         self.assertIsNone(self._line(book, 10_000.0, force=True))
+
+
+class StaleDebugDefaultMigrationTests(unittest.TestCase):
+    """A VAD_DEBUG true frozen into a settings file by the old shipped default
+    is turned off once; a later deliberate true is kept."""
+
+    def _run(self, doc):
+        import contextlib
+        import io
+        import json
+        import os
+        import tempfile
+        from core import config
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "user_settings.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(doc, f)
+            data = json.load(open(path, encoding="utf-8"))
+            with contextlib.redirect_stdout(io.StringIO()):
+                config._migrate_stale_default_overrides(path, data)
+            on_disk = json.load(open(path, encoding="utf-8"))
+            self.assertEqual(os.listdir(d), ["user_settings.json"])
+        return data, on_disk
+
+    def test_old_default_true_is_turned_off_and_recorded(self):
+        data, disk = self._run({"VAD_DEBUG": True, "VAD_THRESHOLD": 0.01})
+        self.assertIs(data["VAD_DEBUG"], False)
+        self.assertIs(disk["VAD_DEBUG"], False)
+        self.assertEqual(disk["VAD_THRESHOLD"], 0.01)
+        self.assertEqual(len(disk["_migrated"]), 1)
+
+    def test_a_deliberate_true_after_the_migration_is_kept(self):
+        _, disk = self._run({"VAD_DEBUG": True})
+        data, disk2 = self._run(disk | {"VAD_DEBUG": True})
+        self.assertIs(data["VAD_DEBUG"], True)
+        self.assertIs(disk2["VAD_DEBUG"], True)
+
+    def test_a_file_without_the_key_is_only_marked(self):
+        data, disk = self._run({"VAD_THRESHOLD": 0.01})
+        self.assertNotIn("VAD_DEBUG", data)
+        self.assertEqual(len(disk["_migrated"]), 1)
 
 
 if __name__ == "__main__":

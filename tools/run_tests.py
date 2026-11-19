@@ -229,8 +229,21 @@ def main(argv: list[str]) -> int:
     if selectors:
         suite = unittest.TestSuite()
         for sel in selectors:
+            sel = sel.replace("\\", "/").replace("/", ".")
+            sel = sel[:-3] if sel.endswith(".py") else sel
+            # A package-qualified selector (monolith.test_monolith_x,
+            # skills.test_x, tests/monolith/test_x.py) names its own module.
+            pkg, _dot, leaf = sel.rpartition(".")
+            if pkg:
+                if pkg == "tests":
+                    pkg = ""
+                elif pkg.startswith("tests."):
+                    pkg = pkg[len("tests."):]
+                leaf = leaf if leaf.startswith("test_") else f"test_{leaf}"
+                suite.addTests(loader.loadTestsFromName(
+                    f"tests.{pkg + '.' if pkg else ''}{leaf}"))
+                continue
             name = sel if sel.startswith("test_") else f"test_{sel}"
-            name = name[:-3] if name.endswith(".py") else name
             suite.addTests(loader.loadTestsFromName(f"tests.{name}"))
     else:
         suite = loader.discover(start_dir=_TESTS_DIR, pattern="test_*.py",
