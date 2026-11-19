@@ -926,13 +926,13 @@ SCHEMA: dict[str, dict] = {
     # 2026-11-17 (overhaul speech-mic-announce): a newly plugged microphone.
     "AUDIO_FOLLOW_NEW_MIC": {
         "tab": "hearing", "label": "Follow a newly plugged microphone",
-        "type": "bool", "default": False,
-        "help": "Off: when a microphone JARVIS has never used appears and "
-                "Windows makes it the default, JARVIS keeps the one it is on, "
-                "tells you once, and switches only when you say 'use the new "
-                "microphone'. The headset, the desk-mic fallback and any "
-                "preferred microphone are followed as always. On: JARVIS "
-                "follows any new default after a few seconds.",
+        "type": "bool", "default": True,
+        "help": "On: JARVIS follows any microphone Windows makes the default "
+                "after a few seconds. Off: when a microphone JARVIS has never "
+                "used appears, it keeps the one it is on, tells you once, and "
+                "switches only when you say 'use the new microphone'. The "
+                "headset, the desk-mic fallback and any preferred microphone "
+                "are followed as always.",
     },
     # 2026-07-08: surface the Whisper STT device/model so the v2.0.23 crash-
     # workaround is settable AND persisted — previously they lived only in

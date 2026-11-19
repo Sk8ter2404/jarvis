@@ -3885,17 +3885,17 @@ AUDIO_REPICK_STABLE_S    = 8.0     # s a new default must hold before JARVIS fol
 # ~5 min all night, against 10 real default moves the watch had already caught.
 # Log: "[audio] re-enumeration mode: ...". Read at each refresh pass.
 AUDIO_PERIODIC_REENUM    = False
-# AUDIO_FOLLOW_NEW_MIC (2026-11-17, overhaul speech-mic-announce): False = a
-# microphone that was NOT there when JARVIS started (or that he never chose
-# this session) and is not the headset / AUDIO_AUTOSWITCH_MIC_FALLBACK /
-# a PREFERRED_INPUT_DEVICES entry does NOT take the microphone over just because
-# Windows made it the default: JARVIS keeps the mic it is on, SAYS once that a new
-# one appeared, and switches only on "use the new microphone". True = follow any
-# new default after AUDIO_REPICK_STABLE_S as before. Live 11-17 17:10:23 a plugged
-# "USB microphone" became the default and JARVIS moved onto it unasked. Only while
-# the mic JARVIS is on is still present (a gone mic is always left). Log:
+# AUDIO_FOLLOW_NEW_MIC (2026-11-17, overhaul speech-mic-announce): True (default,
+# unchanged behaviour) = a new Windows default microphone is followed after
+# AUDIO_REPICK_STABLE_S, as always (a mic he picks on the Stream Deck that was off
+# at boot must work). False (opt-in) = a microphone that was NOT there when JARVIS
+# started (or that he never chose this session) and is not the headset /
+# AUDIO_AUTOSWITCH_MIC_FALLBACK / a PREFERRED_INPUT_DEVICES entry does NOT take
+# the microphone over: JARVIS keeps the mic it is on, SAYS once that a new one
+# appeared, and switches only on "use the new microphone". Only while the mic
+# JARVIS is on is still present (a gone mic is always left). Log:
 # "[audio] new microphone". Read at each refresh pass.
-AUDIO_FOLLOW_NEW_MIC     = False
+AUDIO_FOLLOW_NEW_MIC     = True
 
 
 # ─── Mic / speaker device selection (bobert_companion _refresh_devices) ─

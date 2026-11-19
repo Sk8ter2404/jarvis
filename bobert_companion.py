@@ -15722,7 +15722,7 @@ def _announce_device_changes(switches) -> None:
 # mic he has used or configured: the mics Windows listed when JARVIS started,
 # the headset / AUDIO_AUTOSWITCH_MIC_FALLBACK / PREFERRED_INPUT_DEVICES names,
 # and any mic JARVIS followed this session. Only a STRANGER is held (flag
-# AUDIO_FOLLOW_NEW_MIC, default False), and only while the mic JARVIS is on is
+# AUDIO_FOLLOW_NEW_MIC, default True = follow as before; False opts in), and only while the mic JARVIS is on is
 # still present: a gone mic is always left. The hold is applied to the endpoint
 # pair read at the top of _refresh_devices, so the rest of the pass sees a mic
 # that never moved. It ends when Windows moves the default elsewhere, the old
@@ -15759,7 +15759,7 @@ def _apply_new_mic_hold(now_eps, prev_eps, act, now: float):
     capture half stays ``prev_eps``'. Never raises (it runs in _refresh_devices;
     any error follows the default as before)."""
     try:
-        if (globals().get("AUDIO_FOLLOW_NEW_MIC", False) or act is None
+        if (globals().get("AUDIO_FOLLOW_NEW_MIC", True) or act is None
                 or prev_eps is None or now_eps is None
                 or globals().get("MICROPHONE_INDEX") is not None
                 or not now_eps[1] or not prev_eps[1]):

@@ -5,7 +5,8 @@ THE LIVE LOG. 11-17 17:09:57 a "USB microphone" became Active and the Windows
 default; 17:10:23 JARVIS moved onto it and said "Switched to USB microphone,
 sir."; he was heard (or not) on it until he typed the switch back at 17:12:19.
 Following the default is the design (the Stream Deck moves it), so only a
-STRANGER is held: AUDIO_FOLLOW_NEW_MIC (core/config, default False).
+STRANGER is held: AUDIO_FOLLOW_NEW_MIC (core/config, default True = follow; the hold
+is an opt-in, so these tests patch it False).
 
 Driven through the REAL _refresh_devices with the audio-flap world (a frozen
 PortAudio table, Windows' endpoint truth, a hand clock). Device names are
@@ -37,10 +38,12 @@ class NewMicHoldTests(F._Base):
         for name, val in (("AUDIO_AUTOSWITCH_HEADSET", ""),
                           ("AUDIO_AUTOSWITCH_MIC_FALLBACK", "")):
             self._p(bc, name, val, create=True)
-        # The live default must be the conservative one.
+        # The live default follows the Windows default as always (the hold is
+        # an opt-in); every test here opts in explicitly.
         from core import config
-        self.assertFalse(config.AUDIO_FOLLOW_NEW_MIC)
-        self.assertFalse(bc.AUDIO_FOLLOW_NEW_MIC)
+        self.assertTrue(config.AUDIO_FOLLOW_NEW_MIC)
+        self.assertTrue(bc.AUDIO_FOLLOW_NEW_MIC)
+        self._p(bc, "AUDIO_FOLLOW_NEW_MIC", False)
         self._settle()
 
     def _plug_stranger(self):
@@ -113,7 +116,7 @@ class NewMicHoldTests(F._Base):
         names = self.world.frozen_names()
         self.assertEqual(names[self.bc._device_cache["in"]], F.NAMES[F.DESK])
 
-    def test_the_flag_on_restores_following_any_new_default(self):
+    def test_the_live_default_follows_any_new_default(self):
         self._p(self.bc, "AUDIO_FOLLOW_NEW_MIC", True)
         self._plug_stranger()
         self._passes(4)
