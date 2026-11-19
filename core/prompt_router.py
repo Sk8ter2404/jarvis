@@ -333,6 +333,11 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
     "HOLO MODE": [
         "holo", "hologram", "hand menu", "arc reactor", "explode it",
         "put it back together", "back together", "reassemble",
+        # v3.0.26: "the holo HUD" misheard (live 11-17 17:12:54 "open hollow
+        # hud" routed only TASK QUEUE, through "hud"). Whole phrases: a bare
+        # "hollow" never pulls this section in. core/config.STT_REPLACEMENTS
+        # rewrites them on voice turns; these catch a typed or unmapped one.
+        "hollow hood", "hollow hud", "hollow hug",
     ],
     "SUIT-UP CINEMATIC": ["suit up", "suit-up", "boot sequence", "cinematic"],
     "TASK QUEUE": [

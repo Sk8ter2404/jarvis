@@ -784,12 +784,34 @@ def hand_tracking_route(utterance) -> str | None:
 # The owner: "if I do want the hologram thing, I can say hey open up the
 # hologram thing and it'll open up my camera". Whole open / close / hand-menu
 # requests route without the brain. The older holographic OVERLAY keeps its own
-# words ("holographic overlay", "the holo HUD") and "hologram" is never them.
+# words ("holographic overlay", "holographic display", "the holo") and
+# "hologram" is never them.
 # "Show me the arc reactor", "explode it" and "put it back together" are the
 # hologram's ONLY while its window is up: otherwise "show the arc reactor" stays
 # the compact corner canvas (arc_reactor) the brain already knows, and a stray
 # "explode it" is left to the brain - a camera window never opens on a guess.
-_HOLO_NAME = r"(?:the\s+|my\s+)?hologram(?:\s+(?:thing|mode|view|window))?"
+# "The holo HUD" / "the hologram HUD" is what the owner CALLS this window
+# (2026-11-17, v3.0.26): live 16:03:52, 16:54:41 and 17:00:24 "open the
+# hologram HUD" all went to the brain, which ran holo_mode_on each time, and
+# 16:11:01 "close holographic hug" ran holo_mode_off. The same request misheard
+# failed every time: 16:53:44 "open a hollow hood" (declined), 16:53:58 "open
+# hologram hot hood" (holo_show, 'hot hood'), 17:12:41 / 17:12:54 "open hollow
+# hood / hud" (launch_app "Hollow Hood", then an invented "Hollow Knight"). So
+# "hologram" / "holographic" may take a HUD word, and "holo" / "hollow" count
+# ONLY with one after them: a bare "hollow" or "holo" never matches, and the
+# route is anchored at both ends, so "open Hollow Knight" or "the holo HUD v2"
+# stays with the brain. Bare "holographic" is not this window either.
+_HOLO_HUD_WORD = r"(?:hud|hood|hug|hut)"
+_HOLO_NAME = (r"(?:the\s+|my\s+|a\s+)?(?:"
+              r"hologram(?:\s+(?:thing|mode|view|window|(?:hot\s+)?" + _HOLO_HUD_WORD + r"))?"
+              r"|holographic\s+(?:thing|mode|view|window|" + _HOLO_HUD_WORD + r")"
+              r"|(?:holo|hollow)\s+" + _HOLO_HUD_WORD + r")")
+# "Jarvis is open the hologram HUD" (live 16:03:52): the wake word heard as
+# "Jarvis is". Dropped only right before an open / close verb, so "is the
+# hologram on" stays a question for the brain.
+_HOLO_IS_LEAD_RE = re.compile(
+    r"^is\s+(?=(?:open|close|show|start|launch|bring|pull|fire|put|turn|switch|"
+    r"hide|dismiss|kill|exit|stop|end|shut)\b)", re.IGNORECASE)
 _HOLO_ON_RE = re.compile(
     r"^(?:(?:open|bring|pull|fire|put)\s+up\s+" + _HOLO_NAME
     + r"|(?:open|show(?:\s+me)?|start|launch|activate|load)\s+" + _HOLO_NAME
@@ -844,6 +866,7 @@ def holo_route(utterance, holo_up: bool = False) -> str | None:
         s = " ".join(_strip(s).split())
         s = " ".join(_strip(_HT_POLITE_RE.sub("", s)).split())
         s = " ".join(_HT_POLITE_RE.sub("", s).split())
+        s = _HOLO_IS_LEAD_RE.sub("", s, count=1)
         qst = _HOLO_QUEST_TAIL_RE.search(s)
         if qst is not None and _HOLO_ON_RE.match(s[:qst.start()]):
             return "[ACTION: holo_quest]"

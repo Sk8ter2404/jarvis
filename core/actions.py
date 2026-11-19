@@ -1608,19 +1608,85 @@ def _unresolved_open_line(name: str) -> str:
         return ""
 
 
+def _launch_suggest_on() -> bool:
+    """core.config.LAUNCH_NOT_FOUND_SUGGEST, read live (default True), through
+    core.misheard_names.suggest_on (the one reader). Never raises."""
+    try:
+        from core import misheard_names as _mn
+        return _mn.suggest_on()
+    except Exception:
+        return True
+
+
+def _closest_apps_note(name) -> str:
+    """v3.0.26 (LAUNCH_NOT_FOUND_SUGGEST): the not-found line's tail naming
+    the installed apps closest to ``name`` (core.misheard_names.closest_apps
+    over the Start-menu list), or saying none is close - so the follow-up
+    round offers only apps that exist (live 2026-11-17 17:12:59 it offered
+    "Hollow Knight", which is not installed) - then any saved site
+    (SITE_SHORTCUTS, read live) that sounds like it. The apps part is "" when
+    the Start-menu list could not be read: then nothing is claimed either
+    way. "" when the setting is off. Never raises."""
+    try:
+        if not _launch_suggest_on():
+            return ""
+        from core import misheard_names as _mn
+        apps = _start_apps()
+        note = (_mn.closest_apps_note(
+            _mn.closest_apps(name, [n for n, _aid in apps])) if apps else "")
+        try:
+            from core import config as _cfg
+            note += _mn.closest_sites_note(_mn.closest_sites(
+                name, getattr(_cfg, "SITE_SHORTCUTS", None)))
+        except Exception:
+            pass
+        return note
+    except Exception:
+        return ""
+
+
 def _launch_failure_line(name, e) -> str:
     """launch_app's result when nothing could start ``name``. With
     SITE_NAME_SPOKEN_FORMS on, a name the OS could not find says so in plain
     words - "not found as an app on this PC" - so the follow-up round does
     not guess it is installed; "could not launch" stays at the front (a
-    failure for every FAILURE_MARKERS reader). Never raises."""
+    failure for every FAILURE_MARKERS reader). With LAUNCH_NOT_FOUND_SUGGEST
+    on it also names the closest installed apps (_closest_apps_note). Never
+    raises."""
     try:
         if _site_spoken_forms_on() and isinstance(e, FileNotFoundError):
             return (f"could not launch {name}: not found as an app on this "
-                    f"PC ({e})")
+                    f"PC ({e})" + _closest_apps_note(name))
     except Exception:
         pass
     return f"could not launch {name}: {e}"
+
+
+def _own_feature_offer(bc, name, e) -> str:
+    """v3.0.26 (LAUNCH_NOT_FOUND_SUGGEST, core.misheard_names): when no app is
+    called ``name`` but it is - or sounds like - one of JARVIS's own windows,
+    the TERMINAL line "I've no app called Hollow Hood, sir. Shall I open the
+    holo HUD instead?". No follow-up round runs after it (live 2026-11-17
+    17:12:59 that round invented "Hollow Knight"), the monolith keeps the
+    offer open, and a yes opens the feature (bobert_companion.
+    _feature_offer_route). Offered, never run: a camera window never opens on
+    a guess. Only for a not-found error. "" otherwise. Never raises."""
+    try:
+        if not (_launch_suggest_on() and isinstance(e, FileNotFoundError)):
+            return ""
+        acts = getattr(bc, "ACTIONS", None)
+        if not isinstance(acts, dict):
+            return ""
+        from core import misheard_names as _mn
+        feature = _mn.feature_for(name, registered=acts)
+        if feature is None:
+            return ""
+        print(f"  [launch-feature] no app called {name!r} - offering "
+              f"{feature.label} ({feature.action}), not running it")
+        from core.failure_markers import TERMINAL_FAILURE_PREFIX
+        return TERMINAL_FAILURE_PREFIX + _mn.offer_line(name, feature)
+    except Exception:
+        return ""
 
 
 def _act_launch_app(name: str) -> str:
@@ -1690,6 +1756,12 @@ def _act_launch_app(name: str) -> str:
             site = None
         if site:
             return _act_open_url(site)
+        # 5) ... and JARVIS's own window by another name ("Hollow Hood" =
+        #    the holo HUD, live 2026-11-17 17:12:41) is offered, not guessed
+        #    at by a follow-up round (_own_feature_offer).
+        offer = _own_feature_offer(bc, name, e)
+        if offer:
+            return offer
         return _launch_failure_line(name, e)
 
 
