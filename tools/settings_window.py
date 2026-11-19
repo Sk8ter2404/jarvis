@@ -1288,6 +1288,16 @@ SCHEMA: dict[str, dict] = {
                 "(LTM_EMBED_DEVICE), so it uses no VRAM. Off = JARVIS "
                 "remembers nothing new between sessions.",
     },
+    "CONVERSATION_RESUME_ON_RESTART": {
+        "tab": "ai", "label": "Keep the conversation across a quick restart",
+        "type": "bool", "default": True,
+        "help": "When JARVIS restarts (\"restart yourself\", the tray's "
+                "Restart) within 15 minutes of your last turn, he comes back "
+                "with the last few messages of the conversation instead of "
+                "starting from zero. Anything that looks like a password or "
+                "code is left out, and nothing is kept in guest mode. Off = "
+                "every restart starts fresh. Applies on the next start.",
+    },
     "PROMPT_FREEZE_QUIET_S": {
         "tab": "ai", "label": "Hold prompt updates while talking (seconds)",
         "type": "float", "default": 30.0, "max": 3600,
@@ -2474,7 +2484,8 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                    "LOCAL_LLM_FALLBACK", "LOCAL_VISION_FALLBACK",
                    "AMBIENT_LEARNING_FORCE_LOCAL", "GAME_MODE_ENABLED",
                    "GAME_MODE_DETECT_FULLSCREEN", "GAME_MODE_QUIET"]),
-        ("Memory", ["LTM_ENABLED", "RAG_ENABLED"]),
+        ("Memory", ["LTM_ENABLED", "CONVERSATION_RESUME_ON_RESTART",
+                    "RAG_ENABLED"]),
         ("Speed", ["FAST_PATHS_ENABLED", "INSTANT_ACTIONS_MODE",
                    "PROMPT_FREEZE_QUIET_S", "PROMPT_SLIM_MODE",
                    "LOCAL_PREFIX_REPRIME", "LOCAL_BACKGROUND_MAX_DEFER_S",

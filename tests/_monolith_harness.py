@@ -319,6 +319,10 @@ _MONOLITH_RESTORE_NAMES = (
     # test's in-flight cap (its recall would be "skipped" for the wrong
     # reason).
     "_ltm_recall_threads",
+    # The last-turn time a restart restored (2026-11-17, conversation
+    # resume): a leaked stamp would make a LATER test's restart save look
+    # like it had a recent turn.
+    "_restored_last_turn_at",
     # After-reply hooks (2026-10-01): the registered hooks, the armed turn and
     # the last encore thread. A leaked hook would be called by a LATER test's
     # dispatch; a leaked turn or live encore would arm / refuse one.

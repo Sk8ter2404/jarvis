@@ -53259,6 +53259,152 @@ def _consume_blue_green_handoff() -> tuple[float | None, list]:
     return pending_last_speech, pending_timers
 
 
+# ── The conversation across a quick restart (2026-11-17) ──────────────────
+# core/conversation_resume.py has the rules. Live 2026-11-17: three restarts
+# between 16:59 and 17:05 (two through the tray's hardened teardown) each
+# started from an empty conversation while "[session_resume] no greeting:
+# restart 0 min after the last session" called it the same session. Only the
+# blue/green swap (--resume-handoff) carried a tail across. _act_restart now
+# saves one (_save_conversation_for_restart) through the same handoff file
+# with kind "restart", and the next prod start takes it back
+# (_resume_conversation_after_restart) when the owner's last turn is recent.
+
+# Epoch seconds of the owner's last turn before a restart, when this process
+# restored that conversation: a second restart before any new turn still
+# carries the tail with its real age. 0.0 = none.
+_restored_last_turn_at: list = [0.0]
+
+
+def _conversation_resume_on() -> bool:
+    return bool(globals().get("CONVERSATION_RESUME_ON_RESTART", True))
+
+
+def _last_turn_epoch() -> float:
+    """Epoch seconds of the conversation's last turn: this process's last
+    owner turn or reply (_last_convo_activity / _last_owner_turn_at, both
+    monotonic, converted), else the turn a restart restored. 0.0 when there
+    is none. Never raises."""
+    try:
+        mono = max(float(_last_convo_activity[0] or 0.0),
+                   float(_last_owner_turn_at[0] or 0.0))
+        at = 0.0
+        if mono > 0:
+            at = time.time() - max(0.0, time.monotonic() - mono)
+        return max(at, float(_restored_last_turn_at[0] or 0.0))
+    except Exception:
+        return 0.0
+
+
+def _save_conversation_for_restart(reason: str = "restart") -> int:
+    """_act_restart, before the successor is spawned: write the newest
+    CONVERSATION_RESUME_MAX_MESSAGES messages (credential-looking ones and
+    their replies left out, core.conversation_resume.tail_for_restart) plus
+    the session's opening utterances to data/handoff.json with kind
+    "restart". Prod only, never in guest mode, nothing when there was no
+    turn. Logs one "[conversation-resume] saved" line. Returns how many
+    messages were saved. One small atomic write; never raises."""
+    try:
+        if not _conversation_resume_on():
+            return 0
+        if _bgm is None or BLUE_GREEN_ROLE != "prod":
+            return 0
+        if _guest_mode.is_on():
+            print("  [conversation-resume] guest mode: nothing saved for "
+                  "the restart")
+            return 0
+        last = _last_turn_epoch()
+        if last <= 0:
+            return 0
+        from core import conversation_resume as _cr
+        max_age = globals().get("CONVERSATION_RESUME_MAX_AGE_S",
+                                _cr.DEFAULT_MAX_AGE_S)
+        try:
+            if time.time() - last > float(max_age):
+                # The next start would refuse it anyway: no conversation
+                # text goes to disk for nothing.
+                print(f"  [conversation-resume] nothing saved: the last turn "
+                      f"was {(time.time() - last) / 60.0:.0f} min ago")
+                return 0
+        except Exception:
+            pass
+        tail = _cr.tail_for_restart(
+            list(conversation_history),
+            globals().get("CONVERSATION_RESUME_MAX_MESSAGES",
+                          _cr.DEFAULT_MAX_MESSAGES),
+            _is_secret_fact)
+        if not tail:
+            return 0
+        pairs = [(t, ts) for t, ts in zip(list(_session_opening_turns),
+                                          list(_session_opening_ts))
+                 if isinstance(t, str) and not _is_secret_fact(t)]
+        now = time.time()
+        payload = _cr.build_payload(
+            tail, last, now, [t for t, _ts in pairs],
+            [ts for _t, ts in pairs],
+            bool(_session_opening_lost[0])
+            or len(pairs) < len(_session_opening_turns), reason)
+        if not _bgm.write_handoff_state(payload):
+            print("  [conversation-resume] could not save the conversation "
+                  "for the restart")
+            return 0
+        print(f"  [conversation-resume] saved {len(tail)} message(s) for the "
+              f"restart (last turn {max(0, int(now - last))} s ago)")
+        return len(tail)
+    except Exception as e:
+        print(f"  [conversation-resume] save failed: {type(e).__name__}")
+        return 0
+
+
+def _resume_conversation_after_restart() -> int:
+    """Boot, prod, not a blue/green relaunch: put back the conversation an
+    ordinary restart saved (_save_conversation_for_restart) when the owner's
+    last turn was at most CONVERSATION_RESUME_MAX_AGE_S ago, and seed the
+    session's opening utterances from it (_seed_session_opening). Only into
+    an empty conversation. Logs one "[conversation-resume] restored" or
+    "not restored" line whenever a handoff file was there. Returns how many
+    messages came back. Never raises."""
+    try:
+        if not _conversation_resume_on() or _handoff_resumed[0]:
+            return 0
+        if (_bgm is None or BLUE_GREEN_ROLE != "prod"
+                or _bgm.RESUME_HANDOFF_FLAG in sys.argv):
+            return 0
+        if conversation_history:
+            return 0
+        had_file = os.path.exists(_bgm.HANDOFF_FILE)
+        payload = _bgm.consume_handoff_state(kind="restart")
+        if payload is None:
+            if had_file:
+                print("  [conversation-resume] not restored: the handoff "
+                      "file is not a fresh restart handoff")
+            return 0
+        from core import conversation_resume as _cr
+        now = time.time()
+        msgs, why = _cr.accept(
+            payload, now,
+            globals().get("CONVERSATION_RESUME_MAX_AGE_S",
+                          _cr.DEFAULT_MAX_AGE_S),
+            globals().get("CONVERSATION_RESUME_MAX_MESSAGES",
+                          _cr.DEFAULT_MAX_MESSAGES),
+            _is_secret_fact)
+        if not msgs:
+            print(f"  [conversation-resume] not restored: {why}")
+            return 0
+        conversation_history.extend(msgs)
+        _restored_last_turn_at[0] = float(payload.get("last_turn_at") or 0.0)
+        _seed_session_opening(payload.get("session_opening_turns"),
+                              payload.get("session_opening_ts"),
+                              lost=payload.get("session_opening_lost") is True,
+                              tail=msgs)
+        print(f"  [conversation-resume] restored {len(msgs)} message(s) from "
+              f"before the restart (last turn "
+              f"{_cr.age_s(payload, now):.0f} s ago)")
+        return len(msgs)
+    except Exception as e:
+        print(f"  [conversation-resume] restore failed: {type(e).__name__}")
+        return 0
+
+
 # Words a bare wake / greeting is made of: "Jarvis, wake up", "Hey Jarvis, you
 # there?", "Jarvis, good morning", "Jarvis, I need you". A wake utterance whose
 # rest is only these is a wake and gets the greeting; anything else after the
@@ -55030,6 +55176,11 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     setup_logging()
     if _log_file_path:
         print(f"Logging session to: {_log_file_path}")
+    # ...and the conversation an ordinary restart saved (2026-11-17,
+    # CONVERSATION_RESUME_ON_RESTART): after the logging starts, so its one
+    # "[conversation-resume]" line lands in the session log; before the boot
+    # greeting and the idle re-prime, which read conversation_history.
+    _resume_conversation_after_restart()
 
     # Launch the system-tray applet NOW, not at the end of boot: the icon used
     # to be missing for the 11-56 s the rest of boot takes (preflight, Whisper,

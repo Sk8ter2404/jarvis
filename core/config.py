@@ -111,6 +111,21 @@ MEMORY_EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 # "the default is today's model" on a box whose user_settings.json opted in.
 _SHIPPED_MEMORY_EMBED_MODEL = MEMORY_EMBED_MODEL
 
+# ─── The conversation across a quick restart ───────────────────────────
+# CONVERSATION_RESUME_ON_RESTART (bool, 2026-11-17; core/conversation_resume)
+# - a restart ("restart yourself", the tray's Restart) saves the newest
+# CONVERSATION_RESUME_MAX_MESSAGES messages of the conversation, credential-
+# looking ones left out, and the next start puts them back when the owner's
+# last turn was at most CONVERSATION_RESUME_MAX_AGE_S ago (900 s: the window
+# the welcome-back greeting already treats as the same session). Live
+# 2026-11-17: three restarts in six minutes each started from an empty
+# conversation. Never across a long gap; never in guest mode; the blue/green
+# upgrade swap keeps its own handoff. Boot logs one "[conversation-resume]"
+# line either way. False = every restart starts from zero, as before.
+CONVERSATION_RESUME_ON_RESTART = True
+CONVERSATION_RESUME_MAX_AGE_S = 900
+CONVERSATION_RESUME_MAX_MESSAGES = 10
+
 # ─── Streaming TTS (sentence-flush) ────────────────────────────────────
 # Speak the first complete, action-free sentence(s) of a Claude reply WHILE
 # the rest is still streaming, instead of waiting for the full completion —

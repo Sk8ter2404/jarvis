@@ -1281,6 +1281,14 @@ def _act_restart(_: str = "") -> str:
     # 1.5 s spawn delay and the native release below would otherwise race a
     # pending 'still working' stage). Latches it off. 2026-09-29.
     _filler_teardown_via_bc(bc, "restart")
+    # The recent conversation crosses the restart (2026-11-17,
+    # CONVERSATION_RESUME_ON_RESTART): saved here, BEFORE the successor is
+    # spawned, so it is on disk when the successor boots. One small atomic
+    # write; never raises.
+    try:
+        bc._save_conversation_for_restart("restart")
+    except Exception as e:
+        print(f"  [restart] conversation save failed: {e}")
     script = os.path.abspath(bc.__file__)
 
     def _do_restart():

@@ -454,17 +454,25 @@ def write_handoff_state(state: dict) -> bool:
 HANDOFF_STATE_TTL_SECONDS = 600
 
 
-def consume_handoff_state() -> dict | None:
+def consume_handoff_state(kind: str | None = None) -> dict | None:
     """New-prod-side equivalent of consume_handoff_signal — read + delete.
 
     Rejects payloads older than HANDOFF_STATE_TTL_SECONDS (10 min) as a
     secondary defense against orphaned handoff.json files left behind by
     an aborted blue-green run. Without this, a regular full-upgrade days
     later would replay a multi-day-old conversation_tail into the fresh
-    session and JARVIS would greet mid-sentence about a stale topic."""
+    session and JARVIS would greet mid-sentence about a stale topic.
+
+    ``kind`` (2026-11-17): take only a payload whose "kind" is this one
+    (an ordinary restart writes kind "restart", core/conversation_resume);
+    any other payload is left in place, untouched, for its own consumer.
+    Without ``kind`` every payload is taken, as before."""
     if not os.path.exists(HANDOFF_FILE):
         return None
     payload = _read_json(HANDOFF_FILE, {})
+    if kind is not None and (not isinstance(payload, dict)
+                             or payload.get("kind") != kind):
+        return None
     try:
         os.remove(HANDOFF_FILE)
     except OSError:
