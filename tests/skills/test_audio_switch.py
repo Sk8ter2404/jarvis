@@ -2882,7 +2882,7 @@ class _FakeAudioProcessor:
     _AUDIBLE_RMS_FLOOR = 1.0e-5
 
     def __init__(self, poll_age=1.0, audible_age=None, session_age=None,
-                 raises=False):
+                 raises=False, unpolled_s=None):
         now = _time.time()
         self._raises = raises
         self._state = {
@@ -2892,6 +2892,10 @@ class _FakeAudioProcessor:
             "vad_session_start": 0.0 if session_age is None else now - session_age,
             "total_vad_trips": 0,
         }
+        if unpolled_s is not None:
+            # 2026-11-17: seconds nobody was listening since the last audible
+            # chunk (absent = an older processor, which subtracts nothing).
+            self._state["unpolled_s"] = float(unpolled_s)
 
     def get_vad_state(self):
         if self._raises:
@@ -2940,6 +2944,20 @@ class CaptureSignalStateTests(unittest.TestCase):
             state, why = A.capture_signal_state(60.0)
         self.assertEqual(state, "silent")
         self.assertIn("95 seconds", why)
+
+    def test_time_nobody_was_listening_is_not_counted(self):
+        """2026-11-17: 95 s since the last audible chunk, but 50 of them were
+        JARVIS speaking and thinking (core.audio_processor's unpolled_s) -
+        45 s of HEARD silence is under the 60 s limit, so the device stays."""
+        with _signal(poll_age=1.0, audible_age=95.0, session_age=600.0,
+                     unpolled_s=50.0):
+            state, why = A.capture_signal_state(60.0)
+        self.assertEqual(state, "audible", why)
+        with _signal(poll_age=1.0, audible_age=125.0, session_age=600.0,
+                     unpolled_s=50.0):
+            state, why = A.capture_signal_state(60.0)
+        self.assertEqual(state, "silent")
+        self.assertIn("75 seconds", why)
 
     def test_a_device_that_has_never_produced_audio_is_SILENT_from_cold_start(self):
         """The boot case: headset already on, boom mic already flipped up. The

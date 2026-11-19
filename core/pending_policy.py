@@ -38,6 +38,13 @@ QUEUE_RULES = {
     # "Switched to the Blue Snowball" is news for a moment, and read as a
     # fragment of a recap it says nothing.
     "mic_change": (300.0, False),
+    # "Sir, <the desk mic> has been completely silent for 30 seconds" is
+    # true only while it lasts. Live 11-17 16:02:41 five queued copies were
+    # folded into a recap read out right after a turn he spoke on that very mic.
+    # Never a recap fragment; past the silent-mic re-warn limit (bobert_
+    # companion.MIC_SILENT_REWARN_SECONDS, 900 s - tests pin the two) a fault
+    # that is still there has already been reported again by a fresher line.
+    "mic_silent": (900.0, False),
     # A RAM figure a few minutes old is not true any more; a line that is still
     # true comes round again on the alert's own cool-down. Live 11-05 12:55:14
     # and 14:44:19 a recap read out figures that had waited.
@@ -68,6 +75,12 @@ _TAGS_RE = re.compile(r"^(?:\s*\[[a-z_]+(?::[^\]]*)?\]\s*)+", re.IGNORECASE)
 _CLAP_ACK_RE = re.compile(r"^you rang\b", re.IGNORECASE)
 _MIC_CHANGE_RE = re.compile(r"^(?:switched to\b|headset (?:on|off)\b)",
                             re.IGNORECASE)
+# The silent-mic warning: tagged since 2026-11-17 (still_valid "mic_silent:",
+# the ONE copy of the prefix - bobert_companion imports it), matched by text
+# too for a line an older build left in the queue file.
+MIC_SILENT_VALID_PREFIX = "mic_silent:"
+_MIC_SILENT_RE = re.compile(r"\bhas been completely silent for\b",
+                            re.IGNORECASE)
 _RAM_RE = re.compile(r"\bmemory usage is at\b", re.IGNORECASE)
 _GREETING_RE = re.compile(r"^good (?:morning|afternoon|evening)\b",
                           re.IGNORECASE)
@@ -95,6 +108,11 @@ def line_class(entry) -> str:
         text = _spoken_text(entry)
         if root == "clap" and _CLAP_ACK_RE.match(text):
             return "clap_ack"
+        if root == "audio" and (
+                str(entry.get("still_valid") or "").startswith(
+                    MIC_SILENT_VALID_PREFIX)
+                or _MIC_SILENT_RE.search(text)):
+            return "mic_silent"
         if root == "audio" and _MIC_CHANGE_RE.match(text):
             return "mic_change"
         if root == "system_monitor" and _RAM_RE.search(text):

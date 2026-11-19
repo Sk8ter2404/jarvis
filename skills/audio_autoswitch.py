@@ -17,6 +17,7 @@ A None answer is spoken as "I can't tell", never as "off".
 """
 import importlib
 import os
+import sys
 
 from audio import audio_switch
 
@@ -123,6 +124,25 @@ def _announce_kind(message: str, kind: str) -> None:
         print(f"  [audio-switch] announcement governor failed ({e}); "
               f"announcing unfiltered")
     _announce(message)
+
+
+def _note_owner_switch(direction: str, device) -> None:
+    """Tell the monolith that a voice action just moved the Windows default
+    ``direction`` ("in" / "out") to ``device`` ((id, name)) AND said so, so
+    its own "Switched to ..." line for that same move is not spoken again a
+    minute later (2026-11-17, overhaul actions-09: live 11-17 17:12:22
+    use_desk_mic confirmed the desk mic, 17:13:10 "Switched to <the desk
+    mic>, sir." was spoken anyway). Best-effort: no monolith, no stamp.
+    sys.modules only, never an import - the same discipline as
+    audio_switch.capture_override(): importing the monolith here would load
+    the whole audio stack behind a plain `python -m audio.audio_switch`."""
+    try:
+        bc = sys.modules.get("bobert_companion")
+        fn = getattr(bc, "_note_owner_audio_switch", None) if bc else None
+        if callable(fn) and device:
+            fn(direction, device[0], device[1] if len(device) > 1 else "")
+    except Exception:
+        pass
 
 
 def _capture_sentence(name: str) -> str:
@@ -236,6 +256,7 @@ def register(actions):
                     f"the name may be wrong.")
         if not audio_switch.set_default_render(hs[0]):
             return "I couldn't switch to the headset, sir."
+        _note_owner_switch("out", hs)
         if powered is None:
             return ("Audio's on the headset now, sir — though I couldn't confirm "
                     "it's actually powered on.")
@@ -251,8 +272,10 @@ def register(actions):
         if not spk:
             problem = audio_switch.fallback_problem(fb) or "it could not be resolved"
             return (f"I can't switch to the speakers, sir: {problem}.")
-        return ("Audio's on the speakers now, sir." if audio_switch.set_default_render(spk[0])
-                else "I couldn't switch to the speakers, sir.")
+        if not audio_switch.set_default_render(spk[0]):
+            return "I couldn't switch to the speakers, sir."
+        _note_owner_switch("out", spk)
+        return "Audio's on the speakers now, sir."
 
     # ── the INPUT half ──────────────────────────────────────────────────
     # These exist so the owner is never STUCK on the wrong microphone waiting
@@ -281,6 +304,7 @@ def register(actions):
             # would be a fresh unverified claim.
             return ("I couldn't confirm the microphone moved to the headset, "
                     "sir - check `which mic is active` before you rely on it.")
+        _note_owner_switch("in", mic)
         # Gated, not asserted - see _capture_sentence. Moving the Windows
         # default is what actually happened; being heard on it is a separate
         # fact with a separate owner (bobert_companion's _pick_device).
@@ -308,6 +332,7 @@ def register(actions):
         if not audio_switch.set_default_capture(mic[0]):
             return ("I couldn't confirm the microphone moved to the desk mic, "
                     "sir - check `which mic is active` before you rely on it.")
+        _note_owner_switch("in", mic)
         return _capture_sentence(mic[1])
 
     def which_mic_is_active(_: str = "") -> str:

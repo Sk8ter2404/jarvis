@@ -47,6 +47,30 @@ class ClassTests(unittest.TestCase):
         self.assertEqual(pp.line_class(_e("Your routine is done, sir.",
                                           "clap")), "other")
 
+    def test_the_silent_mic_warning_is_its_own_class(self):
+        # 2026-11-17: live 11-17 16:02:41 five copies were folded into a recap
+        # read out right after a turn he spoke on that very mic.
+        silent = ("Sir, the Synthetic Desk Mic has been completely silent for "
+                  "30 seconds — I can hear nothing at all from it.")
+        tagged = _e(silent, "audio",
+                    still_valid=pp.MIC_SILENT_VALID_PREFIX + "Mic (Synthetic)")
+        self.assertEqual(pp.line_class(tagged), "mic_silent")
+        # ...and an untagged one an older build left in the queue file.
+        self.assertEqual(pp.line_class(_e(silent, "audio")), "mic_silent")
+        self.assertTrue(pp.never_fold(tagged))
+        self.assertEqual(pp.too_old_reason(_e(silent, "audio", 600.0),
+                                           now=NOW, local_hour=MORNING), "")
+        self.assertIn("mic_silent:", pp.too_old_reason(
+            _e(silent, "audio", 901.0), now=NOW, local_hour=MORNING))
+        # Only the audio source means it.
+        self.assertEqual(pp.line_class(_e(silent, "voice_clone")), "other")
+
+    def test_a_merged_switch_line_is_still_a_mic_change(self):
+        # 2026-11-17: one refresh pass, one sentence for both directions.
+        self.assertEqual(pp.line_class(_e(
+            "Switched to the Desk Mic for the microphone and USB Speakers "
+            "for the speakers, sir.", "audio")), "mic_change")
+
     def test_other_audio_and_system_lines_stay_ordinary(self):
         # A hearing alert is not a mic change: it may still be recapped.
         self.assertEqual(pp.line_class(_e(

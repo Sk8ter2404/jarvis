@@ -892,6 +892,10 @@ def capture_claim(name: str, moved: str) -> str:
 #   vad_session_start      the first poll, so a device that has NEVER produced
 #                          audio this session is measurable from cold start -
 #                          which is the boot case (headset already on, boom up).
+#   unpolled_s             (2026-11-17) seconds since the last audible chunk
+#                          during which nobody was listening (gaps between two
+#                          inspected chunks over audio_processor._POLL_GAP_S);
+#                          subtracted, so only heard silence counts.
 #
 # Reading them costs a dict copy and opens no device. The 1e-5 floor and the
 # claim that a working capture device's noise floor sits above it are
@@ -966,7 +970,12 @@ def capture_signal_state(min_silent_s: float,
         if ref <= 0.0:
             return ("unknown", "my own listening timestamps are unset, so I cannot "
                                "tell how long it has been")
-        silent_age = now - ref
+        # Only time spent LISTENING counts (2026-11-17): core.audio_processor
+        # books the gaps between inspected chunks (JARVIS speaking, thinking)
+        # in unpolled_s, the same subtraction seconds_since_audible_chunk()
+        # makes - one rule, so "though I was listening the whole time" below
+        # is true. A state without the key (an older processor) subtracts 0.
+        silent_age = max(0.0, now - ref - float(state.get("unpolled_s") or 0.0))
         if silent_age >= float(min_silent_s):
             ever = ("" if audible_ts > 0.0 else
                     " - I have not heard anything at all since I started")

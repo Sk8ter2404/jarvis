@@ -3876,6 +3876,15 @@ AUDIO_FLAP_WINDOW_S      = 300.0   # s: window the changes are counted in
 AUDIO_FLAP_THRESHOLD     = 3       # changes inside the window = flapping
 AUDIO_ANNOUNCE_MIN_GAP_S = 60.0    # s: at most one audio-device sentence per
 AUDIO_REPICK_STABLE_S    = 8.0     # s a new default must hold before JARVIS follows it
+# AUDIO_PERIODIC_REENUM (2026-11-17, overhaul reliability-01): False = PortAudio
+# is re-enumerated only on a real device change (the live Windows endpoint list
+# changed, a default move, a failed open), plus the old 300 s sweep on a host
+# where that list cannot be read. True = the old forced re-enumeration every
+# 300 s as well, which closes and reopens the always-open microphone, the wake
+# stream and the loopback. Live 11-16/11-17: 209 forced re-enumerations, every
+# ~5 min all night, against 10 real default moves the watch had already caught.
+# Log: "[audio] re-enumeration mode: ...". Read at each refresh pass.
+AUDIO_PERIODIC_REENUM    = False
 
 
 # ─── Mic / speaker device selection (bobert_companion _refresh_devices) ─

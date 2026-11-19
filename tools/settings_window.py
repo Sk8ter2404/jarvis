@@ -913,6 +913,16 @@ SCHEMA: dict[str, dict] = {
                 "if the device it is using has gone. 0 = follow immediately. "
                 "Applies on the next start.",
     },
+    # 2026-11-17 (overhaul reliability-01): the forced 300 s PortAudio sweep.
+    "AUDIO_PERIODIC_REENUM": {
+        "tab": "hearing", "label": "Re-scan audio devices every 5 minutes",
+        "type": "bool", "default": False,
+        "help": "Off: JARVIS re-scans its audio devices only when Windows "
+                "reports a device change, a default move or a failed open "
+                "(and every 5 minutes on a PC where that list can't be read). "
+                "On: also every 5 minutes, which briefly closes and reopens "
+                "the microphone each time.",
+    },
     # 2026-07-08: surface the Whisper STT device/model so the v2.0.23 crash-
     # workaround is settable AND persisted — previously they lived only in
     # core/config.py, so a Settings save (which rewrites user_settings.json from
@@ -2448,7 +2458,8 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
                                  "AUDIO_AUTOSWITCH_DEFER_DURING_MEDIA"]),
         ("Device changes", ["AUDIO_FLAP_WINDOW_S", "AUDIO_FLAP_THRESHOLD",
                             "AUDIO_ANNOUNCE_MIN_GAP_S",
-                            "AUDIO_REPICK_STABLE_S"]),
+                            "AUDIO_REPICK_STABLE_S",
+                            "AUDIO_PERIODIC_REENUM"]),
         ("Speech recognition", ["WHISPER_DEVICE", "WHISPER_MODEL_CUDA",
                                 "PARAKEET_DEVICE", "SMART_TURN_DEVICE",
                                 "VOICE_ID_DEVICE", "LISTEN_GPU",

@@ -1108,11 +1108,13 @@ class VadStateTests(_ResetSingletonMixin, unittest.TestCase):
                 "vad_session_start": 0.0,
                 "total_vad_trips": 0,
                 "last_audible_chunk_ts": 0.0,
+                "unpolled_s": 0.0,
             })
 
     def setUp(self):
         super().setUp()
         self._clear_vad()
+        self.addCleanup(self._clear_vad)
 
     def test_note_vad_active_sets_all_three(self):
         ap.note_vad_active(ts=111.0)
@@ -1181,6 +1183,55 @@ class VadStateTests(_ResetSingletonMixin, unittest.TestCase):
 
     def test_seconds_since_audible_inf_when_no_polling(self):
         self.assertEqual(ap.seconds_since_audible_chunk(), float("inf"))
+
+    # ── 2026-11-17: only time spent LISTENING is silence ─────────────────
+    def _listen(self, t0: float, secs: float, step: float = 0.064) -> float:
+        """Inspect a below-floor chunk every ``step`` s from t0 for secs."""
+        t = t0
+        while t < t0 + secs:
+            ap.note_vad_poll(t)
+            ap.note_raw_rms(1e-6, t)
+            t += step
+        return t
+
+    def test_a_gap_nobody_listened_through_is_not_silence(self):
+        """Live 11-17 16:02:53: 'silent for 40 seconds' 12 s into listening,
+        after a 28 s turn and a 12 s recap on the mic he had just used."""
+        ap.note_raw_rms(0.01, ts=1000.0)          # heard him
+        t = self._listen(1000.0, 1.0)              # 1 s of listening
+        t = self._listen(t + 40.0, 0.5)            # JARVIS spoke 40 s, then
+        with mock.patch.object(ap.time, "time", return_value=t):
+            self.assertLess(ap.seconds_since_audible_chunk(), 2.0)
+
+    def test_heard_silence_still_counts_in_full(self):
+        # NEGATIVE CONTROL: a muted mic listened to for 45 s is 45 s silent.
+        ap.note_raw_rms(0.01, ts=2000.0)
+        t = self._listen(2000.0, 45.0)
+        with mock.patch.object(ap.time, "time", return_value=t):
+            self.assertGreater(ap.seconds_since_audible_chunk(), 44.0)
+
+    def test_gaps_up_to_the_grace_are_still_listening(self):
+        ap.note_raw_rms(0.01, ts=3000.0)
+        t = self._listen(3000.0, 45.0, step=ap._POLL_GAP_S * 0.9)
+        with mock.patch.object(ap.time, "time", return_value=t):
+            self.assertGreater(ap.seconds_since_audible_chunk(), 44.0)
+
+    def test_an_audible_chunk_clears_the_booked_gaps(self):
+        ap.note_raw_rms(0.01, ts=4000.0)
+        t = self._listen(4000.0, 0.5)
+        t = self._listen(t + 30.0, 0.5)
+        self.assertGreater(ap.get_vad_state()["unpolled_s"], 29.0)
+        ap.note_raw_rms(0.01, ts=t)
+        self.assertEqual(ap.get_vad_state()["unpolled_s"], 0.0)
+        t2 = self._listen(t, 31.0)
+        with mock.patch.object(ap.time, "time", return_value=t2):
+            self.assertGreater(ap.seconds_since_audible_chunk(), 30.0)
+
+    def test_cold_start_silence_excludes_gaps_too(self):
+        t = self._listen(5000.0, 1.0)              # the first poll ever
+        t = self._listen(t + 60.0, 0.5)            # boot greeting played
+        with mock.patch.object(ap.time, "time", return_value=t):
+            self.assertLess(ap.seconds_since_audible_chunk(), 3.0)
 
 
 class AudibleFloorTests(unittest.TestCase):

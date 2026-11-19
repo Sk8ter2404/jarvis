@@ -702,7 +702,8 @@ class SpeculativeRealCaptureLoopTests(unittest.TestCase):
         self.addCleanup(setattr, bc, "_last_recording_peak",
                         bc._last_recording_peak)
         for _cell in ("_last_mic_hud_write", "_silent_mic_warned",
-                      "_silent_mic_warned_at", "_silent_mic_warned_device"):
+                      "_silent_mic_warned_at", "_silent_mic_warned_device",
+                      "_silent_mic_recover_s"):
             _c = getattr(bc, _cell, None)
             if isinstance(_c, list) and _c:
                 self.addCleanup(_c.__setitem__, 0, _c[0])

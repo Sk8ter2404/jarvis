@@ -368,6 +368,96 @@ class StaleEnumerationTests(_Base):
         self.assertFalse(any("[audio-flap]" in ln for ln in self.printed))
 
 
+class EndpointWatchReenumTests(_Base):
+    """2026-11-17 (overhaul reliability-01). DEVICE_REENUM_INTERVAL forced a
+    PortAudio teardown every 300 s on time alone: 209 re-enumerations against
+    10 real default moves over the 11-16/11-17 sessions, every 5 minutes all
+    night, each closing the always-open mic, the wake stream and the
+    loopback. The live endpoint watch already sees every hotplug, so while it
+    is readable the sweep is gone; on a blind host it stays."""
+
+    def _quiet_minutes(self, minutes: float) -> int:
+        inits = self.world.inits
+        for _ in range(int(minutes * 60 / 4)):
+            self._pass()
+        return self.world.inits - inits
+
+    def test_nothing_changed_means_no_teardown_all_night(self):
+        self._settle()
+        self.assertEqual(self._quiet_minutes(30), 0,
+                         "a PortAudio teardown with no device change")
+        hits = [ln for ln in self.printed
+                if "re-enumeration mode: endpoint watch" in ln]
+        self.assertEqual(len(hits), 1, "the mode is logged once, not per pass")
+
+    def test_a_plugged_in_mic_is_still_re_enumerated_at_once(self):
+        # The sweep's whole job, done by the watch: a capture endpoint that
+        # was not there at the last enumeration appears.
+        self.world.active.discard(DESK)
+        self.world.default_in = HS_MIC
+        self.world.table = self.world._rows()
+        for _ in range(3):
+            self._pass()
+        self.assertEqual(self.world.frozen_names()[self.bc._device_cache["in"]],
+                         NAMES[HS_MIC])
+        self.assertEqual(self._quiet_minutes(10), 0)
+        inits = self.world.inits
+        self.world.set_desk(True)                 # plugged in, now default
+        self._pass()
+        self.assertEqual(self.world.inits, inits + 1,
+                         "hotplug must re-enumerate on the next 4 s pass")
+        self.assertIn(NAMES[DESK], self.world.frozen_names())
+        for _ in range(3):                        # past the hysteresis
+            self._pass()
+        idx = self.bc._device_cache["in"]
+        self.assertEqual(self.world.frozen_names()[idx], NAMES[DESK])
+        self.assertTrue(self._index_is_live(idx))
+
+    def test_a_blind_host_keeps_the_sweep(self):
+        # No endpoint watch (no MMDevice API): the sweep is the only hotplug
+        # detector there, exactly as before.
+        self._p(self.bc, "_win_active_endpoint_ids", return_value=None)
+        self._settle()
+        n = self._quiet_minutes(31)
+        self.assertGreaterEqual(n, 5, "the 300 s sweep must still run blind")
+        self.assertLessEqual(n, 7)
+        self.assertTrue(any("re-enumeration mode: sweep" in ln
+                            for ln in self.printed), self.printed[-20:])
+
+    def test_the_rollback_knob_restores_the_sweep(self):
+        self._p(self.bc, "AUDIO_PERIODIC_REENUM", True, create=True)
+        self._settle()
+        n = self._quiet_minutes(31)
+        self.assertGreaterEqual(n, 5)
+        self.assertTrue(any("re-enumeration mode: forced sweep" in ln
+                            for ln in self.printed), self.printed[-20:])
+
+    def test_the_knob_default_is_the_endpoint_watch(self):
+        from core import config as cfg
+        self.assertIs(cfg.AUDIO_PERIODIC_REENUM, False)
+        self.assertIs(self.bc.AUDIO_PERIODIC_REENUM, False)
+
+    def test_the_first_re_enumeration_of_a_session_still_runs(self):
+        # Until one real re-enumeration has run, the stale-index baseline was
+        # never taken against a matching enumeration: the sweep stays due.
+        self._settle()
+        self.bc._device_cache["last_reenum_at"] = 0.0
+        inits = self.world.inits
+        self._pass()
+        self.assertEqual(self.world.inits, inits + 1)
+        self.assertEqual(self._quiet_minutes(15), 0)
+
+    def test_a_failed_open_still_re_enumerates(self):
+        self._settle()
+        self.clock.t += 60.0
+        with mock.patch("builtins.print"):
+            self.bc._note_input_open_failure("record_speech", 0,
+                                             RuntimeError("-9999"))
+        inits = self.world.inits
+        self._pass()
+        self.assertEqual(self.world.inits, inits + 1)
+
+
 class RepickHysteresisTests(_Base):
     def _press(self):
         """A Stream-Deck-style move: the default mic goes to the headset
@@ -421,6 +511,130 @@ class RepickHysteresisTests(_Base):
         for _ in range(5):                # 32 s
             self._pass()
         self.assertEqual(self.bc._device_cache["in"], 1)
+
+
+class OwnerConfirmedSwitchTests(_Base):
+    """2026-11-17 (overhaul actions-09). Live 11-17 17:12:22 use_desk_mic
+    said "Listening on ... now, sir."; the refresh pass followed the move
+    and "Switched to the ..., sir." was spoken again at 17:13:10. A switch he
+    ordered by voice and was told about is not announced a second time; any
+    other switch still is."""
+
+    def setUp(self):
+        super().setUp()
+        self._p(self.bc, "_owner_switch_clock", self.clock)
+        self.bc._owner_audio_switch.update({"in": None, "out": None})
+        self.addCleanup(self.bc._owner_audio_switch.update,
+                        {"in": None, "out": None})
+
+    def _follow_headset_mic(self):
+        self.world.default_in = HS_MIC
+        for _ in range(3):                      # past the 8 s hysteresis
+            self._pass()
+        self.assertEqual(self.world.frozen_names()[self.bc._device_cache["in"]],
+                         NAMES[HS_MIC])
+
+    def test_his_own_switch_is_not_announced_again(self):
+        self._settle()
+        # What use_headset_mic does after set_default_capture succeeded.
+        self.bc._note_owner_audio_switch("in", HS_MIC, NAMES[HS_MIC])
+        self._follow_headset_mic()
+        self.assertEqual(self.spoken, [])
+        self.assertTrue(any("is the switch sir asked for" in ln
+                            for ln in self.printed), self.printed)
+        self.assertIsNone(self.bc._owner_audio_switch["in"], "used up")
+
+    def test_matched_by_name_when_the_endpoint_id_is_not_known(self):
+        self._settle()
+        self.bc._note_owner_audio_switch("in", "", NAMES[HS_MIC])
+        self._follow_headset_mic()
+        self.assertEqual(self.spoken, [])
+
+    def test_a_switch_to_another_device_is_still_announced(self):
+        self._settle()
+        self.bc._note_owner_audio_switch("in", DESK, NAMES[DESK])
+        self._follow_headset_mic()
+        self.assertEqual(self.spoken, ["Switched to Wireless Headset, sir."])
+
+    def test_an_old_confirmation_does_not_silence_a_later_switch(self):
+        self._settle()
+        self.bc._note_owner_audio_switch("in", HS_MIC, NAMES[HS_MIC])
+        self.clock.t += self.bc._OWNER_SWITCH_CONFIRMED_S + 1.0
+        self._follow_headset_mic()
+        self.assertEqual(self.spoken, ["Switched to Wireless Headset, sir."])
+
+    def test_one_confirmation_silences_one_switch_only(self):
+        self._settle()
+        self.bc._note_owner_audio_switch("in", HS_MIC, NAMES[HS_MIC])
+        self._follow_headset_mic()
+        self.world.default_in = DESK              # the Stream Deck, later
+        for _ in range(20):
+            self._pass()
+        self.assertEqual(self.spoken, ["Switched to Desk Mic, sir."])
+
+    def test_the_other_direction_of_the_same_pass_is_still_said(self):
+        # He moved the mic by voice; the speakers moved in the same pass.
+        self._settle()
+        self.bc._note_owner_audio_switch("in", HS_MIC, NAMES[HS_MIC])
+        self.world.default_in = HS_MIC
+        self.world.default_out = HS_OUT
+        for _ in range(3):
+            self._pass()
+        self.assertEqual(self.spoken, ["Switched to Wireless Headset, sir."],
+                         "the speaker half is news, the mic half is not")
+
+
+class PreferredInputHotplugTests(_Base):
+    """Overhaul speech-mic-announce, the PREFERRED_INPUT_DEVICES half: live
+    11-17 17:10:23 a newly plugged mic became the Windows default and JARVIS
+    followed it. Following the default is the design when no preference is
+    set (tests above); with PREFERRED_INPUT_DEVICES naming the desk mic a new
+    mic that Windows makes the default is NOT followed and NOT announced,
+    and the re-enumeration it forces re-keys the desk mic silently."""
+
+    def test_a_new_default_mic_does_not_beat_the_preferred_one(self):
+        self._p(self.bc, "PREFERRED_INPUT_DEVICES", ["Desk Mic"])
+        self.world.active.discard(HS_MIC)          # not plugged in yet
+        self.world.table = self.world._rows()
+        for _ in range(3):
+            self._pass()
+        desk_before = self.world.frozen_names()[self.bc._device_cache["in"]]
+        self.assertEqual(desk_before, NAMES[DESK])
+        self.spoken.clear()
+        inits = self.world.inits
+        self.world.active.add(HS_MIC)              # plugged in...
+        self.world.default_in = HS_MIC             # ...and made the default
+        for _ in range(5):
+            self._pass()
+        self.assertGreater(self.world.inits, inits, "hotplug re-enumerated")
+        idx = self.bc._device_cache["in"]
+        self.assertEqual(self.world.frozen_names()[idx], NAMES[DESK])
+        self.assertTrue(self._index_is_live(idx))
+        self.assertEqual(self.spoken, [], "no switch happened, none is said")
+
+
+class OnePassOneSentenceTests(_Base):
+    """2026-11-17 (overhaul speech-mic-announce). Live 11-16 09:33:38 the
+    mic line was held by the one-per-gap rule and then REPLACED by the
+    speaker line from the same pass, so where he is heard was never said."""
+
+    def test_mic_and_speakers_moving_together_are_one_sentence(self):
+        self._settle()
+        self.world.default_in = HS_MIC
+        self.world.default_out = HS_OUT
+        for _ in range(3):
+            self._pass()
+        self.world.default_in = DESK
+        self.world.default_out = SPK
+        self.clock.t += 61.0                      # the gap is open
+        for _ in range(3):
+            self._pass()
+        self.assertEqual(len(self.spoken), 2, self.spoken)
+        self.assertEqual(self.spoken[0], "Switched to Wireless Headset, sir.")
+        self.assertIn("Desk Mic for the microphone", self.spoken[1])
+        self.assertIn("for the speakers", self.spoken[1])
+        self.assertFalse(any("superseded the held announcement" in ln
+                             for ln in self.printed), self.printed)
 
 
 class GovernorWiringTests(_Base):
