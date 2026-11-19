@@ -2098,3 +2098,33 @@ class DeclineRecheckTests(unittest.TestCase):
     def test_never_raises(self):
         self.assertEqual(pr.decline_recheck(object(), object(), object()), "")
         self.assertEqual(pr.nearest_action(None, None), "")
+
+
+class FreeMemoryRoutingTests(unittest.TestCase):
+    """2026-11-17: "clear the RAM" (live 2026-11-16 12:11:36 the model
+    invented [ACTION: clear_ram], which had no handler) and how much memory
+    the brain holds (live 11-16 "why is your brain model taking up so much?"
+    / "how's the brain model holding up?" ran current_model, which only names
+    the model) must reach the local brain's SLIM prompt with the action that
+    answers them, not only the full cloud prompt."""
+
+    FREE = ("Jarvis, try to clear the ram.", "clear the RAM please",
+            "free up some memory", "can you free up some RAM")
+    BRAIN = ("why is your brain model taking up so much?",
+             "how's the brain model holding up?",
+             "how much memory is your brain using?")
+
+    def test_clear_the_ram_ships_free_memory(self):
+        for text in self.FREE:
+            with self.subTest(text=text):
+                slim = pr.slim_pc_control(text, FULL)
+                self.assertIn("[ACTION: free_memory]", slim)
+
+    def test_the_brains_memory_ships_gpu_usage(self):
+        row = re.compile(r"'how's the brain model holding up\?'\s+→ "
+                         r"\[ACTION: gpu_usage\]")
+        self.assertRegex(FULL, row)
+        for text in self.BRAIN:
+            with self.subTest(text=text):
+                slim = pr.slim_pc_control(text, FULL)
+                self.assertRegex(slim, row)

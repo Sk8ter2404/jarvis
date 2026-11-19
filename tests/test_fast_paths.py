@@ -1006,6 +1006,69 @@ class MemoryQuestionTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
 
 
+class FreeMemoryRequestTests(unittest.TestCase):
+    """2026-11-17: "clear the RAM" (live 2026-11-16 12:11:36 the model
+    invented [ACTION: clear_ram] and then blamed missing permissions) is
+    answered by the loaded system_pulse skill's free_memory_answer. The skill
+    is faked here; the real one is driven in
+    tests/monolith/test_monolith_free_memory.py."""
+
+    ASKS = ("Jarvis, try to clear the ram.", "clear the RAM", "free up some RAM",
+            "free up some memory", "Jarvis, can you free up some memory?",
+            "could you clean up the ram please", "free up memory on the PC",
+            "clear my ram", "flush the ram", "free some ram up",
+            "optimize the ram", "reduce the ram usage", "free up ram for me",
+            "make some memory free", "try and free up some memory")
+    NOT = ("clear your memory", "clear the memory", "clear memory",
+           "forget everything", "why is the RAM so high",
+           "what's using all my memory", "clear the screen",
+           "free up some disk space", "free up the C drive",
+           "clear the ram and close chrome", "how much ram do I have",
+           "clear the ram on the server", "", None)
+
+    def setUp(self):
+        import sys
+        import types
+        self.calls = []
+        fake = types.ModuleType("skill_system_pulse")
+        fake.free_memory_answer = lambda said: (self.calls.append(said)
+                                                or self.reply)
+        fake.memory_answer = lambda said: "Memory at 82 percent, sir."
+        self.reply = "Memory at 97 percent, sir. Say 'close Chrome'."
+        prev = sys.modules.get("skill_system_pulse")
+        sys.modules["skill_system_pulse"] = fake
+
+        def _restore():
+            if prev is None:
+                sys.modules.pop("skill_system_pulse", None)
+            else:
+                sys.modules["skill_system_pulse"] = prev
+        self.addCleanup(_restore)
+
+    def test_grammar(self):
+        for text in self.ASKS:
+            with self.subTest(text=text):
+                self.assertTrue(fp.is_free_memory_request(text))
+        for text in self.NOT:
+            with self.subTest(text=text):
+                self.assertFalse(fp.is_free_memory_request(text))
+
+    def test_match_answers_from_the_skill(self):
+        hit = fp.match("Jarvis, try to clear the ram.", now=TUE)
+        self.assertEqual(hit, fp.FastAnswer("memory-free", self.reply))
+        self.assertEqual(self.calls, ["Jarvis, try to clear the ram."])
+        # A memory QUESTION keeps its own answer.
+        self.assertEqual(fp.match("why is the RAM so high", now=TUE).kind,
+                         "memory-users")
+
+    def test_no_answer_falls_through(self):
+        self.reply = ""
+        self.assertIsNone(fp.match("clear the RAM", now=TUE))
+        import sys
+        sys.modules.pop("skill_system_pulse", None)
+        self.assertIsNone(fp.match("clear the RAM", now=TUE))
+
+
 
 class ShortCapabilityOverviewTests(unittest.TestCase):
     """v3.0.8 H2: the overview is short, and a yes to its offer gets the

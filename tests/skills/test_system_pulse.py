@@ -1699,6 +1699,14 @@ class PulseLiveGpuAlertTests(unittest.TestCase):
 _GB = 1024 ** 3
 
 
+def _no_cmdlines(case):
+    """The fixture pids are not this machine's processes: never read a real
+    command line for one (the 15:59 log named none)."""
+    p = mock.patch.object(case.mod, "_python_cmdline", return_value=[])
+    p.start()
+    case.addCleanup(p.stop)
+
+
 def _live_procs_1559(own_pid):
     """The 15:59 memory users, grouped totals as measured (working set, GB):
     llama-server 8.0 (1), claude 6.7 (34), chrome 4.5 (27), pythonw 4.3 (4,
@@ -1753,6 +1761,7 @@ class PulseAskedAtHighRamTests(unittest.TestCase):
         self.mod, self.actions = load_skill_isolated("system_pulse")
         self.reads = 0
         self.gpu_rows = None
+        _no_cmdlines(self)
 
     def _ask(self, pulse, said="", procs=None, arg=""):
         rows = _live_procs_1559(os.getpid()) if procs is None else procs
@@ -2039,6 +2048,7 @@ class PulseWhyIsRamHighTests(unittest.TestCase):
         self.gpu_rows = self.OURS
         self.own = True
         self.rows = _live_procs_1559(os.getpid())
+        _no_cmdlines(self)
 
     def _patches(self, said):
         with self.mod._pulse_cache_lock:
@@ -2207,6 +2217,7 @@ class PulseMemoryWordOverridesLeadTests(PulseWhyIsRamHighTests):
 class PulseMemoryUsersTests(unittest.TestCase):
     def setUp(self):
         self.mod, self.actions = load_skill_isolated("system_pulse")
+        _no_cmdlines(self)
 
     def test_live_users_grouped_by_app_biggest_first(self):
         users = self.mod._memory_users(_live_procs_1559(4242), own_pid=4242,
@@ -2320,6 +2331,149 @@ class PulseMemoryUsersTests(unittest.TestCase):
             self.assertTrue(self.mod._asks_about_memory(said), said)
         for said in ("status report", "how's the gram of salt", "", None):
             self.assertFalse(self.mod._asks_about_memory(said), said)
+
+
+class PulsePythonLabelTests(unittest.TestCase):
+    """Live 2026-11-16: a memory line said "Python at 28 GB", which names
+    nothing he can act on. A Python process is named by what it runs; the
+    command lines are injected (no real process is read)."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("system_pulse")
+        root = self.mod._PROJECT_DIR
+        self.cmd = {
+            501: ["pythonw.exe", os.path.join(root, "tools", "demo_helper.py")],
+            502: ["python.exe", "-m", "skills.demo_server", "--port", "1"],
+            503: ["python.exe", os.path.join(os.path.dirname(root) or root,
+                                             "elsewhere", "photo_sorter.py")],
+            504: [],                                   # access denied / gone
+            505: ["python.exe", "-c", "print(1)"],
+        }
+        p = mock.patch.object(self.mod, "_python_cmdline",
+                              side_effect=lambda pid: self.cmd.get(pid, []))
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_labels(self):
+        lab = self.mod._python_label
+        self.assertEqual(lab(501), "my demo helper")
+        self.assertEqual(lab(502), "my demo server")
+        self.assertEqual(lab(503), "Python running photo sorter")
+        self.assertEqual(lab(504), "Python")
+        self.assertEqual(lab(505), "Python")
+
+    def test_users_name_the_script_not_python(self):
+        rows = [(501, "pythonw.exe", 28 * _GB), (503, "python.exe", 3 * _GB),
+                (504, "python.exe", 1.5 * _GB), (9, "chrome.exe", 2 * _GB),
+                (77, "pythonw.exe", 4 * _GB)]
+        users = self.mod._memory_users(rows, own_pid=77, top=8)
+        self.assertEqual(users, [("my demo helper", 28.0),
+                                 ("my own process", 4.0),
+                                 ("Python running photo sorter", 3.0),
+                                 ("Chrome", 2.0), ("Python", 1.5)])
+
+    def test_small_python_processes_are_not_read(self):
+        rows = [(501, "python.exe", 0.1 * _GB)] * 3
+        self.mod._memory_users(rows, own_pid=1)
+        self.mod._python_cmdline.assert_not_called()
+
+    def test_command_lines_read_are_capped(self):
+        rows = [(1000 + i, "python.exe", 1 * _GB) for i in range(40)]
+        self.mod._memory_users(rows, own_pid=1)
+        self.assertEqual(self.mod._python_cmdline.call_count,
+                         self.mod.MEM_PY_LABEL_MAX)
+
+    def test_real_reader_never_raises(self):
+        # The real hook on a pid that does not exist (psutil's own error).
+        mod, _ = load_skill_isolated("system_pulse")
+        with mock.patch.object(mod, "psutil", create=True) as ps:
+            ps.Process.side_effect = RuntimeError("no such process")
+            self.assertEqual(mod._python_cmdline(424242), [])
+
+
+class PulseFreeMemoryTests(unittest.TestCase):
+    """free_memory (2026-11-17): live 2026-11-16 12:11:36 "try to clear the
+    ram" had no action, and the model's reply blamed missing permissions.
+    The answer is read-only and honest; the end-to-end routes are in
+    tests/monolith/test_monolith_free_memory.py."""
+
+    PULSE = {"ram_pct": 92.0, "cpu_pct": 20.0, "gpu_util_pct": 10.0}
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("system_pulse")
+        _no_cmdlines(self)
+
+    def _answer(self, rows):
+        return self.mod.free_memory_answer(pulse=dict(self.PULSE), procs=rows,
+                                           own_pid=77)
+
+    def test_registered_and_read_only(self):
+        self.assertIn("free_memory", self.actions)
+        with mock.patch.object(self.mod, "_current_pulse",
+                               return_value=dict(self.PULSE)), \
+                mock.patch.object(self.mod, "_read_process_memory",
+                                  return_value=[(9, "chrome.exe", 5 * _GB)]), \
+                mock.patch.object(self.mod, "_turn_words", return_value=""):
+            out = self.actions["free_memory"]("")
+        self.assertTrue(out.startswith("Memory at 92 percent, sir"), out)
+        self.assertIn("Say 'close Chrome' and I'll close it.", out)
+
+    def test_offers_the_biggest_app_he_can_close(self):
+        out = self._answer([(1, "llama-server.exe", 9 * _GB),
+                            (77, "pythonw.exe", 6 * _GB),
+                            (2, "claude.exe", 4 * _GB),
+                            (3, "chrome.exe", 2 * _GB)])
+        self.assertIn("The biggest memory users are my local brain model at 9 "
+                      "gigabytes, my own process at 6 and Claude at 4.", out)
+        self.assertIn("Say 'close Claude' and I'll close it.", out)
+        self.assertIn("Unloading my brain model would only make my next "
+                      "answer slower.", out)
+
+    def test_nothing_of_his_to_close(self):
+        out = self._answer([(1, "llama-server.exe", 9 * _GB),
+                            (2, "dwm.exe", 2 * _GB)])
+        self.assertNotIn("Say 'close", out)
+        self.assertIn(self.mod.FREE_MEMORY_CANT, out)
+
+    def test_only_a_name_the_close_would_find_is_offered(self):
+        # A service host summed over its instances and VS Code (its windows
+        # say "Visual Studio Code") are bigger than Discord: Discord, the one
+        # named user a "close" would find, is the offer.
+        out = self._answer([(1, "svchost.exe", 6 * _GB),
+                            (2, "code.exe", 5 * _GB),
+                            (4, "Discord.exe", 1 * _GB)])
+        self.assertIn("Svchost at 6 gigabytes, VS Code at 5 and Discord at 1",
+                      out)
+        self.assertIn("Say 'close Discord' and I'll close it.", out)
+        for name in ("Svchost", "VS Code"):
+            self.assertNotIn(f"close {name}'", out)
+
+    def test_no_offer_beyond_the_users_he_was_told(self):
+        out = self._answer([(1, "svchost.exe", 6 * _GB),
+                            (2, "code.exe", 5 * _GB),
+                            (3, "python.exe", 4 * _GB),
+                            (4, "chrome.exe", 1 * _GB)])
+        self.assertNotIn("Say 'close", out)
+
+    def test_no_reading_or_no_users_is_still_an_answer(self):
+        out = self.mod.free_memory_answer(pulse={}, procs=[], own_pid=1)
+        self.assertEqual(out, "No one app is holding much of it just now. "
+                         + self.mod.FREE_MEMORY_CANT)
+
+    def test_never_a_failure_marker_or_permissions(self):
+        from core.failure_markers import FAILURE_MARKERS
+        for rows in ([], [(3, "chrome.exe", 3 * _GB)],
+                     [(1, "llama-server.exe", 9 * _GB)]):
+            out = self._answer(rows).lower()
+            with self.subTest(out=out):
+                self.assertFalse([m for m in FAILURE_MARKERS if m in out])
+                self.assertNotIn("permission", out)
+
+    def test_never_raises(self):
+        with mock.patch.object(self.mod, "_memory_users",
+                               side_effect=RuntimeError("boom")):
+            self.assertEqual(self._answer([]), self.mod.FREE_MEMORY_CANT)
+
 
 if __name__ == "__main__":
     unittest.main()

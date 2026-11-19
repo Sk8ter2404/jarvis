@@ -926,7 +926,7 @@ def ring(aid: int, label: str = "", at: float | None = None,
            "stepping": False, "closed": False, "lock": threading.Lock()}
     unproven = 0          # input seen but not counted as his (_input_is_his)
     try:
-        print(f"  [alarm]\u23f0 ringing #{aid} {label}".rstrip())
+        print(f"  [alarm] \u23f0 ringing #{aid} {label}".rstrip())
         _persist()
         # The speaker switch and the volume are calls into the audio service
         # with no time limit of their own. They get a few seconds on their

@@ -214,6 +214,9 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         # which also names the HUD colour. Multi-word only: the bare word
         # "brain" would load this section for "brainstorm".
         "what brain", "which brain", "brain are you",
+        # 2026-11-17: live 11-16 "how's the brain model holding up?" asked
+        # how much it holds; the rows here send that to gpu_usage.
+        "brain model",
     ],
     # 2026-10-01 live: "how smart are you compared to Claude Opus 5.5" (asked
     # three times) loaded CLAUDE CREDITS + the three SMART HOME sections and
@@ -281,6 +284,9 @@ _SECTION_KEYWORDS: Dict[str, List[str]] = {
         # loaded MUSIC + VIDEO PLAYBACK and both memory sections on the
         # header words "video" / "memory", but never this one (gpu_usage).
         "video memory", "graphics memory", "gpu memory",
+        # 2026-11-17: free_memory ("clear the RAM" rides on "ram"; "free up
+        # some memory" named no word of this section).
+        "free up", "free memory", "free some memory",
     ],
     "BAMBU 3D PRINTER": [
         "print", "printer", "printing", "bambu", "3d", "filament", "nozzle",

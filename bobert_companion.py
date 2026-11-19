@@ -41739,6 +41739,11 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     # Single-sentence health/status aggregator (skills/system_pulse.py) and its
     # natural-phrasing aliases. Each returns one finished status sentence.
     "system_pulse", "check_system", "status_report",
+    # "Clear the RAM" (skills/system_pulse.free_memory_answer, 2026-11-17):
+    # the reading, the biggest users and an offer, built only from what was
+    # read. Spoken as written: the model's own restatement of the 11-16 turn
+    # was "I don't have the permissions".
+    "free_memory",
     # The audio READING (core/audio_check.py, 2026-10-09): one finished
     # answer built only from what was read. Spoken as written - an LLM
     # restatement could put back the very invented number it replaces - and
