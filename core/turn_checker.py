@@ -65,6 +65,16 @@ email).
 ``Verdict.reason`` is fixed wording plus registered action names, never the
 owner's or the reply's words, so it is safe to log.
 
+LOCAL CORRECTION (v3.0.26)
+==========================
+With no retry on Claude possible (chat kept local), a said_no_action verdict
+used to be a log line only (live 2026-11-16 02:02:44, after "I've disabled
+wake-word listening" had been spoken with nothing run). The monolith now runs
+``check_turn`` a second time on what the owner actually HEARD; when that is
+still said_no_action it speaks ``LOCAL_CORRECTION_LINE``
+(TURN_CHECK_LOCAL_CORRECTION). A claim the in-turn check withheld was never
+heard, so it gets no correction.
+
 Stdlib plus three repo modules, none doing I/O here (autocorrect is scored
 lexically, never over its embeddings endpoint), so it is testable on the
 light-deps CI runner (tests/test_turn_checker.py).
@@ -83,6 +93,7 @@ __all__ = [
     "COMMAND_NO_ACTION",
     "ESCALATE_MIN_CONFIDENCE",
     "KINDS",
+    "LOCAL_CORRECTION_LINE",
     "MADE_UP_ACTION",
     "OK",
     "ONE_MOMENT_LINE",
@@ -104,6 +115,13 @@ ESCALATE_MIN_CONFIDENCE = 0.8
 # Spoken while the turn is retried on Claude. One of the TTS pre-render
 # OPENERS (core/tts_render_cache.py), so it plays at once.
 ONE_MOMENT_LINE = "One moment, sir."
+
+# Spoken when a said_no_action claim REACHED the owner (it was voiced, not
+# withheld by the in-turn claim check) and no retry on Claude will follow:
+# the cloud is not allowed, or the model is retired (v3.0.26,
+# TURN_CHECK_LOCAL_CORRECTION; live 2026-11-16 02:02:44 the checker saw a
+# false "I've disabled wake-word listening" and could only log it).
+LOCAL_CORRECTION_LINE = "Correction, sir - I haven't actually done that yet."
 
 _CONF_MADE_UP = 0.95
 _CONF_MADE_UP_PARTIAL = 0.6     # other actions ran: a retry would repeat them

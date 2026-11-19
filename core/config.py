@@ -1019,9 +1019,15 @@ STT_HOTWORDS = ""
 # dict, so the owner's own entries are kept, and private names live only there):
 # live 11-16 23:57:51 "how's the Yetsi pace doing?" (the Etsy page) ->
 # project_status.
+# v3.0.26: live 11-16 02:02:35 "turn off lakework mode" (wake-word mode) - the
+# brain guessed, claimed "I've disabled wake-word listening" and ran nothing.
+# "lakework" / "lakeword" are no English words; the two-word forms only before
+# "mode", so "lake work" on its own is left alone.
 STT_REPLACEMENTS: dict = {
     "yetsi": "Etsy", "yetsy": "Etsy", "etsey": "Etsy",
     "yetsi pace": "Etsy page", "yetsy pace": "Etsy page",
+    "lakework": "wake word", "lakeword": "wake word",
+    "lake work mode": "wake word mode", "lake word mode": "wake word mode",
 }
 SITE_SHORTCUTS: dict = {}
 
@@ -1692,6 +1698,16 @@ TURN_CHECK_ESCALATE_MODEL = "claude-sonnet-5-5"
 #   so it ships False (the retry then needs the chat cloud or the boost,
 #   exactly as before).
 TURN_CHECK_CLOUD_ALWAYS = False
+# TURN_CHECK_LOCAL_CORRECTION (v3.0.26)  True = with TURN_CHECK_MODE 'on', a
+#   turn whose reply claimed an action that never ran, where that claim was
+#   actually SPOKEN (not withheld by the in-turn claim check, and not followed
+#   by an honest "I couldn't" line), and no Claude retry follows (the cloud is
+#   not allowed for chat, or the model is retired), ends with core.
+#   turn_checker.LOCAL_CORRECTION_LINE ("Correction, sir - I haven't actually
+#   done that yet."). Live 11-16 02:02:44 the checker saw a false claim and
+#   could only log it. Log line: "[turn-check] ... correcting it locally".
+#   'shadow' only logs "would correct locally". False = log only, as before.
+TURN_CHECK_LOCAL_CORRECTION = True
 
 # ─── Head hold (core/speech_plan.py, v3 W02, 2026-10-27) ─────────────────
 # The prose a reply writes BEFORE an action token whose result will still

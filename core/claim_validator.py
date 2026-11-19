@@ -146,6 +146,25 @@ _CHECK_NOT = (r"(?!\s+(?:in|out)\b)"
               r"(?!\s+(?:(?:my|the|that|this|your|our)\s+)?(?:math|maths|"
               r"arithmetic|calculations?|conversion|sums|working|reasoning|"
               r"spelling)\b)")
+# "set" family (v3.0.26): "I've set the volume to 40", "I'll set it at 72".
+# Only "set <it / the X / your X> to|at" - "I've set the record straight" and
+# "all set" are not claims, and "set a timer" is the timer family's.
+_SET_OBJ = (r"(?:(?:it|that|this|them|everything)|(?:the|your)\s+[\w-]+"
+            r"(?:\s+[\w-]+){0,2}?)\s+(?:to|at)\b")
+# A setting JARVIS changes or adjusts (never "my tone": a self-change).
+_ADJUST_OBJ = (r"(?:(?:it|that|this)|(?:the|your)\s+(?:[\w-]+\s+)?(?:volume|"
+               r"brightness|temperature|thermostat|lights?|lamp|fan|mode|"
+               r"settings?|voice|speed|level|mic|microphone|speakers?|"
+               r"output|input|input\s+device|output\s+device))\b")
+# What a start / stop claim acts on: a pronoun, or a thing JARVIS runs.
+# "Starting the morning with a coffee, I see" is banter, not a claim.
+_RUN_OBJ = (r"(?:(?:it|that|this|them|those|these)\b|(?:the|your|a|an|all|"
+            r"every|this|that)\s+(?:[\w-]+\s+){0,2}?(?:music|songs?|tracks?|"
+            r"playback|playlist|videos?|stream|timers?|alarms?|countdown|"
+            r"recording|scan|download|upload|backup|sync|print(?:\s+job)?|"
+            r"jobs?|process(?:es)?|pipeline|server|service|app|program|"
+            r"tests?|build|update|install(?:ation)?|transfer|eavesdropping|"
+            r"listening|monitoring|tracking|slideshow|presentation)\b)")
 
 _FAMILIES: tuple[tuple[str, str, str, str, frozenset[str]], ...] = (
     ("restart",
@@ -276,6 +295,52 @@ _FAMILIES: tuple[tuple[str, str, str, str, frozenset[str]], ...] = (
      r"muted|unmuted",
      r"mute|unmute",
      frozenset({"mute", "unmute", "volume", "sound", "audio", "mic"})),
+    # A mode / feature switched on or off (v3.0.26, live 2026-11-16
+    # 02:02:40): "Understood, sir. I've disabled wake-word listening." was
+    # spoken from the follow-up round with nothing run - no family had
+    # enable / disable / activate / deactivate, so neither the in-turn check
+    # nor the streaming flush saw a claim (the turn checker only saw the
+    # FIRST reply's "I've turned off", already withheld). Only first-person
+    # and clause-initial forms count, as for every family: "wake-word mode
+    # is disabled" / "it was enabled" describe state; "<x> has been
+    # disabled" is the passive rule's. Grounded by a mode / on / off /
+    # standby action only (plus the turn family's device actions, see
+    # _GROUND_ALSO) - "I've disabled it" is never grounded by get_time.
+    ("toggle",
+     r"(?:re-?)?enabling|disabling|activating|deactivating",
+     r"(?:re-?)?enabled|disabled|activated|deactivated",
+     r"(?:re-?)?enable|disable|activate|deactivate",
+     frozenset({"mode", "on", "off", "enable", "enabled", "disable",
+                "disabled", "toggle", "wake", "guest", "focus", "game",
+                "conversation", "listening", "standby", "dnd", "activate",
+                "deactivate", "ambient", "silent", "learning", "greet",
+                "eavesdropping", "start", "stop"})),
+    # A setting changed (v3.0.26): "I've set the volume to 40", "Setting
+    # it to 72 now", "I've adjusted the brightness". See _SET_OBJ /
+    # _ADJUST_OBJ for what is NOT a claim.
+    ("set",
+     r"setting\s+" + _SET_OBJ + r"|(?:changing|adjusting)\s+" + _ADJUST_OBJ,
+     r"set\s+" + _SET_OBJ + r"|(?:changed|adjusted)\s+" + _ADJUST_OBJ,
+     r"set\s+" + _SET_OBJ + r"|(?:change|adjust)\s+" + _ADJUST_OBJ,
+     frozenset({"set", "volume", "brightness", "heat", "cool", "thermostat",
+                "temperature", "mode", "level", "speed", "fan", "voice",
+                "profile", "change", "adjust", "mic", "output", "input",
+                "device", "audio"})),
+    # Something started or stopped (v3.0.26): "I've stopped the music",
+    # "Starting the backup now, sir.", "I'll stop it". The object must be a
+    # pronoun or a thing JARVIS runs (_RUN_OBJ); "start up" is the open
+    # family's, "start a timer" the timer family's (both listed earlier).
+    ("startstop",
+     r"(?:starting|stopping)\s+" + _RUN_OBJ,
+     r"(?:started|stopped)\s+" + _RUN_OBJ,
+     r"(?:start|stop)\s+" + _RUN_OBJ,
+     frozenset({"start", "stop", "cancel", "end", "pause", "resume", "play",
+                "music", "song", "track", "media", "spotify", "youtube",
+                "video", "timer", "alarm", "reminder", "record", "recording",
+                "backup", "sync", "scan", "pipeline", "eavesdropping",
+                "print", "printer", "download", "upload", "server",
+                "service", "kill", "close", "quit", "exit", "standby",
+                "listening", "monitor", "tracking"})),
     # "I've run the calculations, sir." / "Cross-referencing now." / "I've
     # crunched the numbers" (2026-10-01): stock completed-work lines spoken
     # live with no action run. Any action that ran this turn grounds them
@@ -570,6 +635,8 @@ _PASSIVE_FAMILIES: tuple[tuple[str, str], ...] = (
     ("mute", r"muted|unmuted|silenced"),
     ("restart", r"restarted|rebooted"),
     ("turn", r"turned\s+(?:on|off|up|down)"),
+    # "Wake-word mode is now disabled, sir." (v3.0.26; see the toggle family).
+    ("toggle", r"(?:re-?)?enabled|disabled|activated|deactivated"),
     ("timer", r"set(?:\s+up)?|scheduled|created|added"),
     # Generic completion: any action that ran this turn grounds it.
     ("done", r"done|completed|finished|handled|sorted(?:\s+out)?|"
@@ -830,10 +897,17 @@ def _ran_tokens(ran_actions: Iterable[str]) -> set[str]:
 # and "it has been sent to the printer" is print_document. A flagged reply is
 # withheld, so a report of an action that ran must not be read as a claim.
 # Grounding only - the lenient direction.
+_TURN_TOKENS = next(t for n, _g, _p, _b, t in _FAMILIES if n == "turn")
 _GROUND_ALSO: dict[str, frozenset[str]] = {
-    "switch": next(t for n, _g, _p, _b, t in _FAMILIES if n == "turn"),
-    "power": next(t for n, _g, _p, _b, t in _FAMILIES if n == "turn"),
+    "switch": _TURN_TOKENS,
+    "power": _TURN_TOKENS,
     "send": frozenset({"print", "printer"}),
+    # "I've activated the porch lights" after smart_home_control ran; "I've
+    # set the lamp to 40%" after the same, "I've set the playlist to
+    # shuffle" after a media action (v3.0.26).
+    "toggle": _TURN_TOKENS,
+    "set": _TURN_TOKENS | next(t for n, _g, _p, _b, t in _FAMILIES
+                               if n == "play"),
 }
 
 

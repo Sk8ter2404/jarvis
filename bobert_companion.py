@@ -18200,6 +18200,8 @@ _TURN_FLAG_KEYS = (
     "ACTION_FIT_ROBOT_SPEAK_ENFORCE",
     "ACTION_FIT_ACK_REPEAT_ENFORCE",
     "ACK_CLAIM_NO_FOLLOWUP",
+    # v3.0.26: a spoken false claim with no cloud retry gets a correction.
+    "TURN_CHECK_LOCAL_CORRECTION",
     "SELF_CHANGE_PROMISE_CHECK",
     # v3.0.9 lane B: site names, one action per offer yes, printer status.
     "SITE_NAME_SPOKEN_FORMS", "OFFER_YES_ONE_ACTION",
@@ -42304,7 +42306,10 @@ def _begin_turn_grounding(user_text: str):
                              # when this turn began: the action-fit guard
                              # (v3 W11) reads the previous turn's actions as
                              # the replay history entries before it.
-                             "t0": time.time()}
+                             "t0": time.time(),
+                             # JARVIS's last line asked sir something
+                             # (v3.0.26, _turn_prev_reply_asked).
+                             "prev_asked": _last_assistant_asked()}
     if prev is None:
         _turn_grounding.last_ran = frozenset()
     # "click that X" / "the one on screen": read the windows NOW (text only,
@@ -42695,6 +42700,62 @@ def _drop_timer_claims(text: str) -> str:
         return text
 
 
+# Wake-word mode switched, in the PAST tense or as "wake-word listening"
+# (v3.0.26, live 2026-11-16 02:02:35-40): "turn off <wake-word> mode" got
+# "I've turned off wake-word listening." (withheld by the claim check) and
+# then "I've disabled wake-word listening." (spoken), and nothing ran - the
+# patterns below the table's status row read only "turning off / disabling
+# ... wake word mode". These forms inject the setter ONLY when sir's own
+# words, not a question, name the wake word in the same direction
+# (_wake_toggle_asked): a reply alone never changes how JARVIS listens (the
+# A37 lesson - "I'm always listening, sir." once turned it off).
+_WAKE_WORD_OBJ = (r"(?:the\s+)?wake[-\s]*word"
+                  r"(?:\s+(?:mode|listening|requirement))?")
+_WAKE_OFF_DONE_RE = re.compile(
+    r"\b(?:i'?ve|i\s+have|i)\s+(?:just\s+|now\s+|already\s+)?"
+    r"(?:(?:turned|switched|shut)\s+off|disabled|deactivated|ended|exited|"
+    r"stopped\s+requiring)\s+" + _WAKE_WORD_OBJ + r"\b"
+    r"|\b(?:i'?ve|i\s+have|i)\s+(?:just\s+|now\s+)?(?:turned|switched)\s+"
+    r"(?:the\s+)?wake[-\s]*word\s+(?:mode|listening)\s+off\b"
+    r"|\b(?:turning|switching)\s+off\s+(?:the\s+)?wake[-\s]*word\s+"
+    r"listening\b|\bdisabling\s+(?:the\s+)?wake[-\s]*word\s+listening\b"
+    r"|\bwake[-\s]*word\s+(?:mode|listening)\s+(?:is\s+now|has\s+(?:now\s+)?"
+    r"been)\s+(?:(?:switched|turned)\s+off|off|disabled|deactivated)\b",
+    re.IGNORECASE)
+_WAKE_ON_DONE_RE = re.compile(
+    r"\b(?:i'?ve|i\s+have|i)\s+(?:just\s+|now\s+|already\s+)?"
+    r"(?:(?:turned|switched)\s+(?:back\s+)?on|(?:re-?)?enabled|"
+    r"(?:re-?)?activated|started\s+requiring)\s+" + _WAKE_WORD_OBJ + r"\b"
+    r"|\b(?:i'?ve|i\s+have|i)\s+(?:just\s+|now\s+)?(?:turned|switched)\s+"
+    r"(?:the\s+)?wake[-\s]*word\s+(?:mode|listening)\s+(?:back\s+)?on\b"
+    r"|\bwake[-\s]*word\s+(?:mode|listening)\s+(?:is\s+now|has\s+(?:now\s+)?"
+    r"been)\s+(?:(?:switched|turned)\s+on|on|(?:re-?)?enabled|activated)\b",
+    re.IGNORECASE)
+_WAKE_WORD_ASK_RE = re.compile(r"\bwake[-\s]*words?\b", re.IGNORECASE)
+_WAKE_OFF_ASK_RE = re.compile(
+    r"\b(?:off|disable|deactivate|stop|exit|leave|end|quit|without|"
+    r"no\s+longer|don'?t\s+(?:need|want|require))\b", re.IGNORECASE)
+_WAKE_ON_ASK_RE = re.compile(
+    r"\b(?:on|enable|activate|enter|require|start|back)\b", re.IGNORECASE)
+
+
+def _wake_toggle_asked(user_text, on: bool) -> bool:
+    """True when sir's words ask to switch wake-word mode ON (``on``) or OFF:
+    they name the wake word, are not a question, and point one way only
+    ("turn off wake word mode"; "Jarvis, wake word mode back on"). Never
+    raises (False)."""
+    try:
+        text = str(user_text or "").replace("’", "'")
+        if (not _WAKE_WORD_ASK_RE.search(text)
+                or _claim_validator.looks_like_question(text)):
+            return False
+        off = _WAKE_OFF_ASK_RE.search(text) is not None
+        on_word = _WAKE_ON_ASK_RE.search(text) is not None
+        return (on_word and not off) if on else (off and not on_word)
+    except Exception:
+        return False
+
+
 _PREEMPTIVE_HALLUCINATION_PATTERNS: list[tuple["re.Pattern", str | None, str]] = [
     # Ambient-LEARNING mode (silent standby + fact-extraction, wake on
     # 'JARVIS') is a DIFFERENT feature from the multimodal ambient/eavesdrop
@@ -42785,6 +42846,9 @@ _PREEMPTIVE_HALLUCINATION_PATTERNS: list[tuple["re.Pattern", str | None, str]] =
         r"(?:normal|always[-\s]on)\s+listening\b",
         re.IGNORECASE),
      "wake_word_mode_off", "disable wake-word mode"),
+    # The past tense and "wake-word listening" (v3.0.26) - only when sir's
+    # own words asked for it (_PREEMPT_OWNER_GATES, _wake_toggle_asked).
+    (_WAKE_OFF_DONE_RE, "wake_word_mode_off", "disable wake-word mode"),
     (re.compile(
         r"\b(?:enabling|turning\s+on|switching\s+(?:to|into|on)|entering|"
         r"going\s+into|activating|requiring)\s+wake[-\s]*word(?:\s+mode)?\b"
@@ -42793,6 +42857,7 @@ _PREEMPTIVE_HALLUCINATION_PATTERNS: list[tuple["re.Pattern", str | None, str]] =
         r"(?:going\s+into|entering|enabling|turning\s+on)\s+music\s+mode)\b",
         re.IGNORECASE),
      "wake_word_mode_on", "enable wake-word mode"),
+    (_WAKE_ON_DONE_RE, "wake_word_mode_on", "enable wake-word mode"),
 
     # Guest mode (2026-10-02): the model saying it has switched guest mode on
     # or off without the token would leave memory writes as they were. OFF
@@ -42920,6 +42985,16 @@ _PREEMPTIVE_HALLUCINATION_PATTERNS: list[tuple["re.Pattern", str | None, str]] =
     (_TIMER_STATE_CLAIM_RE, "list_timers", "state the timers from memory"),
 ]
 
+# Rows of the table above that inject only when sir's own words asked for
+# that action (v3.0.26): {pattern: predicate(user_text) -> bool}. A match
+# whose predicate says no is skipped and the scan goes on, so the claim
+# check still withholds the reply and the follow-up round answers instead.
+# The streaming flush still holds every row back (it never sees the gate).
+_PREEMPT_OWNER_GATES: dict = {
+    _WAKE_OFF_DONE_RE: lambda u: _wake_toggle_asked(u, on=False),
+    _WAKE_ON_DONE_RE: lambda u: _wake_toggle_asked(u, on=True),
+}
+
 
 # The first weather_briefing pattern: a bare "<n> degrees <unit>" (v3 W01
 # gives it its own cue rule in _detect_preemptive_hallucination).
@@ -42992,6 +43067,10 @@ def _detect_preemptive_hallucination(
         if _conversion and action_name == "weather_briefing":
             continue
         if not regex.search(scan):
+            continue
+        # v3.0.26: a row that needs sir's own ask (_PREEMPT_OWNER_GATES).
+        _gate = _PREEMPT_OWNER_GATES.get(regex)
+        if _gate is not None and not _gate(user_text):
             continue
         # v3 W01: a nozzle / PETG / oven / CPU temperature is not the weather
         # (replay web-04, p-temp-print*), and a bare "64 degrees" needs a
@@ -44941,17 +45020,78 @@ def _turn_taken_offer_text() -> str:
 def _turn_is_bare_ack() -> bool:
     """True when this owner turn's WHOLE line is a bare acknowledgement or
     decline (core.action_fit.is_bare_ack: "All right.", "No, not right
-    now.") and it accepted no open offer - action-fit rule 7 and the
-    ACK_CLAIM_NO_FOLLOWUP claim drop ask the same thing. While an offer was
-    open (_turn_offer_open) only a decline counts ("All right." may accept
-    it). False outside an owner turn. Never raises."""
+    now.") and it accepted no open offer - the ACK_CLAIM_NO_FOLLOWUP claim
+    drop asks it (action-fit rule 7 asks the strict core predicates itself).
+    While an offer was open (_turn_offer_open) only a decline counts ("All
+    right." may accept it). v3.0.26: a decline with a reason counts too
+    (core.action_fit.is_decline_with_reason) - with no offer open, only
+    right after JARVIS asked him something. False outside an owner turn.
+    Never raises."""
     try:
         user_text = _turn_user_text()
         if not user_text or _turn_accepted_offer():
             return False
+        # v3.0.26: a decline WITH a reason ("Not right now. That'll take
+        # forever.", live 2026-11-17 00:23:45) declines too - only here, for
+        # the claim drop; rule 7 keeps the strict predicates. Without an open
+        # offer it counts only when JARVIS's last line asked him something
+        # (_turn_prev_reply_asked): that line was a fast-path "Want the full
+        # list, sir?", which the offer slot never records.
         if _turn_offer_open():
-            return _action_fit.is_bare_decline(user_text)
-        return _action_fit.is_bare_ack(user_text)
+            return (_action_fit.is_bare_decline(user_text)
+                    or _action_fit.is_decline_with_reason(user_text))
+        if _action_fit.is_bare_ack(user_text):
+            return True
+        return (_turn_prev_reply_asked()
+                and _action_fit.is_decline_with_reason(user_text))
+    except Exception:
+        return False
+
+
+def _last_assistant_asked() -> bool:
+    """True when the newest assistant line in conversation_history asks the
+    owner something (a question or an offer: claim_validator.asks_owner).
+    Never raises (False)."""
+    try:
+        for m in reversed(conversation_history):
+            if isinstance(m, dict) and m.get("role") == "assistant":
+                content = m.get("content")
+                return (isinstance(content, str)
+                        and _claim_validator.asks_owner(content))
+        return False
+    except Exception:
+        return False
+
+
+def _turn_prev_reply_asked() -> bool:
+    """True when JARVIS's last line before this owner turn asked him
+    something - snapshotted as the turn began (_begin_turn_grounding), so the
+    turn's own replies never count. False outside an owner turn. Never
+    raises."""
+    try:
+        frame = getattr(_turn_grounding, "frame", None)
+        return bool(frame and frame.get("prev_asked"))
+    except Exception:
+        return False
+
+
+def _note_turn_ack_claim_dropped() -> None:
+    """Record that this turn's claim was dropped because sir only
+    acknowledged or declined (ACK_CLAIM_NO_FOLLOWUP): the turn checker then
+    has nothing to retry or correct (_turn_check_after_chain). Never
+    raises."""
+    try:
+        frame = getattr(_turn_grounding, "frame", None)
+        if frame is not None:
+            frame["ack_claim_dropped"] = True
+    except Exception:
+        pass
+
+
+def _turn_ack_claim_dropped() -> bool:
+    try:
+        frame = getattr(_turn_grounding, "frame", None)
+        return bool(frame and frame.get("ack_claim_dropped"))
     except Exception:
         return False
 
@@ -46089,11 +46229,14 @@ def parse_and_run_actions(reply: str) -> tuple[str, list[tuple[str, str, bool]]]
                     cleaned, ran_actions=_turn_actions_ran(),
                     user_text=_turn_user_text(), first=matched)
                 _ack_line = _ack_rest or _claim_validator.ACK_CLAIM_LINE
-                print(f"  [validation] sir only acknowledged or declined - "
-                      f"dropped the claim '{matched.strip()}' and no "
-                      f"follow-up round")
+                _why = ("only acknowledged or declined"
+                        if _action_fit.is_bare_ack(_turn_user_text())
+                        else "declined with a reason")
+                print(f"  [validation] sir {_why} - dropped the claim "
+                      f"'{matched.strip()}' and no follow-up round")
                 cleaned = _ack_line
                 matched = None
+                _note_turn_ack_claim_dropped()
             except Exception as _ack_err:
                 print(f"  [validation] ack-claim drop failed: "
                       f"{type(_ack_err).__name__}")
@@ -46874,6 +47017,16 @@ def handle_confirmation_response(user_text: str) -> bool:
             except Exception as _e:
                 print(f"  [confirm] informative follow-up failed: {_e}")
                 _fu = ""
+            # v3.0.26: its own [ACTION:] tokens never run here, so a claim
+            # of a NEW action in it is not spoken (_drop_unrun_claims).
+            if _fu and _ACTION_RE.search(str(_fu)):
+                print("  [confirm] the read-back named an action - not run")
+                _fu = re.sub(r"\s{2,}", " ",
+                             _ACTION_RE.sub(" ", str(_fu))).strip()
+            if _fu:
+                _fu = _drop_unrun_claims(
+                    _fu, ran_actions=list(executed) + list(_turn_actions_ran()),
+                    user_text=user_text, where="the confirmed read-back")
             if _fu:
                 _speak(_fu)
                 spoke_answer = True
@@ -53657,6 +53810,30 @@ def _turn_check_escalate_target() -> tuple:
         return model, model
 
 
+def _drop_unrun_claims(text, *, ran_actions=(), user_text="",
+                       where="read-back") -> str:
+    """``text`` - the prose of a brain reply whose own [ACTION:] tokens are
+    NOT run (the turn checker's retry read-back, a confirmed action's
+    read-back) - without the sentences that claim an action nothing ran
+    (claim_validator.find_unverified_claim / drop_unverified_claims,
+    grounded by ``ran_actions``). Those two paths spoke a model reply with no
+    claim check at all (v3.0.26 honesty audit). "" when nothing honest is
+    left. Never raises (``text`` unchanged on a fault)."""
+    try:
+        matched = _claim_validator.find_unverified_claim(
+            text, ran_actions=ran_actions, user_text=user_text)
+        if not matched:
+            return text
+        kept = _claim_validator.drop_unverified_claims(
+            text, ran_actions=ran_actions, user_text=user_text,
+            first=matched)
+        print(f"  [validation] {where}: not speaking the claim "
+              f"'{matched.strip()}' - nothing ran it")
+        return kept
+    except Exception:
+        return text
+
+
 def _turn_check_escalate(user_text, verdict, failed_texts, barge_seq0,
                          model=None) -> str:
     """'on' mode: retry this turn ONCE on Claude (TURN_CHECK_ESCALATE_MODEL,
@@ -53745,6 +53922,9 @@ def _turn_check_escalate(user_text, verdict, failed_texts, barge_seq0,
                           "not run (one retry round only)")
                 b_spoken = re.sub(r"\s{2,}", " ",
                                   _ACTION_RE.sub(" ", back)).strip()
+                b_spoken = _drop_unrun_claims(
+                    b_spoken, ran_actions=_turn_actions_ran(),
+                    user_text=user_text, where="the retry read-back")
                 if b_spoken and not _turn_check_barged(barge_seq0):
                     _speak(b_spoken)
         # The retry replaced the turn's reply: its offer, if it ends on one,
@@ -53803,15 +53983,50 @@ def _turn_check_flush(timeout: float = 5.0) -> bool:
     return True
 
 
+def _turn_check_local_correction_on() -> bool:
+    """TURN_CHECK_LOCAL_CORRECTION (core/config.py, default True). Never
+    raises."""
+    try:
+        return bool(globals().get("TURN_CHECK_LOCAL_CORRECTION", True))
+    except Exception:
+        return False
+
+
+def _turn_check_heard_claim(user_text, heard_texts, emitted, ran, registered,
+                            *, asked) -> bool:
+    """True when what sir actually HEARD this turn (``heard_texts``: every
+    line the dispatch spoke, the early-streamed part included) claims an
+    action nothing ran - the checker's own said_no_action rule
+    (core.turn_checker.check_turn) on those lines alone. A claim the in-turn
+    check withheld was never heard; an honest line after it ("I'm afraid I
+    couldn't finish that one") or a question makes the turn "ok". Never
+    raises (False)."""
+    try:
+        heard = " ".join(str(t or "") for t in heard_texts or ()).strip()
+        if not heard:
+            return False
+        v = _turn_checker.check_turn(
+            user_text, heard, emitted, ran, registered,
+            asked_question=True if asked else None,
+            **({"verb_clash": True} if _action_aliases_on() else {}))
+        return v.kind == _turn_checker.SAID_NO_ACTION
+    except Exception:
+        return False
+
+
 def _turn_check_judge(mode, user_text, chain_texts, chain_results,
                       registered, *, asked, needs_confirmation, cloud_allowed,
                       out=None, log_path_fn=None, close_line="",
-                      barge_seq0=0):
+                      barge_seq0=0, heard_texts=None):
     """The back half of _turn_check_after_chain: the verdict, the
     "[turn-check]" line (to ``out``, the stdout that was live when the turn
     ended), the jsonl row (at ``log_path_fn()``) and, in 'on' mode, the
     retry. Runs on the worker in 'shadow', on the voice thread in 'on'.
-    Returns the Verdict."""
+
+    v3.0.26 (TURN_CHECK_LOCAL_CORRECTION): a said_no_action turn that gets
+    no retry, and whose claim sir actually heard (``heard_texts``, see
+    _turn_check_heard_claim), ends with LOCAL_CORRECTION_LINE in 'on' mode;
+    'shadow' only says it would. Returns the Verdict."""
     emitted = _turn_check_emitted(chain_texts)
     ran = _turn_check_ran(chain_results)
     verdict = _turn_checker.check_turn(
@@ -53860,6 +54075,38 @@ def _turn_check_judge(mode, user_text, chain_texts, chain_results,
             print(f"  [turn-check] {verdict.kind} "
                   f"conf={verdict.confidence:.2f} ({verdict.reason}) - {why}",
                   file=out if out is not None else sys.stdout)
+        # The local correction (TURN_CHECK_LOCAL_CORRECTION): only where no
+        # retry on Claude follows - in 'shadow' too, judged as 'on' would be
+        # (``would`` and a live model = 'on' retries instead). Its own
+        # "[turn-fix]" line, so the turn keeps ONE "[turn-check]" line.
+        if (verdict.kind == _turn_checker.SAID_NO_ACTION
+                and not (would and not gone) and not needs_confirmation
+                and heard_texts is not None
+                and _turn_check_local_correction_on()):
+            _tc_out = out if out is not None else sys.stdout
+            if not _turn_check_heard_claim(user_text, heard_texts, emitted,
+                                           ran, registered, asked=asked):
+                print("  [turn-fix] the claim never reached sir (withheld, "
+                      "or an honest line followed) - no correction",
+                      file=_tc_out)
+            elif mode != "on":
+                print("  [turn-fix] would correct locally: the claim was "
+                      "spoken and nothing ran", file=_tc_out)
+            elif _turn_check_barged(barge_seq0):
+                print("  [turn-fix] barged - not correcting", file=_tc_out)
+            else:
+                print("  [turn-fix] the claim was spoken and nothing ran - "
+                      "correcting it locally (TURN_CHECK_LOCAL_CORRECTION)",
+                      file=_tc_out)
+                row["corrected"] = True
+                try:
+                    _speak(_turn_checker.LOCAL_CORRECTION_LINE)
+                    conversation_history.append(
+                        {"role": "assistant",
+                         "content": _turn_checker.LOCAL_CORRECTION_LINE})
+                except Exception as e:
+                    print(f"  [turn-check] could not speak the correction - "
+                          f"{type(e).__name__}", file=_tc_out)
         if escalate:
             row["escalated"] = True
             row["retry"] = "error"
@@ -53879,13 +54126,21 @@ def _turn_check_judge(mode, user_text, chain_texts, chain_results,
 
 
 def _turn_check_after_chain(user_text, chain_texts, chain_results, *,
-                            skip=False, close_line="", barge_seq0=0):
+                            skip=False, close_line="", barge_seq0=0,
+                            heard_texts=None):
     """Check one finished turn (TURN_CHECK_MODE); see the block comment
     above. ``chain_texts``: the first reply and every follow-up as the model
     wrote them; ``chain_results``: every round's (name, result, informative)
     tuples; ``skip``: a route-reply, glance, barged or self-voiced turn (not
     checked); ``close_line``: the close-out line spoken (and recorded), if
-    any.
+    any; ``heard_texts``: every line the dispatch actually spoke (v3.0.26,
+    for the local correction - None = unknown, no correction).
+
+    A turn whose claim the ack-claim drop already removed (sir only
+    acknowledged or declined, ACK_CLAIM_NO_FOLLOWUP) is not checked either
+    (v3.0.26): there is nothing to retry - live 2026-11-17 00:23:52 a
+    decline was logged said_no_action, and with the cloud allowed it would
+    have been retried on Claude.
 
     On the voice thread this only snapshots what the check needs (the end-of-
     turn state: the registry, a pending confirmation or autocorrect question,
@@ -53895,6 +54150,10 @@ def _turn_check_after_chain(user_text, chain_texts, chain_results, *,
     work."""
     mode = _turn_check_mode()
     if mode == "off" or skip or _turn_checker is None:
+        return None
+    if _turn_ack_claim_dropped():
+        print("  [turn-check] skipped - sir only acknowledged or declined "
+              "(the claim was dropped, nothing to retry)")
         return None
     results = list(chain_results or ())
     held = any(isinstance(r, (tuple, list)) and len(r) > 1
@@ -53916,7 +54175,9 @@ def _turn_check_after_chain(user_text, chain_texts, chain_results, *,
         cloud_allowed=bool(_chat_cloud_allowed() or _cloud_boost_on()
                            or _turn_check_cloud_always()),
         out=sys.stdout, log_path_fn=_turn_check_log_path,
-        close_line=close_line, barge_seq0=barge_seq0)
+        close_line=close_line, barge_seq0=barge_seq0,
+        heard_texts=(None if heard_texts is None
+                     else [str(t or "") for t in heard_texts]))
     args = (mode, user_text, list(chain_texts or ()), results,
             list(ACTIONS))     # one C-level copy; skills may register
     if mode == "shadow":
@@ -54293,8 +54554,14 @@ def _run_llm_dispatch_body(text: str) -> str:
     # Every sentence voiced so far this turn (CHAIN_LEAD_DEDUPE, v3.0.11): a
     # follow-up round's lead that repeats one is not said again.
     _chain_spoken = _chain_lines.spoken_keys(_stream_spoken_prefix[0])
+    # Every line this dispatch actually SPOKE, the early-streamed part first
+    # (v3.0.26): the turn checker's local correction reads what sir heard,
+    # not what the model wrote (a withheld claim was never heard).
+    _heard: list = ([_stream_spoken_prefix[0]] if _stream_spoken_prefix[0]
+                    else [])
     if spoken_text and not _barged:
         _after_reply_note(spoke=_speak(spoken_text))
+        _heard.append(spoken_text)
         _spoke_substance = _says_something(spoken_text)
         _chain_spoken |= _chain_lines.spoken_keys(spoken_text)
 
@@ -54539,6 +54806,7 @@ def _run_llm_dispatch_body(text: str) -> str:
         f_spoken = _drop_stale_offer_asides(f_spoken)
         if f_spoken and not _barged:
             _speak(f_spoken)
+            _heard.append(f_spoken)
             _spoke_substance = _spoke_substance or _says_something(f_spoken)
             _chain_spoken |= _chain_lines.spoken_keys(f_spoken)
         # A follow-up reply can itself emit a verbatim-result action (e.g. the
@@ -54582,6 +54850,7 @@ def _run_llm_dispatch_body(text: str) -> str:
               f"reported to sir — saying so")
         try:
             _speak(_close)
+            _heard.append(_close)
             conversation_history.append({"role": "assistant",
                                          "content": _close})
         except Exception as _co_err:
@@ -54604,7 +54873,7 @@ def _run_llm_dispatch_body(text: str) -> str:
             text, _chain_texts, _chain_results,
             skip=(_route_reply is not None or _glance_reply is not None
                   or _barged or _sv_reply),
-            close_line=_close, barge_seq0=_barge_seq0)
+            close_line=_close, barge_seq0=_barge_seq0, heard_texts=_heard)
     except Exception as _tc_err:
         print(f"  [turn-check] skipped - {type(_tc_err).__name__}: "
               f"{str(_tc_err)[:120]}")

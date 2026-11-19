@@ -432,7 +432,8 @@ def asks_rerun(user_text) -> bool:
 # "sure", "please", "go ahead", "do it", "again" are never bare (they ask),
 # and neither is any line with a request in it ("okay, play it").
 # core/claim_validator's ack-claim drop (ACK_CLAIM_NO_FOLLOWUP) asks the
-# same predicate (the monolith passes it this one).
+# same predicate (the monolith passes it this one) - and, since v3.0.26,
+# also is_decline_with_reason below, which rule 7 does NOT use.
 _BARE_ACK_WORDS = (
     r"all\s*right|alright|ok(?:ay)?|cool|nice|great|good|fine|got\s+it|"
     r"thanks|thank\s+you|no|nope|nah|not\s+now|not\s+right\s+now|"
@@ -485,6 +486,95 @@ def is_bare_decline(user_text) -> bool:
             return False
         text = _norm(user_text).lower().replace("’", "'")
         return _BARE_DECLINE_WORD_RE.search(text) is not None
+    except Exception:
+        return False
+
+
+# A decline WITH a reason (v3.0.26, live 2026-11-17 00:23:45): "Want the full
+# list, sir?" -> "Not right now. That'll take forever." is a decline, but the
+# reason sentence failed is_bare_decline (the WHOLE line must be ack words),
+# so the brain's "On it, sir." took two withheld rounds, a close-out ("I'm
+# afraid I couldn't finish that one") and 7 s. is_decline_with_reason is a
+# SEPARATE predicate: rule 7 keeps the strict is_bare_ack / is_bare_decline;
+# only the monolith's ack-claim drop (ACK_CLAIM_NO_FOLLOWUP) asks this one.
+# The head (the first sentence, or its first comma parts) must be a bare
+# decline; every later part must read as a reason: it starts with a subject /
+# hedge word (_REASON_OPENER_RE) or is courtesy only, and carries no request
+# or redirect word and nothing JARVIS could act on (_REASON_NOT_RE). "No.
+# Play the next one.", "No, I meant the other one", "No. The lights are
+# still on." and anything with a "?" stay False.
+_DECLINE_SENTENCE_RE = re.compile(r"(?<=[.!;…])\s+")
+_DECLINE_PART_RE = re.compile(r"\s*(?:,|\s[—–-]\s|[—–])\s*")
+_REASON_OPENER_RE = re.compile(
+    r"^(?:that|that'?s|that'?ll|that'?d|it|it'?s|it'?ll|it'?d|its|i|i'?m|"
+    r"i'?ll|i'?ve|i'?d|im|we|we'?re|we'?ll|we'?ve|there|there'?s|too|way|"
+    r"maybe|perhaps|probably|honestly|frankly|the|this|my|our|he|she|they|"
+    r"they'?re|you|you'?re|you'?ve|because|cause|'cause|since|sounds|seems|"
+    r"bit|kind|kinda|sort|sorta|not|nothing|no\s+need|later|another\s+time|"
+    r"some\s+other\s+time|long|late|busy|tired|all\s+good|i'?m\s+fine)\b")
+_REASON_NOT_RE = re.compile(
+    # a request / redirect / correction
+    r"\b(?:instead|rather|meant|mean|said|asked|wrong|other(?!\s+time)|"
+    r"another(?!\s+time)|"
+    r"different|again|still|actually|want|wanted|need|needed|would\s+like|"
+    r"'d\s+like|let'?s|please|can\s+you|could\s+you|would\s+you|will\s+you|"
+    r"not\s+(?:that|this|the|what|it\b)|that'?s\s+not|isn'?t\s+(?:it|that|"
+    r"right|working)|try|why|what|how|where|when|who|which|"
+    # things JARVIS acts on
+    r"music|songs?|tracks?|playlist|volume|loud(?:er)?|quiet(?:er)?|"
+    r"lights?|lamps?|timers?|alarms?|reminders?|weather|news|screens?|"
+    r"windows?|monitors?|e-?mails?|mail|messages?|texts?|calendar|youtube|"
+    r"spotify|netflix|videos?|tv|camera|mic|microphone|headset|speakers?|"
+    r"bright(?:ness|er)?|dark(?:er)?|dim|temperature|thermostat|heat|fan|"
+    r"printer|print|files?|folders?|apps?|browser|tabs?|search|mode|wake|"
+    r"robot|bot|open|close|play|pause|stop|turn|switch|show|"
+    r"tell|read|find|send|call|remind|skip|mute|unmute|cancel|undo)\b")
+
+
+def _decline_head_end(parts: list) -> int:
+    """How many leading comma parts of the first sentence form a bare
+    decline (is_bare_decline), longest first; 0 when none do."""
+    for k in range(len(parts), 0, -1):
+        if is_bare_decline(", ".join(parts[:k])):
+            return k
+    return 0
+
+
+def _is_reason_part(part: str) -> bool:
+    text = part.strip(" .!,;:…").lower().replace("’", "'")
+    if not text:
+        return True
+    if _BARE_ACK_RE.match(text):          # "thanks", "sir", "jarvis"
+        return True
+    return (_REASON_OPENER_RE.match(text) is not None
+            and _REASON_NOT_RE.search(text) is None)
+
+
+def is_decline_with_reason(user_text) -> bool:
+    """True when the owner's line DECLINES: it opens with a bare decline
+    (is_bare_decline: "No.", "Not right now", "No thanks") and everything
+    after it only gives a reason ("That'll take forever.", "I'm busy.",
+    "Maybe later."). A bare decline with nothing after it counts too. False
+    for any "?", a request, a redirect or a correction after the decline,
+    and anything naming a thing JARVIS acts on ("No. Play the next one.",
+    "No, the lights are still on."). Never raises."""
+    try:
+        text = _norm(user_text).replace("’", "'")
+        if not text or "?" in text:
+            return False
+        if is_bare_decline(text):
+            return True
+        sentences = [s for s in _DECLINE_SENTENCE_RE.split(text) if s.strip()]
+        if not sentences:
+            return False
+        first = [p for p in _DECLINE_PART_RE.split(sentences[0]) if p.strip()]
+        k = _decline_head_end(first)
+        if not k:
+            return False
+        rest = first[k:]
+        for s in sentences[1:]:
+            rest.extend(p for p in _DECLINE_PART_RE.split(s) if p.strip())
+        return bool(rest) and all(_is_reason_part(p) for p in rest)
     except Exception:
         return False
 
