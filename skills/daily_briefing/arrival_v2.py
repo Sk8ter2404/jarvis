@@ -152,6 +152,19 @@ def _import_skill(name: str):
         return None
 
 
+def _accepts_summoned(fn) -> bool:
+    """True when ``fn`` takes a ``summoned`` keyword (or **kwargs). Checked
+    once by signature, so a TypeError raised INSIDE the call can never make a
+    second call queue the line twice. Unreadable signature: assume yes."""
+    try:
+        import inspect
+        params = inspect.signature(fn).parameters
+        return "summoned" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    except (TypeError, ValueError):
+        return True
+
+
 def _enqueue_speech(message: str) -> None:
     """Route announcements through bobert_companion.proactive_announce when
     available so the queue write goes through the canonical drainer. Falls
@@ -161,12 +174,12 @@ def _enqueue_speech(message: str) -> None:
         bc = importlib.import_module("bobert_companion")
         announcer = getattr(bc, "proactive_announce", None)
         if callable(announcer):
-            try:
-                # summoned (2026-11-17, ARRIVAL_PASS_HOLDS_S): his arrival
-                # caused it, so for a while it passes the room-talk and
-                # media holds while he is here.
+            # summoned (2026-11-17, ARRIVAL_PASS_HOLDS_S): his arrival
+            # caused it, so for a while it passes the room-talk and
+            # media holds while he is here.
+            if _accepts_summoned(announcer):
                 announcer(message, source="arrival_v2", summoned="arrival")
-            except TypeError:
+            else:
                 announcer(message, source="arrival_v2")   # an older API
             return
     except Exception:

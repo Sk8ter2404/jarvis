@@ -604,3 +604,58 @@ class CreditsLocalBackendWaitTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CreditsUnchangedLowBalanceTests(unittest.TestCase):
+    """2026-11-19 (proactive-07): an unchanged low balance is spoken once, on a
+    lower step, or as a daily reminder -- not every 4 hours."""
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("credits_monitor")
+        self.mod._last_alert_at[0] = 0.0
+        self.mod._last_alert_balance[0] = None
+
+    def _check(self, dollars):
+        with mock.patch.object(self.mod, "_read_credits_via_vision",
+                               return_value=(dollars, "BALANCE: $%.2f" % dollars)),              mock.patch.object(self.mod, "_save_state"),              mock.patch.object(self.mod, "_enqueue_speech") as enq:
+            self.mod._check_and_maybe_alert()
+        return enq
+
+    def test_unchanged_balance_5h_later_is_quiet(self):
+        self.assertEqual(self._check(4.5).call_count, 1)
+        self.mod._last_alert_at[0] = time.time() - 5 * 3600
+        self._check(4.5).assert_not_called()
+
+    def test_lower_step_speaks_after_the_cooldown(self):
+        self._check(4.5)
+        self.mod._last_alert_at[0] = time.time() - 5 * 3600
+        self.assertEqual(self._check(1.5).call_count, 1)
+
+    def test_lower_step_inside_the_cooldown_waits(self):
+        self._check(4.5)
+        self._check(1.5).assert_not_called()
+
+    def test_daily_reminder_after_24h(self):
+        self._check(4.5)
+        self.mod._last_alert_at[0] = time.time() - 25 * 3600
+        self.assertEqual(self._check(4.5).call_count, 1)
+
+    def test_top_up_resets_so_the_next_dip_speaks(self):
+        self._check(4.5)
+        self._check(30.0)
+        self.assertIsNone(self.mod._last_alert_balance[0])
+        self.mod._last_alert_at[0] = time.time() - 5 * 3600
+        self.assertEqual(self._check(4.5).call_count, 1)
+
+    def test_balance_persisted_across_a_restart(self):
+        import json
+        fd, path = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"last_alert_at": time.time() - 5 * 3600,
+                       "last_alert_balance": 4.5}, f)
+        self.mod._STATE_FILE = path
+        self.mod._load_alert_cooldowns()
+        self.assertEqual(self.mod._last_alert_balance[0], 4.5)
+        self._check(4.5).assert_not_called()

@@ -189,10 +189,11 @@ def _reset_if_stale() -> None:
 
 
 def music_seen_within(seconds: float) -> bool:
-    """True while the classifier flags music (sustained or not yet - the
-    moment it crosses the threshold) or it ended within ``seconds``
-    (2026-11-17, bobert_companion._summoned_room_quiet: a clap's answer is
-    not spoken over music that the detector flagged a moment after the
+    """True while the classifier's music flag is set (it is set once the
+    window-fraction rule is met, not on the first musical chunk, so music that
+    began less than a window ago is not yet seen) or it ended within
+    ``seconds`` (2026-11-17, bobert_companion._summoned_room_quiet: a clap's
+    answer is not spoken over music the detector flagged a moment after the
     clap). Never raises (False)."""
     try:
         with _lock:
