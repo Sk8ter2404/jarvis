@@ -40914,7 +40914,10 @@ def _pregate_confirm_one(t_hit: float, score: float, speaking: bool) -> str:
             _listen_note("pregate_drops")
             return "dropped"
         peak = float(np.sqrt(np.mean(np.square(cut, dtype=np.float64))))
-        audio, _g = apply_capture_auto_gain(cut, peak)
+        # A RAW bus cut: its level is the whole cut's RMS (the pre-v3.0.26
+        # basis), not the 'clip' basis' loudest chunk, which would give a
+        # quiet wake cut 2-3x less gain.
+        audio, _g = apply_capture_auto_gain(cut, peak, clip_peak=peak)
         text, _conf = _wake_confirm_decode(audio)
         ok = _text_has_wake_prefix(text)
         if speaking:
@@ -41138,8 +41141,11 @@ def _wake_reanchor(text: str, conf) -> "str | None":
                         and len(_stt_clip) == len(audio)) else None)
         if not why:
             peak = float(np.sqrt(np.mean(np.square(cut, dtype=np.float64))))
+            # The processed re-decode clip takes the clip basis; the RAW cut
+            # fallback keeps its whole-cut level (as the pregate does).
             dec, _g = apply_capture_auto_gain(
-                _stt_cut if _stt_cut is not None else cut, peak)
+                _stt_cut if _stt_cut is not None else cut, peak,
+                clip_peak=None if _stt_cut is not None else peak)
             new_text, _c = _wake_confirm_decode(dec)
             if not _text_has_wake_prefix(new_text):
                 why = "re-decode"
