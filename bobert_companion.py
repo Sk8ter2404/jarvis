@@ -15714,6 +15714,130 @@ def _announce_device_changes(switches) -> None:
         print(f"  [audio] device-change announcement failed: {e}")
 
 
+# ── A newly plugged microphone is asked about, not followed (2026-11-17) ──
+# Overhaul speech-mic-announce. Live 11-17 17:09:57 a "USB microphone" became
+# Active and the Windows default; 17:10:23 JARVIS moved onto it ("Switched to
+# USB microphone") and listened there until he typed the switch back. Following
+# the default is the design (the Stream Deck moves it) and stays so for every
+# mic he has used or configured: the mics Windows listed when JARVIS started,
+# the headset / AUDIO_AUTOSWITCH_MIC_FALLBACK / PREFERRED_INPUT_DEVICES names,
+# and any mic JARVIS followed this session. Only a STRANGER is held (flag
+# AUDIO_FOLLOW_NEW_MIC, default False), and only while the mic JARVIS is on is
+# still present: a gone mic is always left. The hold is applied to the endpoint
+# pair read at the top of _refresh_devices, so the rest of the pass sees a mic
+# that never moved. It ends when Windows moves the default elsewhere, the old
+# mic goes, or he says "use the new microphone" (_accept_held_new_mic).
+_NEW_MIC_STATE: dict = {"known": None, "held": None, "accepted": ""}
+_new_mic_lock = threading.Lock()
+
+
+def _fragment_matches_endpoint(endpoint_id, fragments) -> bool:
+    """Does the endpoint's Windows friendly name contain any of the name
+    ``fragments`` (case-insensitive, empty ones ignored)? Never raises."""
+    try:
+        friendly = (_win_endpoint_friendly_name(endpoint_id) or "").lower()
+        return bool(friendly) and any(
+            f and str(f).strip().lower() in friendly for f in (fragments or ()))
+    except Exception:
+        return False
+
+
+def _new_mic_name_known(endpoint_id) -> bool:
+    """Is this capture endpoint one he has configured: the headset, the desk-mic
+    fallback or a PREFERRED_INPUT_DEVICES fragment? Unreadable = not known (the
+    caller then asks, which is safe)."""
+    frags = [globals().get("AUDIO_AUTOSWITCH_HEADSET", ""),
+             globals().get("AUDIO_AUTOSWITCH_MIC_FALLBACK", "")]
+    frags += list(globals().get("PREFERRED_INPUT_DEVICES") or [])
+    return _fragment_matches_endpoint(endpoint_id, frags)
+
+
+def _apply_new_mic_hold(now_eps, prev_eps, act, now: float):
+    """The (render, capture) default endpoints JARVIS should act on this pass:
+    ``now_eps`` unless its capture endpoint is a stranger that has just become
+    the default while the mic JARVIS is on is still present, in which case the
+    capture half stays ``prev_eps``'. Never raises (it runs in _refresh_devices;
+    any error follows the default as before)."""
+    try:
+        if (globals().get("AUDIO_FOLLOW_NEW_MIC", False) or act is None
+                or prev_eps is None or now_eps is None
+                or globals().get("MICROPHONE_INDEX") is not None
+                or not now_eps[1] or not prev_eps[1]):
+            with _new_mic_lock:
+                _NEW_MIC_STATE["held"] = None
+            return now_eps
+        new_ep, prev_ep = now_eps[1], prev_eps[1]
+        with _new_mic_lock:
+            known = _NEW_MIC_STATE["known"]
+            if known is None:       # the boot baseline: what is there is his
+                known = _NEW_MIC_STATE["known"] = set(
+                    _endpoint_ids_of(act, True)) | {new_ep, prev_ep}
+            held = _NEW_MIC_STATE["held"]
+            if new_ep == prev_ep or new_ep in known:
+                _NEW_MIC_STATE["held"] = None
+                return now_eps
+            if _NEW_MIC_STATE["accepted"] == new_ep:
+                known.add(new_ep)
+                _NEW_MIC_STATE["held"] = None
+                return now_eps
+            if _audio_endpoint_gone(prev_ep, act):
+                known.add(new_ep)       # what he was on is gone: leave it
+                _NEW_MIC_STATE["held"] = None
+                return now_eps
+            if _new_mic_name_known(new_ep):
+                known.add(new_ep)
+                _NEW_MIC_STATE["held"] = None
+                return now_eps
+            # PREFERRED_INPUT_DEVICES names the mic JARVIS is on: _pick_device
+            # keeps it whatever the default does, so there is nothing to hold
+            # and nothing to ask (the preference is respected as it always was).
+            if _fragment_matches_endpoint(
+                    prev_ep, globals().get("PREFERRED_INPUT_DEVICES")):
+                _NEW_MIC_STATE["held"] = None
+                return now_eps
+            first = not (held and held.get("ep") == new_ep
+                         and held.get("prev") == prev_ep)
+            if first:
+                _NEW_MIC_STATE["held"] = {"ep": new_ep, "prev": prev_ep,
+                                          "since": now}
+        if first:
+            new_name = _audio_endpoint_label(new_ep)
+            cur_name = _audio_endpoint_label(prev_ep)
+            print(f"  [audio] new microphone {new_name} became the Windows "
+                  f"default - staying on {cur_name} until sir says to switch "
+                  f"(AUDIO_FOLLOW_NEW_MIC is off)")
+            try:
+                proactive_announce(
+                    f"{new_name[0].upper()}{new_name[1:]} appeared and "
+                    f"Windows made it the default, sir. I'm staying on "
+                    f"{cur_name}. Say 'use the new microphone' to switch.",
+                    source="audio", dedupe_key="audio:new_mic")
+            except Exception as e:
+                print(f"  [audio] new-microphone notice failed: {e}")
+        return (now_eps[0], prev_ep)
+    except Exception:
+        return now_eps
+
+
+def _accept_held_new_mic() -> str:
+    """Voice action: follow the held new microphone. Returns its spoken name,
+    or "" when nothing is held. The next refresh pass (<= 4 s) switches."""
+    with _new_mic_lock:
+        held = _NEW_MIC_STATE.get("held")
+        if not held:
+            return ""
+        _NEW_MIC_STATE["accepted"] = held["ep"]
+        ep = held["ep"]
+    try:
+        # He is told in words ("Listening on ... now"), so the pass that
+        # follows must not announce the same switch again (actions-09).
+        _note_owner_audio_switch("in", ep, _win_endpoint_friendly_name(ep) or "")
+        _device_cache["checked_at"] = 0.0
+    except Exception:
+        pass
+    return _audio_endpoint_label(ep)
+
+
 def _refresh_devices(force: bool = False):
     """Re-check preferred devices if enough time has passed.
     Logs a message when the active device changes.
@@ -15870,6 +15994,10 @@ def _refresh_devices(force: bool = False):
             # source than the default). Never decide from two snapshots that
             # disagree — unknown for this pass, the next pass re-reads.
             _act = None
+        # A stranger microphone that just became the default is held, not
+        # followed (2026-11-17, AUDIO_FOLLOW_NEW_MIC): everything below sees a
+        # capture default that never moved.
+        _now_eps = _apply_new_mic_hold(_now_eps, _prev_eps, _act, now)
         _in_stale, _out_stale = _audio_endpoint_state_pass(_act)
         _audio_default_flip_pass(_now_eps if _have_eps else None)
         _default_moved = bool(_have_eps and _prev_eps is not None

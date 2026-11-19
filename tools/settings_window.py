@@ -923,6 +923,17 @@ SCHEMA: dict[str, dict] = {
                 "On: also every 5 minutes, which briefly closes and reopens "
                 "the microphone each time.",
     },
+    # 2026-11-17 (overhaul speech-mic-announce): a newly plugged microphone.
+    "AUDIO_FOLLOW_NEW_MIC": {
+        "tab": "hearing", "label": "Follow a newly plugged microphone",
+        "type": "bool", "default": False,
+        "help": "Off: when a microphone JARVIS has never used appears and "
+                "Windows makes it the default, JARVIS keeps the one it is on, "
+                "tells you once, and switches only when you say 'use the new "
+                "microphone'. The headset, the desk-mic fallback and any "
+                "preferred microphone are followed as always. On: JARVIS "
+                "follows any new default after a few seconds.",
+    },
     # 2026-07-08: surface the Whisper STT device/model so the v2.0.23 crash-
     # workaround is settable AND persisted — previously they lived only in
     # core/config.py, so a Settings save (which rewrites user_settings.json from
@@ -2459,7 +2470,8 @@ TAB_SECTIONS: dict[str, list[tuple[str, list[str]]]] = {
         ("Device changes", ["AUDIO_FLAP_WINDOW_S", "AUDIO_FLAP_THRESHOLD",
                             "AUDIO_ANNOUNCE_MIN_GAP_S",
                             "AUDIO_REPICK_STABLE_S",
-                            "AUDIO_PERIODIC_REENUM"]),
+                            "AUDIO_PERIODIC_REENUM",
+                            "AUDIO_FOLLOW_NEW_MIC"]),
         ("Speech recognition", ["WHISPER_DEVICE", "WHISPER_MODEL_CUDA",
                                 "PARAKEET_DEVICE", "SMART_TURN_DEVICE",
                                 "VOICE_ID_DEVICE", "LISTEN_GPU",

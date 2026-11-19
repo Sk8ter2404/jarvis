@@ -393,6 +393,11 @@ class EndpointWatchReenumTests(_Base):
     def test_a_plugged_in_mic_is_still_re_enumerated_at_once(self):
         # The sweep's whole job, done by the watch: a capture endpoint that
         # was not there at the last enumeration appears.
+        # The desk mic is the configured fallback (as on the live box), so a
+        # new default that is it is followed; a STRANGER is held instead
+        # (tests/monolith/test_monolith_new_mic.py).
+        self._p(self.bc, "AUDIO_AUTOSWITCH_MIC_FALLBACK", "Desk Mic",
+                create=True)
         self.world.active.discard(DESK)
         self.world.default_in = HS_MIC
         self.world.table = self.world._rows()

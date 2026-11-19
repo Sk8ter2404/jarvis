@@ -188,6 +188,8 @@ _MONOLITH_RESTORE_NAMES = (
     "_silent_mic_recover_s",
     # 2026-11-17: the owner-confirmed audio switch stamps (actions-09).
     "_owner_audio_switch",
+    # 2026-11-17: the held-new-microphone state (speech-mic-announce).
+    "_NEW_MIC_STATE",
     # ── voice fast-path latches (bobert_companion-local single-element lists) ─
     # Reset to [None]/[False] so a wake detector built (or a disable-latch
     # tripped) in one test can't bleed into the next. (tests/monolith/

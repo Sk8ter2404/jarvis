@@ -29,6 +29,7 @@ from audio import audio_switch
 SPEAK_VERBATIM_ACTIONS = (
     "use_headset_mic", "switch_to_headset_mic",
     "use_desk_mic", "switch_to_desk_mic",
+    "use_new_mic", "switch_to_new_mic",
     "which_mic_is_active",
 )
 
@@ -57,12 +58,18 @@ PROMPT_EXAMPLES = (
     "                       - listen on the DESK microphone instead. Fire on\n"
     "                         'use my desk mic', 'switch to the desk mic',\n"
     "                         'stop using the headset mic', 'use the desk mic'.\n"
+    "  use_new_mic / switch_to_new_mic\n"
+    "                       - ONLY after JARVIS said a new microphone appeared\n"
+    "                         and he is staying on his own: switch to it. Fire\n"
+    "                         on 'use the new microphone', 'switch to the new\n"
+    "                         mic', 'yes, use it'.\n"
     "  which_mic_is_active  - report WHICH recording device is selected and\n"
     "                         whether anything is overriding the choice. Fire\n"
     "                         on 'which mic is active', 'which microphone are\n"
     "                         you set to', 'are you on the headset mic'.\n"
     "    Example: 'use my desk mic' -> [ACTION: use_desk_mic]\n"
     "    Example: 'listen on my headset' -> [ACTION: use_headset_mic]\n"
+    "    Example: 'use the new microphone' -> [ACTION: use_new_mic]\n"
     "    Example: 'which mic is active' -> [ACTION: which_mic_is_active]\n"
     "  These change or report the INPUT device only. They are not volume, and\n"
     "  they are not use_headset / use_speakers, which move the OUTPUT."
@@ -335,6 +342,20 @@ def register(actions):
         _note_owner_switch("in", mic)
         return _capture_sentence(mic[1])
 
+    def use_new_mic(_: str = "") -> str:
+        """Follow the new microphone JARVIS held back (bobert_companion.
+        _apply_new_mic_hold, AUDIO_FOLLOW_NEW_MIC off). sys.modules only."""
+        try:
+            bc = sys.modules.get("bobert_companion")
+            fn = getattr(bc, "_accept_held_new_mic", None) if bc else None
+            name = fn() if callable(fn) else ""
+        except Exception:
+            name = ""
+        if not name:
+            return ("There's no new microphone waiting, sir. Say 'use my desk "
+                    "mic' or 'use my headset mic' to choose one.")
+        return f"Switching the microphone to {name} now, sir."
+
     def which_mic_is_active(_: str = "") -> str:
         """Which recording device is selected - and what is overriding it.
 
@@ -383,6 +404,8 @@ def register(actions):
     actions["switch_to_headset_mic"] = use_headset_mic
     actions["use_desk_mic"] = use_desk_mic
     actions["switch_to_desk_mic"] = use_desk_mic
+    actions["use_new_mic"] = use_new_mic
+    actions["switch_to_new_mic"] = use_new_mic
     actions["which_mic_is_active"] = which_mic_is_active
 
     actions["audio_autoswitch_status"] = audio_autoswitch_status
