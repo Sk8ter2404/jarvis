@@ -590,6 +590,91 @@ class StateIOTests(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────
+# 2026-11-17: the briefing is "heard" only once spoken (core/queue_receipts)
+# ─────────────────────────────────────────────────────────────────────────
+class HeardReceiptTests(unittest.TestCase):
+    """Live 11-17 06:35:30 the briefing was queued, held for 9.5 hours and
+    dropped as too old (16:02:41) - while _mark_fired had counted the morning
+    as briefed from the moment it was queued."""
+
+    def setUp(self):
+        self.mod, _ = load_briefing_part("arrival_v2")
+        self.tmp = tempfile.mkdtemp(prefix="arrv2_heard_")
+        self.addCleanup(lambda: _rmtree(self.tmp))
+        self.mod._STATE_FILE = os.path.join(self.tmp, "state.json")
+        from core import queue_receipts
+        queue_receipts.reset()
+        self.addCleanup(queue_receipts.reset)
+        self.qr = queue_receipts
+        self.today = time.strftime("%Y-%m-%d")
+        self.entry = {"ts": time.time() - 60, "source": "arrival_v2",
+                      "message": "[intent:briefing] Good morning, sir."}
+
+    def _queued(self):
+        self.mod._mark_fired("presence watcher", queued=True)
+
+    def test_a_queued_briefing_is_covered_but_not_heard(self):
+        self._queued()
+        st = self.mod._load_state()
+        self.assertEqual(st["last_fired_date"], self.today)
+        self.assertIs(st["heard"], False)
+        self.assertTrue(self.mod._already_fired_today())
+
+    def test_a_plain_mark_has_no_heard_flag(self):
+        self._queued()
+        self.mod._mark_fired("suppressed (morning_chain briefed)")
+        self.assertNotIn("heard", self.mod._load_state())
+
+    def test_spoken_marks_it_heard_and_keeps_the_day_covered(self):
+        self.mod._register_receipts()
+        self._queued()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.qr.note_spoken(self.entry)
+        st = self.mod._load_state()
+        self.assertIs(st["heard"], True)
+        self.assertEqual(st["heard_date"], self.today)
+        self.assertTrue(self.mod._already_fired_today())
+
+    def test_dropped_unheard_uncovers_the_day(self):
+        self.mod._register_receipts()
+        self._queued()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.qr.note_dropped(self.entry, "briefing: waited 34031 s, "
+                                             "limit 21600 s")
+        self.assertFalse(self.mod._already_fired_today())
+        st = self.mod._load_state()
+        self.assertIn("dropped unheard", st["last_reason"])
+        self.assertIn("dropped unheard", out.getvalue())
+        # ...and he is told of it when he asks what he missed.
+        self.assertEqual([m[2] for m in self.qr.missed()], ["briefing"])
+
+    def test_a_drop_after_it_was_heard_changes_nothing(self):
+        self.mod._register_receipts()
+        self._queued()
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.qr.note_spoken(self.entry)
+            self.qr.note_dropped(self.entry, "x")
+        self.assertTrue(self.mod._already_fired_today())
+
+    def test_yesterdays_line_dropped_does_not_uncover_today(self):
+        self.mod._register_receipts()
+        self._queued()
+        old = dict(self.entry, ts=time.time() - 2 * 86400)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.qr.note_dropped(old, "briefing: waited 172800 s")
+        self.assertTrue(self.mod._already_fired_today())
+
+    def test_enqueue_marks_the_line_summoned(self):
+        calls = []
+        bc = _fake_mod("bobert_companion",
+                       proactive_announce=lambda msg, source=None, **k: calls.append(
+                           (source, k)))
+        with inject_modules(bobert_companion=bc):
+            self.mod._enqueue_speech("morning sir")
+        self.assertEqual(calls, [("arrival_v2", {"summoned": "arrival"})])
+
+
+# ─────────────────────────────────────────────────────────────────────────
 # _chain_morning_briefing_fired_today (the chain part faked)
 # ─────────────────────────────────────────────────────────────────────────
 class ChainFiredTests(unittest.TestCase):
@@ -1228,7 +1313,7 @@ class GatherAndFireTests(unittest.TestCase):
             out = self.mod._fire_arrival("presence")
         self.assertEqual(out, "[intent:briefing] hi")
         enq.assert_called_once_with("[intent:briefing] hi")
-        mark.assert_called_once_with("presence")
+        mark.assert_called_once_with("presence", queued=True)
 
     def test_fire_arrival_starts_the_arrival_quiet(self):
         # v3.0.10 (ARRIVAL_QUIET_MINUTES): live 2026-10-29 07:22:03 the

@@ -1019,9 +1019,9 @@ WEATHER_ALERT_COOLDOWN_HOURS      = 4      # per-alert-class cooldown
 # the pattern_learning JSONL, today's session logs, Teams events, and
 # bambu_monitor state ("Sir, today you spent 2 hours 40 minutes in Bambu
 # Studio, completed one print, took 4 Teams calls including one from a
-# colleague, and played 11 tracks. Shall I queue the same morning
-# briefing for tomorrow?"). Also runs on demand via the daily_recap action
-# ("JARVIS, recap my day").
+# colleague, and played 11 tracks."; no closing question since 2026-11-17,
+# and the scheduled one leaves out what the evening briefing already said).
+# Also runs on demand via the daily_recap action ("JARVIS, recap my day").
 DAILY_RECAP_ENABLED           = True
 DAILY_RECAP_HOUR              = 22    # 24-hour clock, local time
 DAILY_RECAP_MINUTE            = 30
@@ -1451,6 +1451,21 @@ PROACTIVE_MAX_UNANSWERED = 2
 PROACTIVE_ATTEMPT_GAP_S  = 300
 # How many recent remarks a new one may not repeat (core/proactive_guard).
 PROACTIVE_RECENT_RING    = 8
+# 2026-11-17 (live 11-16): "...the first computer mouse was made of wood." at
+# 09:28 and again at 12:30 after the 10:11 restart - the ring above lived in
+# memory only. Spoken remarks are also kept on disk (data/proactive_recent.json,
+# restored at boot): a new one may not repeat any of the last
+# PROACTIVE_RECENT_KEEP_N spoken within PROACTIVE_RECENT_KEEP_S. 0 = memory
+# only, as before.
+PROACTIVE_RECENT_KEEP_S  = 7 * 86400
+PROACTIVE_RECENT_KEEP_N  = 30
+# ...and 11:25-12:25 four generations in a row were dropped as a copy of the
+# persona example "One moment, sir.", each a ~12k-token brain call five
+# minutes after the last. After PROACTIVE_DROP_STREAK drops in a row the next
+# attempt waits PROACTIVE_DROP_BACKOFF_S instead of PROACTIVE_ATTEMPT_GAP_S;
+# a spoken remark ends the streak. 0 = no backoff, as before.
+PROACTIVE_DROP_STREAK    = 2
+PROACTIVE_DROP_BACKOFF_S = 3600
 
 MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bobert_memory.json")
 
@@ -14677,7 +14692,8 @@ def proactive_announce(message: str, source: str = "skill",
                        offer: bool = False,
                        urgent: bool = False,
                        still_valid: str | None = None,
-                       history_text: str | None = None) -> bool:
+                       history_text: str | None = None,
+                       summoned: str | None = None) -> bool:
     """Public proactive-speech API for skills.
 
     Skills that want JARVIS to speak something unprompted (print milestones,
@@ -14730,6 +14746,13 @@ def proactive_announce(message: str, source: str = "skill",
     follow-up ("open that one") needs the full answer. Capped at
     _HISTORY_TEXT_MAX_CHARS. Without it the old rule applies (a question or
     `offer` is recorded, a plain statement is not).
+
+    `summoned` (2026-11-17, core/owner_presence.SUMMONED_RULES): "clap" or
+    "arrival" - a line he caused a moment ago (his double clap, his face
+    arriving in the morning). For a short window (CLAP_ACK_PASS_HOLDS_S /
+    ARRIVAL_PASS_HOLDS_S) it speaks through the room-talk hold (and, for the
+    arrival briefing, the media hold) while he is present; never through
+    "owner away", "gaming" or a speech hold (_summoned_pass).
     """
     # ── FOCUS MODE GATE ──────────────────────────────────────────────────────
     # This is the whole point of focus / do-not-disturb: while the owner is
@@ -14817,6 +14840,8 @@ def proactive_announce(message: str, source: str = "skill",
                 :_HISTORY_TEXT_MAX_CHARS]
         if urgent:
             entry["urgent"] = True
+        if summoned:
+            entry["summoned"] = str(summoned)
         if still_valid:
             # Re-checked by the drain just before speaking
             # (skills.bambu_monitor.speech_still_valid); False drops the line.
@@ -17476,7 +17501,12 @@ def should_be_proactive() -> bool:
         last_attempt_at=float(_proactive_last_attempt_at[0] or 0.0),
         cooldown_s=PROACTIVE_COOLDOWN_S, factor=PROACTIVE_BACKOFF_FACTOR,
         max_unanswered=PROACTIVE_MAX_UNANSWERED,
-        attempt_gap_s=PROACTIVE_ATTEMPT_GAP_S)
+        attempt_gap_s=_proactive_guard.attempt_gap_s(
+            int(_proactive_drop_streak[0] or 0),
+            base_s=PROACTIVE_ATTEMPT_GAP_S,
+            streak_min=int(globals().get("PROACTIVE_DROP_STREAK", 0) or 0),
+            backoff_s=float(globals().get("PROACTIVE_DROP_BACKOFF_S", 0)
+                            or 0)))
     if not ok:
         return _proactive_hold("pacing", why)
 
@@ -17518,8 +17548,89 @@ def _proactive_note_spoken(text: str) -> None:
         _proactive_remarks_at.append(_proactive_mono())
         del _proactive_remarks_at[:-16]
         _proactive_hold_logged[0] = ""
+        _proactive_drop_streak[0] = 0
     except Exception:
         pass
+    _proactive_saved_note(text)
+
+
+def _proactive_recent_path() -> str:
+    """data/proactive_recent.json, resolved at call time (core/paths)."""
+    from core.paths import data_file
+    return data_file("proactive_recent.json")
+
+
+def _proactive_saved_prune(now: float) -> None:
+    """Keep the saved remarks within PROACTIVE_RECENT_KEEP_S and the newest
+    PROACTIVE_RECENT_KEEP_N. Never raises."""
+    try:
+        keep_s = float(globals().get("PROACTIVE_RECENT_KEEP_S", 0) or 0)
+        keep_n = max(1, int(globals().get("PROACTIVE_RECENT_KEEP_N", 30) or 30))
+        _proactive_saved[:] = [
+            (t, x) for t, x in _proactive_saved
+            if keep_s > 0 and 0 <= now - t <= keep_s][-keep_n:]
+    except Exception:
+        pass
+
+
+def _proactive_saved_note(text: str) -> None:
+    """A remark was spoken: add it to the saved ring and write it out
+    (PROACTIVE_RECENT_KEEP_S 0 = off). Never raises."""
+    try:
+        if float(globals().get("PROACTIVE_RECENT_KEEP_S", 0) or 0) <= 0:
+            return
+        now = time.time()
+        _proactive_saved.append((now, str(text)))
+        _proactive_saved_prune(now)
+        from core.atomic_io import _atomic_write_json as _w
+        _w(_proactive_recent_path(),
+           [{"t": t, "text": x} for t, x in _proactive_saved])
+    except Exception as _e:
+        print(f"  [proactive] could not save the recent remarks: {_e}")
+
+
+def _proactive_recent_restore() -> int:
+    """Boot: read the remarks the last runs spoke (data/proactive_recent.json)
+    into the saved ring, so a restart cannot repeat one. Returns how many
+    were kept. A missing / corrupt file keeps none. Never raises."""
+    try:
+        if float(globals().get("PROACTIVE_RECENT_KEEP_S", 0) or 0) <= 0:
+            return 0
+        path = _proactive_recent_path()
+        if not os.path.exists(path):
+            return 0
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        rows = []
+        for r in data if isinstance(data, list) else []:
+            if (isinstance(r, dict) and isinstance(r.get("text"), str)
+                    and isinstance(r.get("t"), (int, float))
+                    and not isinstance(r.get("t"), bool)):
+                rows.append((float(r["t"]), r["text"]))
+        _proactive_saved[:] = sorted(rows + list(_proactive_saved))
+        _proactive_saved_prune(time.time())
+        if _proactive_saved:
+            print(f"  [proactive] remembered {len(_proactive_saved)} recent "
+                  f"remark(s) from earlier runs")
+        return len(_proactive_saved)
+    except Exception as _e:
+        print(f"  [proactive] could not read the recent remarks: {_e}")
+        return 0
+
+
+def _proactive_recent_all() -> list:
+    """Every remark a new one may not repeat: the saved ring (earlier runs,
+    PROACTIVE_RECENT_KEEP_S) then this run's ring, oldest first, without
+    duplicates. Never raises."""
+    try:
+        _proactive_saved_prune(time.time())
+        out: list = []
+        for x in [x for _t, x in _proactive_saved] + list(_proactive_recent):
+            if x not in out:
+                out.append(x)
+        return out
+    except Exception:
+        return list(_proactive_recent)
 
 
 def generate_proactive_comment(now: float | None = None) -> str:
@@ -17584,7 +17695,8 @@ def generate_proactive_comment(now: float | None = None) -> str:
         system += (" You have run nothing: never say you did, checked, "
                    "pulled up or prepared anything.")
     clock = time.strftime("%I:%M %p", lt).lstrip("0")
-    recent = list(_proactive_recent)
+    # This run's remarks AND the saved ones from earlier runs (2026-11-17).
+    recent = _proactive_recent_all()
     user = (f"(Local time: {clock}, {_proactive_guard.day_part(lt.tm_hour)}. "
             + ("Give one short interesting fact, or SKIP." if grounded else
                "There has been silence. Generate one short proactive comment."))
@@ -17601,11 +17713,31 @@ def generate_proactive_comment(now: float | None = None) -> str:
         return ""
     if not line.strip():
         return ""
+    # 2026-11-17: "Good morning, sir." / "Certainly, sir." in front of the
+    # fact is cut off (core/proactive_guard.strip_filler_opener); a line that
+    # was nothing more is dropped.
+    opener = _proactive_guard.filler_opener(line)
+    if opener:
+        trimmed = _proactive_guard.strip_filler_opener(line)
+        if not trimmed:
+            _proactive_drop_streak[0] = int(_proactive_drop_streak[0] or 0) + 1
+            print(f"  [proactive] dropped (only '{opener}')")
+            return ""
+        print(f"  [proactive] trimmed the opener '{opener}'")
+        line = trimmed
     ok, why = _proactive_guard.check_remark(line, hour=lt.tm_hour,
                                             recent=recent,
-                                            grounded_only=grounded)
+                                            grounded_only=grounded,
+                                            no_opener=True)
     if not ok:
-        print(f"  [proactive] dropped ({why})")
+        # PROACTIVE_DROP_STREAK: drops in a row back the next attempt off.
+        _proactive_drop_streak[0] = int(_proactive_drop_streak[0] or 0) + 1
+        _streak = int(_proactive_drop_streak[0])
+        _min = int(globals().get("PROACTIVE_DROP_STREAK", 0) or 0)
+        print(f"  [proactive] dropped ({why})"
+              + (f" - {_streak} in a row, next try in "
+                 f"{float(globals().get('PROACTIVE_DROP_BACKOFF_S', 0)) / 60:.0f}"
+                 f" min" if _min > 0 and _streak >= _min else ""))
         return ""
     return line
 
@@ -18645,6 +18777,11 @@ _TURN_FLAG_KEYS = (
     # v3.0.26 (ovh-b): a launch name nothing could start is checked against
     # JARVIS's own windows and the installed apps.
     "LAUNCH_NOT_FOUND_SUGGEST",
+    # 2026-11-17 overhaul (proactive lines): his clap's answer and his arrival
+    # briefing pass some holds, the gap after a budget deferral, the away
+    # question's route, idle remarks across restarts.
+    "CLAP_ACK_PASS_HOLDS_S", "ARRIVAL_PASS_HOLDS_S", "PENDING_DEFER_GAP_S",
+    "AWAY_RECAP_ROUTE", "PROACTIVE_RECENT_KEEP_S", "PROACTIVE_DROP_STREAK",
 )
 
 
@@ -27314,6 +27451,11 @@ _proactive_recent: list = []
 _proactive_remarks_at: list = []
 _proactive_last_attempt_at = [0.0]
 _proactive_hold_logged = [""]
+# 2026-11-17: [(time.time(), remark)] spoken in this run AND restored from
+# data/proactive_recent.json at boot (PROACTIVE_RECENT_KEEP_S), and how many
+# generations in a row the text gate dropped (PROACTIVE_DROP_STREAK).
+_proactive_saved: list = []
+_proactive_drop_streak = [0]
 
 
 def _note_owner_voice() -> None:
@@ -27330,6 +27472,7 @@ def _note_owner_voice() -> None:
 # the GIL-atomic idiom of this file.
 from core import owner_presence as _owner_presence_mod  # noqa: E402
 from core import pending_policy as _pending_policy_mod  # noqa: E402
+from core import queue_receipts as _queue_receipts_mod  # noqa: E402
 from core import brain_warmup as _brain_warmup_mod  # noqa: E402
 # time.monotonic() of the last non-wake speech the main loop captured and
 # dropped at the background-audio gate (people, or a show, talking). 0.0 = none.
@@ -27602,8 +27745,100 @@ def _media_hold_asked_for(entry) -> bool:
     try:
         if not globals().get("MEDIA_HOLD_PASS_ASKED", False):
             return False
+        # The presence recap carries history_text too (its unnamed lines,
+        # 2026-11-17), but nobody asked for it.
+        if (_owner_presence_mod.source_root(entry)
+                == _owner_presence_mod._RECAP_SOURCE.split(":", 1)[0]):
+            return False
         hist = entry.get("history_text") if isinstance(entry, dict) else None
         return isinstance(hist, str) and bool(hist.strip())
+    except Exception:
+        return False
+
+
+# ── lines he summoned (2026-11-17, core/owner_presence.SUMMONED_RULES) ─────
+# How long after it was queued a summoned line may pass its holds (seconds,
+# core/config; 0 = never, the old hold).
+_SUMMONED_WINDOW_KEYS = {"clap": "CLAP_ACK_PASS_HOLDS_S",
+                         "arrival": "ARRIVAL_PASS_HOLDS_S"}
+# "No music or media a moment ago" for a clap's answer: the room-music
+# detector lagged the clap detector by up to ~10 s in the 11-16/17 logs.
+_SUMMONED_QUIET_S = 10.0
+
+
+def _owner_seen_or_heard() -> bool:
+    """A face within OWNER_PRESENT_FACE_WINDOW_S or his MIC voice within
+    OWNER_PRESENT_VOICE_WINDOW_S - presence without the input signal (an
+    automation's input never says he is in the room). Never raises (False)."""
+    try:
+        mono = _proactive_mono()
+        voice_at = float(_last_owner_voice_at[0] or 0.0)
+        face_at = float(last_face_seen or 0.0)
+        return bool(_owner_presence_mod.presence_verdict(
+            voice_age_s=(mono - voice_at) if voice_at > 0.0 else None,
+            face_age_s=(time.time() - face_at) if face_at > 0.0 else None,
+            input_age_s=None,
+            voice_window_s=OWNER_PRESENT_VOICE_WINDOW_S,
+            face_window_s=OWNER_PRESENT_FACE_WINDOW_S,
+            input_window_s=OWNER_PRESENT_INPUT_WINDOW_S)[0])
+    except Exception:
+        return False
+
+
+def _summoned_room_quiet() -> bool:
+    """No music or media now or within _SUMMONED_QUIET_S, read at speak time:
+    the music gate's PC / room reading and its last "playing", the media
+    hold, the Windows media session (his music too), the room-music detector
+    and the camera TV detector (counted as the media hold counts it:
+    _media_hold_tv_counts). Fails CLOSED (False): a doubt holds the line, as
+    before. Never raises."""
+    try:
+        if _pc_media_playing(refresh=False):
+            return False
+        at = _music_state.get("playing_at")
+        if (at is not None
+                and time.monotonic() - float(at) <= _SUMMONED_QUIET_S):
+            return False
+        if globals().get("MEDIA_HOLD_ENABLED", False) and _media_hold_active():
+            return False
+        if _smtc_media_playing():
+            return False
+        mod = sys.modules.get("skill_standby_audio_detect")
+        seen = getattr(mod, "music_seen_within", None) if mod else None
+        if callable(seen) and seen(_SUMMONED_QUIET_S):
+            return False
+        tv = sys.modules.get("skill_tv_detect")
+        if (tv is not None and _media_hold_tv_counts(tv)
+                and bool(tv.is_tv_on())):
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _summoned_pass(item, hold_kind: str, *, log: bool = False) -> bool:
+    """Does this queued line pass the ``hold_kind`` hold because he summoned
+    it (core/owner_presence.summoned_passes)? ``log``: say so (the drain,
+    once, as it speaks it). Never raises (False)."""
+    try:
+        kind = _owner_presence_mod.summoned_kind(item)
+        if not kind or not hold_kind:
+            return False
+        window = float(globals().get(_SUMMONED_WINDOW_KEYS.get(kind, ""), 0)
+                       or 0)
+        try:
+            age = time.time() - float(item.get("ts"))
+        except (TypeError, ValueError):
+            age = 0.0
+        ok = _owner_presence_mod.summoned_passes(
+            item, hold_kind=hold_kind, age_s=age, window_s=window,
+            present=_owner_present, seen_or_heard=_owner_seen_or_heard,
+            room_quiet=_summoned_room_quiet)
+        if ok and log:
+            print(f"  [pending] {kind} line passes the {hold_kind} hold "
+                  f"(queued {age:.0f} s ago, he is here): "
+                  f"{str(item.get('message', ''))[:60]}")
+        return ok
     except Exception:
         return False
 
@@ -52201,6 +52436,41 @@ _PENDING_DRAIN_BUDGET_S = 25.0
 # attempts in all, then dropped (a permanently failing line must not wedge
 # the queue).
 _PENDING_SPEAK_MAX_TRIES = 3
+# PENDING_DEFER_GAP_S (core/config, 2026-11-17): after a budget deferral the
+# rest waits until _proactive_mono() reaches [0] or an owner turn newer than
+# [1] (the _last_owner_turn_at of the deferral). [0] 0.0 = no gap running.
+_pending_defer_gap = [0.0, 0.0]
+
+
+def _pending_defer_gap_start() -> None:
+    """A full drain just deferred its tail: hold the rest PENDING_DEFER_GAP_S
+    (0 = off). Never raises."""
+    try:
+        gap = float(globals().get("PENDING_DEFER_GAP_S", 0) or 0)
+        if gap <= 0:
+            return
+        _pending_defer_gap[0] = _proactive_mono() + gap
+        _pending_defer_gap[1] = float(_last_owner_turn_at[0] or 0.0)
+    except Exception:
+        pass
+
+
+def _pending_defer_gap_left() -> float:
+    """Seconds left of the gap after a budget deferral (0.0 = none: never
+    started, run out, or he has spoken since). Never raises."""
+    try:
+        until = float(_pending_defer_gap[0] or 0.0)
+        if until <= 0.0:
+            return 0.0
+        left = until - _proactive_mono()
+        if (left <= 0.0
+                or float(_last_owner_turn_at[0] or 0.0) > float(
+                    _pending_defer_gap[1] or 0.0)):
+            _pending_defer_gap[0] = 0.0
+            return 0.0
+        return left
+    except Exception:
+        return 0.0
 
 
 def _requeue_supersede(items: list, live: list) -> list:
@@ -52331,11 +52601,12 @@ def _pending_source_in(item, sources) -> bool:
 
 
 def _pending_has_source(sources, urgent: bool = False,
-                        asked: bool = False) -> bool:
+                        asked: bool = False, summoned_hold: str = "") -> bool:
     """Peek (no claim): does the speech queue hold an entry from ``sources``
     (or, with ``urgent``, any entry flagged urgent; with ``asked``, any line
-    he asked for - _media_hold_asked_for)? True on any read error, so the
-    real drain decides. Never raises."""
+    he asked for - _media_hold_asked_for; with ``summoned_hold``, a line he
+    summoned that may pass that hold - _summoned_pass)? True on any read
+    error, so the real drain decides. Never raises."""
     try:
         with open(PENDING_SPEECH_PATH, "r", encoding="utf-8") as f:
             raw = f.read().strip()
@@ -52347,6 +52618,7 @@ def _pending_has_source(sources, urgent: bool = False,
         return any(_pending_source_in(e, sources)
                    or (urgent and _owner_presence_mod.is_urgent(e))
                    or (asked and _media_hold_asked_for(e))
+                   or (summoned_hold and _summoned_pass(e, summoned_hold))
                    for e in items)
     except FileNotFoundError:
         return False
@@ -52406,6 +52678,9 @@ def _note_pending_spoken(item, msg) -> None:
             _last_away_recap[0] = (time.time(), str(msg))
     except Exception:
         pass
+    # 2026-11-17: the skill that queued it hears it was SPOKEN (the arrival
+    # briefing counts the morning as heard only now; core/queue_receipts).
+    _queue_receipts_mod.note_spoken(item)
 
 
 def _pending_queue_nonempty() -> bool:
@@ -52425,12 +52700,15 @@ def _pending_queue_nonempty() -> bool:
 def _away_recap_shortcut(text: str) -> bool:
     """AWAY_RECAP_ROUTE (default True, 2026-11-17): "did anything happen while
     I was away / did you log anything while I was at school" drains the
-    speech queue now (_speak_pending: the "While you were away" recap and
-    every line that waited), with no brain call. When the drain says
-    nothing: the recap he already heard in the last 3 h again, "still
-    waiting" while a hold keeps lines queued, or the honest "nothing was
-    waiting" (core/owner_presence.away_answer_line). False when off or the
-    line is no such question. Never raises."""
+    speech queue now (_speak_pending(asked=True): the "While you were away"
+    recap and every line that waited, through any presence hold - he is here
+    and asking), with no brain call. When the drain says nothing: the recap
+    he already heard in the last 3 h again, "still waiting" while a speech
+    hold keeps lines queued, or the honest "nothing was waiting" (core/
+    owner_presence.away_answer_line). Lines dropped unsaid as too old while
+    he was away are named after it (core/queue_receipts.missed_phrase,
+    2026-11-17). False when off or the line is no such question. Never
+    raises."""
     try:
         if not globals().get("AWAY_RECAP_ROUTE", True):
             return False
@@ -52444,21 +52722,30 @@ def _away_recap_shortcut(text: str) -> bool:
         _last_turn_ctx_at[0] = time.monotonic()   # TTS_TURN_CONTEXT_TTL_S
         _pending_drain_spoken[0] = []
         try:
-            spoke = bool(_speak_pending())
+            # asked=True (2026-11-17): he is here and asked - no presence
+            # hold may answer "still waiting".
+            spoke = bool(_speak_pending(asked=True))
         except Exception as _e:
             print(f"  [away-recap] drain failed: {type(_e).__name__}")
             spoke = False
         said = list(_pending_drain_spoken[0] or [])
         _pending_drain_spoken[0] = None
         last = _last_away_recap[0]
+        # What was dropped unsaid while he was away (too old by the time he
+        # was back: the morning briefing, memory alerts ...), named once.
+        missed = _queue_receipts_mod.missed_phrase(
+            _queue_receipts_mod.take_missed())
+        if missed:
+            print(f"  [away-recap] also missed: {missed}")
         line = _owner_presence_mod.away_answer_line(
             spoke=spoke and bool(said),
             still_queued=(not said) and _pending_queue_nonempty(),
             last_recap=last[1] if last else "",
-            last_recap_age_s=(time.time() - last[0]) if last else None)
+            last_recap_age_s=(time.time() - last[0]) if last else None,
+            missed=missed)
         if line:
             print(f"  JARVIS: {line}")
-            _append_turn(text, line)
+            _append_turn(text, " ".join(said + [line]))
             _speak(line)
         else:
             _append_turn(text, " ".join(said))
@@ -52470,13 +52757,20 @@ def _away_recap_shortcut(text: str) -> bool:
         return False
 
 
-def _speak_pending(only_sources=None):
+def _speak_pending(only_sources=None, *, asked: bool = False):
     """If skills (like the timer) have queued reminders, speak them now.
 
     ``only_sources`` (2026-10-01): speak only entries whose queued ``source``
     (its part before any ":") is in this set and HOLD the rest, in order, for
     a later full drain. Standby passes _STANDBY_SPEAKABLE_SOURCES so a timer
     the owner set plays while JARVIS sleeps; None = speak everything.
+
+    ``asked`` (2026-11-17, _away_recap_shortcut only): he has just asked what
+    happened while he was away, so no presence hold applies (room talk, his
+    video, "owner away" - a typed ask stamps no voice - gaming, the gap after
+    a deferral); only the speech hold above still does. The pass is a return
+    drain "While you were away": stale lines fold into the recap. Live, the
+    old drain could answer his direct question with "still waiting".
 
     Race-safe consume-and-rename pattern: we rename the queue file to a
     sibling `.consuming` BEFORE iterating, so any skill that writes a new
@@ -52500,10 +52794,14 @@ def _speak_pending(only_sources=None):
     # untouched; it is spoken once the hold passes.
     if _speech_hold_active():
         return False
+    _full_drain = only_sources is None
     _return_drain = False
     _return_away = False
     _hold_urgent = False
     _hold_asked = False
+    # The kind of presence hold in force ("room talk", "media playing", ...):
+    # a line he summoned may pass some (_summoned_pass). "" = no hold.
+    _hold_kind = ""
     if only_sources is None:
         # Standby (only_sources) leaves the governor's held line where it is,
         # exactly as before: it would only be held again below.
@@ -52512,12 +52810,29 @@ def _speak_pending(only_sources=None):
         return False  # an unmerged orphan: claiming now would clobber it
     if not os.path.exists(PENDING_SPEECH_PATH):
         return False
-    if only_sources is None:
+    if only_sources is None and asked:
+        # He asked (see the docstring): a return drain, no presence hold.
+        print("  [pending] he asked what he missed - no presence hold this "
+              "pass")
+        _presence_hold_logged[0] = ""
+        _game_hold_seen[0] = False
+        _presence_away_seen[0] = False
+        _pending_defer_gap[0] = 0.0
+        _return_drain = True
+        _return_away = True
+    elif only_sources is None:
         # PRESENCE HOLD (2026-10-02, core/owner_presence.py). While the owner
         # is away, or the room is talking, only his own reminders and the
         # guard alert are spoken; everything else waits, in order, untouched
         # on disk (the peek below never claims a queue with nothing to say).
         _hold = _presence_hold_reason()
+        if not _hold:
+            # PENDING_DEFER_GAP_S (2026-11-17): the tail a budget deferred
+            # waits a moment, or until his next turn.
+            _gap_left = _pending_defer_gap_left()
+            if _gap_left > 0:
+                _hold = (f"after the drain budget ({_gap_left:.0f} s left, "
+                         f"or until he speaks)")
         if _hold:
             _kind = _hold.split(" (", 1)[0]
             if _presence_hold_logged[0] != _kind:
@@ -52533,6 +52848,9 @@ def _speak_pending(only_sources=None):
             # v3.0.10 review (MEDIA_HOLD_PASS_ASKED): a result he asked for
             # speaks through the media hold (_media_hold_asked_for).
             _hold_asked = _kind == "media playing"
+            # 2026-11-17: his clap's answer / his arrival briefing may pass
+            # this hold for a moment (core/owner_presence.SUMMONED_RULES).
+            _hold_kind = _kind
         else:
             _presence_hold_logged[0] = ""
             _return_drain = (bool(PRESENCE_HOLD_ENABLED
@@ -52544,7 +52862,8 @@ def _speak_pending(only_sources=None):
     # Standby runs this every pass (as often as every 0.3 s while muted):
     # claim and rewrite the queue only when something in it may be spoken.
     if only_sources is not None and not _pending_has_source(
-            only_sources, urgent=_hold_urgent, asked=_hold_asked):
+            only_sources, urgent=_hold_urgent, asked=_hold_asked,
+            summoned_hold=_hold_kind):
         return False
     consume_path = PENDING_SPEECH_PATH + ".consuming"
     try:
@@ -52583,6 +52902,9 @@ def _speak_pending(only_sources=None):
         for _e, _why in _too_old:
             print(f"  [pending] too old to say ({_e.get('source', '?')}; "
                   f"{_why}): {str(_e.get('message', ''))[:80]}")
+            # 2026-11-17: its skill hears of it (the arrival briefing re-arms)
+            # and his "what did I miss" can name it (core/queue_receipts).
+            _queue_receipts_mod.note_dropped(_e, _why)
         if not items:
             try: os.remove(consume_path)
             except Exception: pass
@@ -52600,6 +52922,9 @@ def _speak_pending(only_sources=None):
         for _e in _dropped:
             print(f"  [pending] expired while away ({_e.get('source', '?')}): "
                   f"{str(_e.get('message', ''))[:80]}")
+            # A moment-line: its skill hears of it, but it is not news.
+            _queue_receipts_mod.note_dropped(_e, "expired while away",
+                                             remember=False)
         for _e in _folded:
             print(f"  [pending] folded into the recap ({_e.get('source', '?')}): "
                   f"{str(_e.get('message', ''))[:80]}")
@@ -52646,7 +52971,9 @@ def _speak_pending(only_sources=None):
                 and not _pending_source_in(item, only_sources)
                 and not (_hold_urgent
                          and _owner_presence_mod.is_urgent(item))
-                and not (_hold_asked and _media_hold_asked_for(item))):
+                and not (_hold_asked and _media_hold_asked_for(item))
+                and not (_hold_kind
+                         and _summoned_pass(item, _hold_kind, log=True))):
             held.append(item)
             back.append(item)
             continue
@@ -52778,6 +53105,8 @@ def _speak_pending(only_sources=None):
         print(f"  [pending] drain budget ({_PENDING_DRAIN_BUDGET_S:.0f}s) "
               f"reached — deferring {len(deferred)} announcement(s) to the "
               f"next pass")
+        if _full_drain:
+            _pending_defer_gap_start()
     if back and not _requeue_pending_speech(back):
         # Held + deferred entries go back in their original queue order. When
         # that write fails they must not go down with the snapshot (2026-10-01
@@ -57422,6 +57751,9 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         # Arm the presence hold on queued proactive speech (starts the
         # physical-input watcher; see _presence_watch_start).
         _presence_watch_start()
+        # The idle remarks the last runs spoke (PROACTIVE_RECENT_KEEP_S): a
+        # restart must not repeat one.
+        _proactive_recent_restore()
         # BOOT_PARALLEL_LOAD (v3 W10): the full dependency import check,
         # now that boot is done (only what the fast pass missed is reported).
         # Kept ABOVE _listen_media_boot(): that call stays the statement right

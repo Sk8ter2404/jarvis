@@ -39,10 +39,13 @@ EXEMPT_SOURCES = frozenset({"timer", "schedule", "promise", "guard"})
 # (2026-10-02 review repair): the fold cut "Slight problem, sir - your H2D
 # appears to be unwell. Error code 0300-0100 on layer 142." to "Slight
 # problem." - the printer and the code were the whole point.
+# "arrival_v2" (2026-11-17): the presence-triggered morning briefing's own
+# source was missing, so with PENDING_SOURCE_POLICY off a stale one could be
+# cut to a fragment (core/pending_policy.BRIEFING_SOURCES always had it).
 KEEP_WHOLE_SOURCES = frozenset({
-    "morning", "arrival", "evening", "daily", "news", "recap", "handoff",
-    "weekly_digest_briefing", "anticipation_briefing", "focus", "focus_mode",
-    "bambu", "bambu_voice_companion", "print_companion",
+    "morning", "arrival", "arrival_v2", "evening", "daily", "news", "recap",
+    "handoff", "weekly_digest_briefing", "anticipation_briefing", "focus",
+    "focus_mode", "bambu", "bambu_voice_companion", "print_companion",
 })
 
 
@@ -67,6 +70,65 @@ EXPIRE_QUIETLY_SOURCES = frozenset({
 _RECAP_NAMED = 3          # fragments named in a recap; the rest are counted
 _FRAGMENT_MAX = 70        # characters per recap fragment
 _RECAP_SOURCE = "recap:presence"
+
+
+# ── lines he summoned (2026-11-17) ───────────────────────────────────────────
+# A queued line may carry ``summoned`` (proactive_announce(summoned=...)): he
+# caused it a moment ago, so for a short window it passes the holds named
+# here - never "owner away" or "gaming", and never a speech hold. Per kind:
+#   (holds it may pass, needs his face or his voice - polled input is not
+#    enough, needs a quiet room - no music or media now or a moment ago)
+#   clap    - "You rang, sir?" answers his double clap. Live 11-16/11-17 11 of
+#             15 claps got no answer: the ack waited behind the 45 s room-talk
+#             hold and expired at its 10 s age. Many of those claps came with
+#             music, so the room must be quiet too (re-checked at speak time).
+#             It also passes the short gap after a drain-budget deferral
+#             (PENDING_DEFER_GAP_S), which would outlast its 10 s life.
+#   arrival - the presence-triggered morning briefing. Live 11-17 06:35:30 it
+#             was queued as his face appeared and held behind his video and
+#             room talk while he was getting ready, then "owner away" for
+#             hours, and dropped unheard at 16:02:41.
+# The hold kinds are bobert_companion._presence_hold_reason's (and the drain's
+# deferral gap) before any " (".
+SUMMONED_RULES = {
+    "clap":    (frozenset({"room talk", "after the drain budget"}), True, True),
+    "arrival": (frozenset({"room talk", "media playing"}), False, False),
+}
+
+
+def summoned_kind(entry) -> str:
+    """The entry's ``summoned`` kind when it is one SUMMONED_RULES knows."""
+    try:
+        kind = entry.get("summoned") if isinstance(entry, dict) else None
+        return kind if isinstance(kind, str) and kind in SUMMONED_RULES else ""
+    except Exception:
+        return ""
+
+
+def summoned_passes(entry, *, hold_kind: str, age_s, window_s,
+                    present, seen_or_heard, room_quiet) -> bool:
+    """May this summoned line be spoken through ``hold_kind`` now? Only a
+    hold its kind lists, only within ``window_s`` of being queued (0 = off),
+    only while ``present()`` (presence_verdict); a kind that needs it also
+    ``seen_or_heard()`` (a face or his voice) and ``room_quiet()``. The three
+    readings are callables, read only when needed. Never raises (False)."""
+    try:
+        rule = SUMMONED_RULES.get(summoned_kind(entry))
+        if not rule or hold_kind not in rule[0]:
+            return False
+        window = float(window_s or 0)
+        age = float(age_s)
+        if window <= 0 or math.isnan(age) or age > window:
+            return False
+        if not present():
+            return False
+        if rule[1] and not seen_or_heard():
+            return False
+        if rule[2] and not room_quiet():
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def source_root(entry) -> str:
@@ -206,23 +268,49 @@ def recap_fragment(message: str) -> str:
         return ""
 
 
+_COUNT_WORDS = ("no", "one", "two", "three", "four", "five", "six", "seven",
+                "eight", "nine", "ten")
+
+
+def _count_word(n: int) -> str:
+    return _COUNT_WORDS[n] if 0 <= n < len(_COUNT_WORDS) else str(n)
+
+
+def _listed(frags: list) -> str:
+    if len(frags) == 1:
+        return frags[0]
+    return "; ".join(frags[:-1]) + "; and " + frags[-1]
+
+
 def recap_line(fragments: list, extra: int = 0, *, away: bool = True) -> str:
-    """'While you were away, sir: A; B; and C, plus 2 more.' — '' when there
-    is nothing to name. ``away`` False (the lines waited for another reason:
-    room talk, standby, a speech hold - he never left) says 'Earlier, sir:'
-    instead (2026-10-02). Never asks a question (nothing on the queue may end
-    unanswerable in wake-word mode)."""
+    """'While you were away, sir: A; B; and C.' — '' when there is nothing
+    to name. ``away`` False (the lines waited for another reason: room talk,
+    standby, a speech hold - he never left) says 'Earlier, sir:' instead
+    (2026-10-02). With ``extra`` more not named it ends 'And two more -
+    shall I list them?' (2026-11-17; it was ', plus 2 more.', which nothing
+    could ask about): plan_return_drain records the others in the entry's
+    history_text, so "JARVIS, yes" reaches the brain with them - the one
+    question a queued recap may ask."""
     frags = [f for f in (fragments or []) if f]
     if not frags:
         return ""
-    if len(frags) == 1:
-        listed = frags[0]
-    else:
-        listed = "; ".join(frags[:-1]) + "; and " + frags[-1]
-    if extra > 0:
-        listed += f", plus {extra} more"
     lead = "While you were away, sir" if away else "Earlier, sir"
-    return f"{lead}: {listed}."
+    line = f"{lead}: {_listed(frags)}."
+    if extra > 0:
+        line += f" And {_count_word(int(extra))} more - shall I list them?"
+    return line
+
+
+def recap_history(fragments: list, rest: list, *, away: bool = True) -> str:
+    """What conversation_history records for a recap whose ``rest`` was not
+    named (proactive_announce's history_text rule): the spoken line plus
+    the others, so his "yes" has them. '' when nothing is left out."""
+    rest = [f for f in (rest or []) if f]
+    line = recap_line(fragments, extra=len(rest), away=away)
+    if not line or not rest:
+        return ""
+    return (f"{line} (The other {_count_word(len(rest))}: "
+            f"{'; '.join(rest)}.)")
 
 
 def plan_return_drain(items: list, *, now: float, stale_s: float,
@@ -284,11 +372,15 @@ def plan_return_drain(items: list, *, now: float, stale_s: float,
                 if frag and frag not in frags:
                     frags.append(frag)
             named = frags[:_RECAP_NAMED]
-            line = recap_line(named, extra=len(frags) - len(named),
-                              away=away)
+            rest = frags[_RECAP_NAMED:]
+            line = recap_line(named, extra=len(rest), away=away)
             if line:
-                out.insert(recap_at, {"ts": float(now), "message": line,
-                                      "source": _RECAP_SOURCE})
+                entry = {"ts": float(now), "message": line,
+                         "source": _RECAP_SOURCE}
+                if rest:
+                    entry["history_text"] = recap_history(named, rest,
+                                                          away=away)
+                out.insert(recap_at, entry)
         return out, dropped, folded
     except Exception:
         return list(items), [], []
@@ -331,6 +423,13 @@ AWAY_NOTHING_WAITING_LINE = (
 AWAY_STILL_HELD_LINE = (
     "A few notices are still waiting, sir - I'll read them out in a moment.")
 AWAY_RECAP_REPEAT_S = 3 * 3600.0   # a recap said this recently is said again
+# Lines dropped unsaid while he was away (core/queue_receipts.missed_phrase,
+# 2026-11-17): named after the answer.
+# Worded so it stays true when a line went stale while he was here too.
+AWAY_MISSED_LINE = ("Also, {missed} went unsaid, sir - out of date before "
+                    "I could say it.")
+AWAY_ONLY_MISSED_LINE = ("Nothing is waiting now, sir, but {missed} went "
+                         "unsaid - out of date before I could say it.")
 
 
 def is_away_recap_ask(text) -> bool:
@@ -348,24 +447,33 @@ def is_away_recap_ask(text) -> bool:
 
 
 def away_answer_line(*, spoke: bool, still_queued: bool = False,
-                     last_recap: str = "", last_recap_age_s=None) -> str:
+                     last_recap: str = "", last_recap_age_s=None,
+                     missed: str = "") -> str:
     """What JARVIS says after draining the queue for an away question.
     '' when the drain spoke (the lines themselves were the answer). Else the
     recap he already gave within AWAY_RECAP_REPEAT_S, word for word; else
-    "still waiting" when lines are held on the queue (room talk, a hold);
-    else the honest "nothing was waiting". Never raises."""
+    "still waiting" when lines are held on the queue (a speech hold); else
+    the honest "nothing was waiting". ``missed`` (2026-11-17, core/
+    queue_receipts.missed_phrase: "the morning briefing and two memory
+    warnings") names what was dropped unsaid: AWAY_MISSED_LINE after the
+    answer (alone when the drain spoke), or AWAY_ONLY_MISSED_LINE instead of
+    "nothing was waiting". Never raises."""
     try:
+        missed = str(missed or "").strip()
+        extra = AWAY_MISSED_LINE.format(missed=missed) if missed else ""
         if spoke:
-            return ""
+            return extra
         recap = str(last_recap or "").strip()
         try:
             age = float(last_recap_age_s)
         except (TypeError, ValueError):
             age = None
         if recap and age is not None and 0 <= age <= AWAY_RECAP_REPEAT_S:
-            return recap
+            return f"{recap} {extra}".strip()
         if still_queued:
-            return AWAY_STILL_HELD_LINE
+            return f"{AWAY_STILL_HELD_LINE} {extra}".strip()
+        if missed:
+            return AWAY_ONLY_MISSED_LINE.format(missed=missed)
         return AWAY_NOTHING_WAITING_LINE
     except Exception:
         return AWAY_NOTHING_WAITING_LINE

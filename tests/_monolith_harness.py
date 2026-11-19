@@ -340,10 +340,17 @@ _MONOLITH_RESTORE_NAMES = (
     # the wrong reason; a leaked remark would make a later remark a "repeat".
     "_last_owner_voice_at", "_proactive_recent", "_proactive_remarks_at",
     "_proactive_last_attempt_at", "_proactive_hold_logged",
+    # ...the saved ring of earlier runs' remarks and the drop streak
+    # (2026-11-17): a leaked remark would make a later one a "repeat", a
+    # leaked streak would back a later test's attempt off.
+    "_proactive_saved", "_proactive_drop_streak",
     # The speech-queue presence hold (2026-10-02): the last room-talk stamp,
     # the boot arm (a leaked True would hold a LATER test's queue for an
     # "absent" owner) and the logged hold kind.
     "_last_room_talk_at", "_presence_gate_armed", "_presence_hold_logged",
+    # The gap after a budget deferral (PENDING_DEFER_GAP_S, 2026-11-17): a
+    # leaked one would hold a LATER test's queue.
+    "_pending_defer_gap",
     # The media hold (v3.0.10): the last video signal and the hold start (a
     # leaked stamp would hold or release a LATER test's queue), and the
     # owner turn's voice-context stamp (TTS_TURN_CONTEXT_TTL_S).
@@ -950,12 +957,25 @@ class MonolithGlobalsTestCase(unittest.TestCase):
                 _aq._arrived_at[0] = 0.0
         except Exception:
             pass
+        # 2026-11-17 (core/queue_receipts): a skill's receipt hook registered
+        # by an earlier test, or lines an earlier test's drain dropped, must
+        # not reach this test (its away answer would name them).
+        try:
+            from core import queue_receipts as _qr
+            _qr.reset()
+        except Exception:
+            pass
         _before = dict(vars(bc))
         try:
             return super().run(result)
         finally:
             _restore_monolith_pristine(bc)
             _heal_leaked_mocks(bc, _before, self.id())
+            try:
+                from core import queue_receipts as _qr
+                _qr.reset()
+            except Exception:
+                pass
             _cfg.MODEL_ROUTING = _saved_route
             _cfg.AMBIENT_LEARNING_FORCE_LOCAL = _saved_force
             _cfg.AMBIENT_LISTEN_ENABLED = _saved_ambient

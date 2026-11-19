@@ -53,6 +53,18 @@ QUEUE_RULES = {
     # forecast and its headlines. Past this it is not read out, and it is never
     # cut to a fragment.
     "briefing":   (6 * _HOUR, False),
+    # 2026-11-17 (live 11-16 23:50:09, the recap he came back to at night):
+    # "the temperature drops about 10 degrees by 6 PM" read at 11:50 PM. A
+    # weather line is about the next few hours.
+    "weather":    (2 * _HOUR, True),
+    # ...the same recap named "the microphone has been completely silent" and
+    # "the microphone appears to be down" while he was talking to JARVIS
+    # through it. A stale mic-health line is false once he is back; a mic that
+    # is still dead is warned about again on the alert's own cool-down.
+    "mic_health": (300.0, False),
+    # ...and its "plus 3 more" held two "Yes, listening, sir." - the ambient
+    # listener's answer to his name while JARVIS slept, said minutes later.
+    "wake_ack":   (60.0, False),
     # Anything else that waited this long is not worth a recap fragment.
     "other":      (24 * _HOUR, True),
 }
@@ -82,6 +94,13 @@ MIC_SILENT_VALID_PREFIX = "mic_silent:"
 _MIC_SILENT_RE = re.compile(r"\bhas been completely silent for\b",
                             re.IGNORECASE)
 _RAM_RE = re.compile(r"\bmemory usage is at\b", re.IGNORECASE)
+# bobert_companion's silent-mic warning ("Sir, <mic> has been completely
+# silent for N seconds") and self_diagnostic's "<the microphone> appears to be
+# down" alert.
+_MIC_SILENT_RE = re.compile(r"\bhas been completely silent for\b",
+                            re.IGNORECASE)
+_MIC_DOWN_RE = re.compile(r"\b(?:microphone|mic)\b[^.]{0,40}\bappears to be "
+                          r"down\b", re.IGNORECASE)
 _GREETING_RE = re.compile(r"^good (?:morning|afternoon|evening)\b",
                           re.IGNORECASE)
 _EVENING_RE = re.compile(r"^good evening\b", re.IGNORECASE)
@@ -115,8 +134,15 @@ def line_class(entry) -> str:
             return "mic_silent"
         if root == "audio" and _MIC_CHANGE_RE.match(text):
             return "mic_change"
+        if ((root == "audio" and _MIC_SILENT_RE.search(text))
+                or (root == "self_diagnostic" and _MIC_DOWN_RE.search(text))):
+            return "mic_health"
         if root == "system_monitor" and _RAM_RE.search(text):
             return "ram"
+        if root == "weather":
+            return "weather"
+        if root == "ambient-listen":
+            return "wake_ack"
         if root in BRIEFING_SOURCES:
             return "briefing"
         return "other"

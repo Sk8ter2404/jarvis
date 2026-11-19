@@ -40,7 +40,9 @@ ENABLE_BACKGROUND_MONITOR = True     # set False to disable the periodic checker
 INITIAL_DELAY_SECONDS     = 3600     # wait a full hour before the first background check
                                      # (same as CHECK_INTERVAL_SECONDS — avoids firing on
                                      # every restart when JARVIS is being relaunched frequently)
-ALERT_COOLDOWN_SECONDS    = 4 * 3600 # don't repeat a low-balance alert more than this often
+ALERT_COOLDOWN_SECONDS    = 4 * 3600 # a LOWER step (see below) may speak after this long
+CREDITS_REMIND_SECONDS    = 24 * 3600 # an UNCHANGED low balance is repeated at most this often
+CREDITS_ALERT_STEPS       = (2.0, 0.0) # a balance falling under one of these speaks again
 # -------------------------------------------------------------------------
 
 _PROJECT_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -54,11 +56,15 @@ _STATE_FILE   = os.path.join(_PROJECT_DIR, "credits_state.json")
 # times across 09-29/09-30, at night too.
 _last_alert_at = [0.0]
 _last_login_alert_at = [0.0]
+# The balance the last low-balance alert was spoken for (None = none yet). An
+# unchanged low balance used to repeat every ALERT_COOLDOWN_SECONDS (about six
+# times a day); now it speaks once, again on a lower step, or as a daily reminder.
+_last_alert_balance = [None]
 _check_lock = threading.Lock()   # serialize: only one check at a time
 _speech_lock = threading.Lock()  # guard pending_speech.json read-modify-write
 
 
-def _enqueue_speech(message: str):
+def _enqueue_speech(message: str, family: "str | None" = None):
     """Route a proactive announcement through bobert_companion's public
     proactive_announce() API when available, falling back to a direct atomic
     write against pending_speech.json if the parent module hasn't loaded yet
@@ -66,12 +72,20 @@ def _enqueue_speech(message: str):
     finishes initialising). Matches the canonical pattern used by
     skills/bambu_monitor.py, skills/weather_briefing.py, skills/wellness.py,
     etc., so every co-writer of pending_speech.json funnels through the same
-    atomic helper and there's no per-skill race drift."""
+    atomic helper and there's no per-skill race drift.
+
+    ``family`` (2026-11-17): the supersede / dedupe tag of the line; the
+    low-balance alert shares skills/disk_budget_watchdog's "credits_low", so
+    the two skills' copies of one fact never queue behind each other."""
     try:
         bc = _import_companion()
         announcer = getattr(bc, "proactive_announce", None)
         if callable(announcer):
-            announcer(message, source="credits")
+            if family:
+                announcer(message, source="credits", supersede=family,
+                          dedupe_key=family)
+            else:
+                announcer(message, source="credits")
             return
     except Exception:
         pass
@@ -104,6 +118,7 @@ def _save_state(balance, raw: str):
                 # The alert cooldowns, so a restart can't reset them.
                 "last_alert_at":       _last_alert_at[0],
                 "last_login_alert_at": _last_login_alert_at[0],
+                "last_alert_balance":  _last_alert_balance[0],
             }, f, indent=2)
     except Exception:
         pass
@@ -126,6 +141,9 @@ def _load_alert_cooldowns() -> None:
             v = data.get(key)
             if isinstance(v, (int, float)) and 0 < v <= now + 60:
                 cell[0] = max(cell[0], float(v))
+        b = data.get("last_alert_balance")
+        if isinstance(b, (int, float)) and not isinstance(b, bool)                 and _last_alert_balance[0] is None:
+            _last_alert_balance[0] = float(b)
     except Exception:
         pass
 
@@ -279,6 +297,27 @@ def _check_and_maybe_alert():
         _check_and_maybe_alert_now()
 
 
+def _low_step(balance: float) -> int:
+    """How many alert marks ``balance`` is under (the threshold counts as one)."""
+    marks = (ALERT_THRESHOLD_DOLLARS,) + tuple(CREDITS_ALERT_STEPS)
+    return sum(1 for m in marks if balance < m)
+
+
+def _low_balance_due(dollars: float, now: float) -> bool:
+    """Speak a low balance once: when none was announced yet, when it has
+    fallen to a lower step since (after the short cooldown), or as a reminder
+    after CREDITS_REMIND_SECONDS. An unchanged balance stays quiet."""
+    since = now - _last_alert_at[0]
+    last = _last_alert_balance[0]
+    if _last_alert_at[0] <= 0 or last is None:
+        # Never announced -- or only a pre-upgrade stamp with no balance: keep
+        # the old cooldown so an upgrade restart does not repeat the line.
+        return since > (ALERT_COOLDOWN_SECONDS if _last_alert_at[0] > 0 else 0)
+    if _low_step(dollars) > _low_step(last) and since > ALERT_COOLDOWN_SECONDS:
+        return True
+    return since > CREDITS_REMIND_SECONDS
+
+
 def _check_and_maybe_alert_now():
     """The cycle itself (see _check_and_maybe_alert)."""
     if not _check_lock.acquire(blocking=False):
@@ -301,13 +340,20 @@ def _check_and_maybe_alert_now():
             _save_state(dollars, raw)
             return
         print(f"  [credits] background check: ${dollars:.2f}")
-        if dollars < ALERT_THRESHOLD_DOLLARS:
-            if (now - _last_alert_at[0]) > ALERT_COOLDOWN_SECONDS:
+        if dollars >= ALERT_THRESHOLD_DOLLARS:
+            _last_alert_balance[0] = None    # topped up: the next dip speaks afresh
+        else:
+            if _low_balance_due(dollars, now):
                 _enqueue_speech(
                     f"Heads up, sir — your Claude credits are getting low. "
-                    f"Only ${dollars:.2f} remaining."
+                    f"Only ${dollars:.2f} remaining.",
+                    family="credits_low",
                 )
                 _last_alert_at[0] = now
+                _last_alert_balance[0] = dollars
+            else:
+                print(f"  [credits] low balance ${dollars:.2f} unchanged, "
+                      f"not announced again")
         _save_state(dollars, raw)
     finally:
         _check_lock.release()

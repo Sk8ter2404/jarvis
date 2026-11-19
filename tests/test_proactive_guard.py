@@ -398,5 +398,69 @@ class UngroundedRemarkTests(unittest.TestCase):
                          (True, ""))
 
 
+class FillerOpenerTests(unittest.TestCase):
+    """2026-11-17 (live 11-16 09:28:44 / 12:30:58): "Good morning, sir." and
+    "Certainly, sir." in front of an unprompted fact."""
+
+    FACT = "Interestingly, the first computer mouse was made of wood."
+
+    def test_the_live_openers_are_found_and_cut(self):
+        for opener in ("Good morning, sir.", "Certainly, sir.", "Very good, sir —",
+                       "Of course!", "Right away, sir.", "Indeed,"):
+            with self.subTest(opener=opener):
+                line = f"{opener} {self.FACT}"
+                self.assertTrue(pg.filler_opener(line))
+                self.assertEqual(pg.strip_filler_opener(line), self.FACT)
+
+    def test_tags_are_kept_and_the_rest_capitalised(self):
+        line = "[intent:briefing] Good morning, sir. octopuses have three hearts."
+        self.assertEqual(pg.strip_filler_opener(line),
+                         "[intent:briefing] Octopuses have three hearts.")
+
+    def test_a_line_that_is_only_an_opener_is_nothing(self):
+        self.assertEqual(pg.strip_filler_opener("Certainly, sir."), "")
+        self.assertEqual(pg.strip_filler_opener("Very good, sir. Noted."), "")
+
+    def test_a_fact_that_merely_contains_the_words_is_untouched(self):
+        for text in ("Goodness, the Eiffel Tower grows in summer, sir.",
+                     "The phrase 'very good' dates from 1300, sir.",
+                     "Heyday is from the Middle English 'heyda', sir.",
+                     self.FACT):
+            with self.subTest(text=text):
+                self.assertEqual(pg.filler_opener(text), "")
+                self.assertEqual(pg.strip_filler_opener(text), text)
+
+    def test_check_remark_drops_an_opener_only_when_asked(self):
+        line = f"Certainly, sir. {self.FACT}"
+        ok, why = pg.check_remark(line, hour=12, pool=(), no_opener=True)
+        self.assertFalse(ok)
+        self.assertIn("opens with 'Certainly, sir.'", why)
+        # Screen remarks (core/screen_remarks) keep the old rule.
+        self.assertEqual(pg.check_remark(line, hour=12, pool=()), (True, ""))
+
+    def test_the_trimmed_restart_copy_is_a_repeat(self):
+        first = pg.strip_filler_opener(f"Good morning, sir. {self.FACT}")
+        later = pg.strip_filler_opener(f"Certainly, sir. {self.FACT}")
+        ok, why = pg.check_remark(later, hour=12, pool=(), recent=[first],
+                                  no_opener=True)
+        self.assertEqual((ok, why), (False, "repeats a recent remark"))
+
+
+class DropStreakGapTests(unittest.TestCase):
+    def test_two_drops_in_a_row_buy_the_backoff(self):
+        gap = lambda n: pg.attempt_gap_s(n, base_s=300, streak_min=2,  # noqa: E731
+                                         backoff_s=3600)
+        self.assertEqual((gap(0), gap(1), gap(2), gap(5)),
+                         (300.0, 300.0, 3600.0, 3600.0))
+
+    def test_off_switches(self):
+        self.assertEqual(pg.attempt_gap_s(9, base_s=300, streak_min=0,
+                                          backoff_s=3600), 300.0)
+        self.assertEqual(pg.attempt_gap_s(9, base_s=300, streak_min=2,
+                                          backoff_s=0), 300.0)
+        self.assertEqual(pg.attempt_gap_s("x", base_s=300, streak_min=2,
+                                          backoff_s=3600), 300.0)
+
+
 if __name__ == "__main__":
     unittest.main()

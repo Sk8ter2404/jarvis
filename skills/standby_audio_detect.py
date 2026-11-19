@@ -84,6 +84,8 @@ _classifications: "deque[tuple[float, bool, float]]" = deque()   # (ts, is_music
 _music_active = [False]
 _music_since  = [0.0]
 _last_feed_at = [0.0]
+# time.time() the last music ended / expired (0.0 = never): music_seen_within.
+_music_ended_at = [0.0]
 _total_chunks_seen  = [0]
 _total_music_chunks = [0]
 
@@ -170,6 +172,7 @@ def feed_audio(audio: np.ndarray, sample_rate: int = 16000) -> None:
         else:
             if _music_active[0]:
                 _music_active[0] = False
+                _music_ended_at[0] = now
                 print("  [audio-music] music ended")
 
 
@@ -180,8 +183,27 @@ def _reset_if_stale() -> None:
         return
     if (time.time() - _last_feed_at[0]) > MUSIC_TIMEOUT_SECONDS:
         _music_active[0] = False
+        _music_ended_at[0] = _last_feed_at[0]     # last heard then
         _classifications.clear()
         print("  [audio-music] state expired (no audio fed)")
+
+
+def music_seen_within(seconds: float) -> bool:
+    """True while the classifier's music flag is set (it is set once the
+    window-fraction rule is met, not on the first musical chunk, so music that
+    began less than a window ago is not yet seen) or it ended within
+    ``seconds`` (2026-11-17, bobert_companion._summoned_room_quiet: a clap's
+    answer is not spoken over music the detector flagged a moment after the
+    clap). Never raises (False)."""
+    try:
+        with _lock:
+            _reset_if_stale()
+            if _music_active[0]:
+                return True
+            ended = float(_music_ended_at[0] or 0.0)
+            return ended > 0.0 and 0.0 <= time.time() - ended <= float(seconds)
+    except Exception:
+        return False
 
 
 def is_music_currently_playing() -> bool:

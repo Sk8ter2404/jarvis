@@ -548,13 +548,33 @@ def _configured_action() -> str:
     return name or DEFAULT_ACTION
 
 
+def _accepts_summoned(fn) -> bool:
+    """True when ``fn`` takes a ``summoned`` keyword (or **kwargs). Checked
+    once by signature, so a TypeError raised INSIDE the call can never make a
+    second call queue the line twice. Unreadable signature: assume yes."""
+    try:
+        import inspect
+        params = inspect.signature(fn).parameters
+        return "summoned" in params or any(
+            p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    except (TypeError, ValueError):
+        return True
+
+
 def _announce(bc, text: str) -> None:
     if not text:
         return
     try:
         fn = getattr(bc, "proactive_announce", None)
         if callable(fn):
-            fn(text, source="clap")
+            # summoned (2026-11-17, CLAP_ACK_PASS_HOLDS_S): his clap's
+            # answer may pass the room-talk hold for its few seconds of
+            # life while he is seen or heard and the room is quiet (live
+            # 11 of 15 answers expired behind that hold).
+            if _accepts_summoned(fn):
+                fn(text, source="clap", summoned="clap")
+            else:
+                fn(text, source="clap")      # an older proactive_announce
             return
         fn = getattr(bc, "_speak", None)
         if callable(fn):

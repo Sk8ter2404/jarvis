@@ -17,6 +17,18 @@ Background monitor:
     unknown rather than triggering an alert — credits_monitor will refresh it
     on its own hourly cadence.
 
+The alert stamps are PERSISTED (2026-11-17, data/budget_watchdog_state.json).
+Live 11-16/11-17 "Heads up, sir - Claude credit balance is down to 7.10
+dollars" was said or recapped 8 times in 38 hours with the balance unchanged:
+the 4 h cooldown lived in memory, so every restart (6 in that window)
+announced it again 3 minutes after boot, and while he was away a copy queued
+every 4 h. Now an unchanged low balance is news once: it is said again only
+when it falls below the next step (CREDITS_ALERT_STEPS) or, as a reminder,
+CREDITS_REMIND_SECONDS after the last time; a top-up above the threshold
+re-arms it. Queued copies carry one supersede / dedupe family
+(CREDITS_LOW_FAMILY, shared with skills/credits_monitor), so a held copy is
+replaced, never stacked.
+
 Reads credits_state.json instead of calling the vision-driven check itself, so
 the watchdog stays cheap (no Chrome spawn per poll) and there's a single
 source of truth for the balance.
@@ -39,7 +51,14 @@ DISK_ALERT_GB             = 10.0
 CREDITS_ALERT_DOLLARS     = 10.0
 POLL_INTERVAL_SECONDS     = 300        # 5 minutes
 INITIAL_DELAY_SECONDS     = 180        # let JARVIS finish booting first
-ALERT_COOLDOWN_SECONDS    = 4 * 3600   # 4 hours between repeat alerts per metric
+ALERT_COOLDOWN_SECONDS    = 4 * 3600   # 4 hours between repeat disk alerts
+# The same low credit balance is said again at most this often (a reminder);
+# a drop below the next step is news at once.
+CREDITS_REMIND_SECONDS    = 24 * 3600
+CREDITS_ALERT_STEPS       = (5.0, 2.0, 0.0)
+# The supersede / dedupe family of every queued "credits are low" line (this
+# skill and skills/credits_monitor): one held copy, never a stack.
+CREDITS_LOW_FAMILY        = "credits_low"
 CREDITS_STATE_STALE_SECONDS = 24 * 3600  # ignore credits snapshot older than this
 DISK_PATH                 = "C:\\"
 # ─────────────────────────────────────────────────────────────────────────
@@ -54,21 +73,87 @@ if _PROJECT_DIR not in sys.path:  # pragma: no cover - import-time sys.path guar
 from core.atomic_io import _atomic_write_json  # noqa: E402
 
 _speech_lock = threading.Lock()
+_state_lock = threading.Lock()
 _last_disk_alert_at    = [0.0]
 _last_credits_alert_at = [0.0]
+# The balance the last credits alert named (None = no alert since the last
+# top-up): an unchanged low balance is not news.
+_last_credits_alert_balance: list = [None]
+_STATE_NAME = "budget_watchdog_state.json"
 
 
-def _enqueue_speech(message: str) -> None:
+def _state_path() -> str:
+    """data/budget_watchdog_state.json, resolved at call time (staging- and
+    JARVIS_DATA_DIR-aware, core/paths)."""
+    from core.paths import data_file
+    return data_file(_STATE_NAME)
+
+
+def _load_alert_state() -> None:
+    """Restore the persisted alert stamps (keeping whichever is newer) and the
+    last announced balance. A missing / corrupt file, or a stamp from the
+    future, leaves the cells alone. Never raises."""
+    try:
+        path = _state_path()
+        if not os.path.exists(path):
+            return
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return
+        now = time.time()
+        with _state_lock:
+            for key, cell in (("last_disk_alert_at", _last_disk_alert_at),
+                              ("last_credits_alert_at", _last_credits_alert_at)):
+                v = data.get(key)
+                if (isinstance(v, (int, float)) and not isinstance(v, bool)
+                        and 0 < v <= now + 60):
+                    cell[0] = max(cell[0], float(v))
+            bal = data.get("last_credits_alert_balance")
+            if (isinstance(bal, (int, float)) and not isinstance(bal, bool)
+                    and _last_credits_alert_balance[0] is None):
+                _last_credits_alert_balance[0] = float(bal)
+    except Exception:
+        pass
+
+
+def _save_alert_state() -> None:
+    """Persist the alert stamps and the last announced balance. Never raises."""
+    try:
+        with _state_lock:
+            payload = {
+                "last_disk_alert_at": _last_disk_alert_at[0],
+                "last_credits_alert_at": _last_credits_alert_at[0],
+                "last_credits_alert_balance": _last_credits_alert_balance[0],
+            }
+        _atomic_write_json(_state_path(), payload)
+    except Exception as e:
+        print(f"  [watchdog] could not save the alert state: {e}")
+
+
+def _credits_step(balance: float) -> int:
+    """How many alert steps ``balance`` is below: 1 under
+    CREDITS_ALERT_DOLLARS, one more under each of CREDITS_ALERT_STEPS."""
+    marks = (CREDITS_ALERT_DOLLARS,) + tuple(CREDITS_ALERT_STEPS)
+    return sum(1 for m in marks if balance < m)
+
+
+def _enqueue_speech(message: str, family: "str | None" = None) -> None:
     """Route a proactive announcement through bobert_companion's public
     proactive_announce() API when available, falling back to a direct atomic
     write against pending_speech.json. Mirrors the pattern in
-    skills/credits_monitor.py and skills/system_monitor.py."""
+    skills/credits_monitor.py and skills/system_monitor.py. ``family``: the
+    supersede / dedupe tag, so a newer copy replaces a held one."""
     try:
         import importlib
         bc = importlib.import_module("bobert_companion")
         announcer = getattr(bc, "proactive_announce", None)
         if callable(announcer):
-            announcer(message, source="disk_budget_watchdog")
+            if family:
+                announcer(message, source="disk_budget_watchdog",
+                          supersede=family, dedupe_key=family)
+            else:
+                announcer(message, source="disk_budget_watchdog")
             return
     except Exception:
         pass
@@ -125,9 +210,11 @@ def _check_disk(now: float) -> None:
         return
     _enqueue_speech(
         f"Sir, C drive is down to {free_gb:.1f} gigabytes free. "
-        f"You may want to clear some room before the overnight run continues."
+        f"You may want to clear some room before the overnight run continues.",
+        family="disk_low",
     )
     _last_disk_alert_at[0] = now
+    _save_alert_state()
 
 
 def _check_credits(now: float) -> None:
@@ -138,14 +225,31 @@ def _check_credits(now: float) -> None:
         # Snapshot too old to trust — credits_monitor will refresh it.
         return
     if balance >= CREDITS_ALERT_DOLLARS:
+        if _last_credits_alert_balance[0] is not None:
+            # Topped up: the next drop below the threshold is news again.
+            _last_credits_alert_balance[0] = None
+            _save_alert_state()
         return
-    if (now - _last_credits_alert_at[0]) <= ALERT_COOLDOWN_SECONDS:
+    last_bal = _last_credits_alert_balance[0]
+    lower_step = (last_bal is None
+                  or _credits_step(balance) > _credits_step(float(last_bal)))
+    since = now - _last_credits_alert_at[0]
+    if not lower_step and since < CREDITS_REMIND_SECONDS:
         return
     _enqueue_speech(
         f"Heads up, sir — Claude credit balance is down to "
-        f"{balance:.2f} dollars. Top up before the autonomous run drains it."
+        f"{balance:.2f} dollars. Top up before the autonomous run drains it.",
+        family=CREDITS_LOW_FAMILY,
     )
+    print(f"  [watchdog] credits alert queued (${balance:.2f}; "
+          + ("a new low step" if lower_step else
+             f"a reminder, the last one {since / 3600:.0f} h ago") + ")")
     _last_credits_alert_at[0] = now
+    # Only a LOWER reading moves the remembered balance: one that bobs back
+    # over a step (4.99 / 5.01) is not news twice.
+    if last_bal is None or balance < float(last_bal):
+        _last_credits_alert_balance[0] = balance
+    _save_alert_state()
 
 
 def _monitor_loop() -> None:  # pragma: no cover - non-terminating background daemon (sleeps INITIAL_DELAY then polls forever); its body delegates to _check_disk/_check_credits, which are unit-tested directly
@@ -185,6 +289,9 @@ def register(actions):
 
     actions["check_budget"] = check_budget
 
+    # Restore the cooldowns BEFORE the monitor can alert: a restart must not
+    # announce an unchanged balance again.
+    _load_alert_state()
     t = threading.Thread(target=_monitor_loop, daemon=True)
     t.start()
     print(

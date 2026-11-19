@@ -256,6 +256,9 @@ class RequeueFailureNeverDropsTests(_QueueBase):
     def test_budget_deferred_tail_survives_a_failed_requeue(self):
         bc = self.bc
         self._p(bc, "_PENDING_DRAIN_BUDGET_S", 0.0)
+        # The requeue mechanics, without the 2026-11-17 gap after a deferral
+        # (PENDING_DEFER_GAP_S; test_monolith_proactive_lines_1117).
+        self._p(bc, "PENDING_DEFER_GAP_S", 0, create=True)
         a, b, c = ({"message": f"Line {n}, sir."} for n in "abc")
         self._write([a, b, c])
         with mock.patch.object(bc, "_requeue_pending_speech",

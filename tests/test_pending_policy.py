@@ -78,6 +78,45 @@ class ClassTests(unittest.TestCase):
         self.assertEqual(pp.line_class(_e(
             "Sir, the disk is nearly full.", "system_monitor")), "other")
 
+    def test_the_lines_of_the_live_night_return(self):
+        # 11-16 23:50:09: the recap he came back to named a 6 PM forecast and
+        # two mic alerts; its "plus 3 more" held two "Yes, listening, sir."
+        for msg, src, cls in (
+            ("Sir, the temperature drops about 10 degrees by 6 PM - you may "
+             "want a jacket.", "weather", "weather"),
+            ("Sir, the desk mic has been completely silent for 30 seconds - "
+             "I can hear nothing at all from it.", "audio", "mic_health"),
+            ("Sir, the microphone appears to be down. I'll queue a fix.",
+             "self_diagnostic", "mic_health"),
+            ("Yes, listening, sir.", "ambient-listen", "wake_ack"),
+            ("I heard my name, sir - go ahead.", "ambient-listen", "wake_ack"),
+        ):
+            self.assertEqual(pp.line_class(_e(msg, src)), cls, msg)
+        # Another part being down is not a mic alert.
+        self.assertEqual(pp.line_class(_e(
+            "Sir, the Claude API appears to be down. I'll queue a fix.",
+            "self_diagnostic")), "other")
+
+    def test_the_night_return_limits(self):
+        fc = _e("Sir, rain by 6 PM.", "weather", age=2 * 3600 + 60)
+        mic = _e("Sir, the desk mic has been completely silent for 64 "
+                 "seconds.", "audio", age=301)
+        ack = _e("Yes, listening, sir.", "ambient-listen", age=61)
+        kept, dropped = pp.plan_ages([fc, mic, ack], now=NOW, local_hour=23)
+        self.assertEqual(kept, [])
+        self.assertEqual([d[1].split(":")[0] for d in dropped],
+                         ["weather", "mic_health", "wake_ack"])
+        fresh = [_e("Sir, rain by 6 PM.", "weather", age=3000),
+                 _e("Sir, the desk mic has been completely silent for 64 "
+                    "seconds.", "audio", age=30),
+                 _e("Yes, listening, sir.", "ambient-listen", age=20)]
+        self.assertEqual(pp.plan_ages(fresh, now=NOW, local_hour=23)[0],
+                         fresh)
+        # A young weather line may still be recapped; a mic alert never is.
+        self.assertFalse(pp.never_fold(fresh[0]))
+        self.assertTrue(pp.never_fold(fresh[1]))
+        self.assertTrue(pp.never_fold(fresh[2]))
+
     def test_his_own_and_urgent_lines_have_no_class(self):
         for src in ("timer", "schedule", "promise:7", "guard"):
             self.assertEqual(pp.line_class(_e("Reminder, sir.", src)), "")

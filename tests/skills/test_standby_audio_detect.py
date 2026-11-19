@@ -367,6 +367,40 @@ class ResetIfStaleTests(unittest.TestCase):
         self.assertTrue(self.mod._music_active[0])
 
 
+class MusicSeenWithinTests(unittest.TestCase):
+    """2026-11-17: a clap's answer is not spoken over music the detector
+    flagged a moment after the clap (bobert_companion._summoned_room_quiet)."""
+
+    def setUp(self):
+        self.mod, _ = load_skill_isolated("standby_audio_detect")
+        self.mod._music_active[0] = False
+        self.mod._music_ended_at[0] = 0.0
+        self.mod._last_feed_at[0] = self.mod.time.time()
+        self.mod._classifications.clear()
+
+    def test_never_heard_is_false(self):
+        self.assertFalse(self.mod.music_seen_within(10))
+
+    def test_music_now_is_true(self):
+        self.mod._music_active[0] = True
+        self.assertTrue(self.mod.music_seen_within(10))
+
+    def test_music_that_just_ended_counts_for_the_window_only(self):
+        now = self.mod.time.time()
+        self.mod._music_ended_at[0] = now - 4
+        self.assertTrue(self.mod.music_seen_within(10))
+        self.mod._music_ended_at[0] = now - 30
+        self.assertFalse(self.mod.music_seen_within(10))
+
+    def test_a_stale_detector_records_when_it_last_heard(self):
+        self.mod._music_active[0] = True
+        self.mod._last_feed_at[0] = self.mod.time.time() - (
+            self.mod.MUSIC_TIMEOUT_SECONDS + 1)
+        self.assertFalse(self.mod.music_seen_within(10))
+        self.assertFalse(self.mod._music_active[0])
+        self.assertGreater(self.mod._music_ended_at[0], 0.0)
+
+
 # ─── librosa onset energy ────────────────────────────────────────────────
 class OnsetEnergyTests(unittest.TestCase):
     def setUp(self):
