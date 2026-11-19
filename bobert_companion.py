@@ -14214,7 +14214,58 @@ _device_cache = {"in": None, "out": None, "checked_at": 0.0,
 # 0xc0000374 window every 4s. Instead, keep the cheap 4s gate but force a real
 # re-enumeration at most this often when the mic is idle, so hotplug is picked
 # up within a few minutes without the churn.
+#
+# 2026-11-17 (overhaul reliability-01): only while the live Windows endpoint
+# watch (_win_active_endpoint_ids) cannot be read. When it can, it sees every
+# hotplug on the 4 s pass and the sweep is pure churn - see _reenum_sweep_due.
 DEVICE_REENUM_INTERVAL = 300.0
+
+
+def _reenum_sweep_due(since_reenum: float, endpoint_watch: bool) -> bool:
+    """Is the TIME-ONLY PortAudio re-enumeration due on this pass?
+
+    Only on a host where the live endpoint watch is unreadable this pass
+    (no MMDevice API, no default endpoint at all, a COM error) - there the
+    sweep is still the only hotplug detector, exactly as before - and once
+    per session until the first real re-enumeration has run, so the stale-
+    index baseline (pa_active_endpoints) is taken from an enumeration that
+    matches it. With the watch readable a real change re-enumerates through
+    _stale_reinit / _move_reorders / an unenumerated move / a failed open
+    (reenum_requested) / a signature change instead.
+
+    AUDIO_PERIODIC_REENUM (core/config, default False) True restores the old
+    sweep on every host - the rollback.
+
+    Logs each MODE CHANGE once ("[audio] re-enumeration mode: ..."), never per
+    pass. Never raises (it runs inside _refresh_devices)."""
+    try:
+        if since_reenum < DEVICE_REENUM_INTERVAL:
+            return False
+        never = float(_device_cache.get("last_reenum_at") or 0.0) <= 0.0
+        forced = bool(globals().get("AUDIO_PERIODIC_REENUM", False))
+        due = bool(never or forced or not endpoint_watch)
+        mode = ("forced" if forced else
+                "watch" if endpoint_watch else "sweep")
+        if not never and _device_cache.get("reenum_mode") != mode:
+            _device_cache["reenum_mode"] = mode
+            if mode == "watch":
+                print("  [audio] re-enumeration mode: endpoint watch - the "
+                      "Windows endpoint list is read live every pass, so "
+                      "PortAudio re-enumerates only on a real device change, "
+                      "a default move or a failed open (no "
+                      f"{DEVICE_REENUM_INTERVAL:.0f}s sweep)")
+            elif mode == "forced":
+                print("  [audio] re-enumeration mode: forced sweep "
+                      "(AUDIO_PERIODIC_REENUM is on) - PortAudio is "
+                      f"re-enumerated every {DEVICE_REENUM_INTERVAL:.0f}s")
+            else:
+                print("  [audio] re-enumeration mode: sweep - the Windows "
+                      "endpoint list is unreadable, so PortAudio is "
+                      f"re-enumerated every {DEVICE_REENUM_INTERVAL:.0f}s to "
+                      "catch a plugged or unplugged device")
+        return due
+    except Exception:
+        return True
 # Serializes _refresh_devices so two callers (e.g. listen loop + a skill)
 # can't both be tearing PortAudio down at the same time, and so the wake-word
 # pause/resume bracket around sd._terminate() isn't racing with concurrent
@@ -15327,7 +15378,9 @@ def _audio_endpoint_gone(endpoint_id, active) -> bool:
 #   • The teardown therefore remains necessary for exactly ONE thing: a device
 #     that is NOT in the frozen list (true USB hotplug). That is what
 #     DEVICE_REENUM_INTERVAL and the signature check are for, and they are
-#     untouched.
+#     untouched. (Since 2026-09-29 the endpoint watch's stale check catches
+#     hotplug live; since 2026-11-17 the DEVICE_REENUM_INTERVAL sweep runs
+#     only where that watch cannot be read - _reenum_sweep_due.)
 #
 # Restricting the match to the DEFAULT HOST API is load-bearing twice over: it
 # reproduces `device=None`'s answer as above, and it collapses the four
@@ -15449,7 +15502,7 @@ def _endpoint_device_identity(endpoint_id: str | None,
         except Exception:
             continue
         name = d.get("name") or ""
-        if name == friendly or (len(name) == 31 and friendly.startswith(name)):
+        if _pa_name_matches_endpoint(name, friendly):
             hits.append((i, name))
     if len(hits) != 1:
         # Nothing matched → the endpoint is genuinely absent from the frozen
@@ -15524,9 +15577,20 @@ def _device_name_present(name: str) -> bool | None:
     return name in names
 
 
-def _announce_device_change(prev_name: str, new_name: str,
-                            want_input: bool) -> None:
-    """Speak an audio-device switch.
+def _pa_name_matches_endpoint(pa_name: str, friendly: str) -> bool:
+    """Is the PortAudio device ``pa_name`` the Windows endpoint named
+    ``friendly``? Equal, or - because MME truncates descriptions to 31
+    characters - exactly 31 characters long and a prefix of it. The one copy of
+    that rule (_endpoint_device_identity and the owner-switch check use it)."""
+    if not pa_name or not friendly:
+        return False
+    return pa_name == friendly or (len(pa_name) == 31
+                                   and friendly.startswith(pa_name))
+
+
+def _device_change_parts(prev_name: str, new_name: str,
+                         want_input: bool) -> tuple[str, str]:
+    """(the new device's spoken name, the loss clause or "") for one switch.
 
     NEUTRAL BY DEFAULT (2026-08-20). The owner drives his mic and speakers from
     a Stream Deck, so a change is normally DELIBERATE — narrating it as a fault
@@ -15539,20 +15603,279 @@ def _announce_device_change(prev_name: str, new_name: str,
     new_friendly = (_friendly_device_name(new_name)
                     or ("the fallback mic" if want_input
                         else "the default speakers"))
+    loss = ""
     if _device_name_present(prev_name) is False:
         prev_lower = (prev_name or "").lower()
         if "headset" in prev_lower or "headphone" in prev_lower:
-            msg = (f"Switched to {new_friendly}, sir — "
-                   f"your headset appears to have dropped off.")
+            loss = "your headset appears to have dropped off"
         else:
             old_friendly = (_friendly_device_name(prev_name)
                             or ("the previous mic" if want_input
                                 else "the previous speakers"))
-            msg = (f"Switched to {new_friendly}, sir — "
-                   f"{old_friendly} appears to have disconnected.")
-    else:
-        msg = f"Switched to {new_friendly}, sir."
-    _enqueue_device_announcement(msg)
+            loss = f"{old_friendly} appears to have disconnected"
+    return new_friendly, loss
+
+
+def _device_change_sentence(parts) -> str:
+    """ONE sentence for the switches of one refresh pass. ``parts`` is a list
+    of (want_input, new spoken name, loss clause).
+
+    2026-11-17 (overhaul speech-mic-announce). One press usually moves both
+    defaults, and the two sentences used to be enqueued one after the other
+    through the flap governor, which keeps only the NEWEST held sentence -
+    live 11-16 09:33:38 "Switched to <the desk mic>" (where he is HEARD) was
+    superseded by "Switched to <the speakers>" and never said. The same
+    device both ways is one plain sentence (the headset: "Switched to your
+    headset, sir."); two devices are named in one; each loss clause once."""
+    losses: list[str] = []
+    news: list[str] = []
+    for _wi, nf, loss in parts:
+        if loss and loss not in losses:
+            losses.append(loss)
+        if nf not in news:
+            news.append(nf)
+    tail = (" — " + " and ".join(losses)) if losses else ""
+    if len(news) == 1:
+        return f"Switched to {news[0]}, sir{tail}."
+    mic = next(nf for wi, nf, _l in parts if wi)
+    spk = next(nf for wi, nf, _l in parts if not wi)
+    return (f"Switched to {mic} for the microphone and {spk} for the "
+            f"speakers, sir{tail}.")
+
+
+def _announce_device_change(prev_name: str, new_name: str,
+                            want_input: bool) -> None:
+    """Speak ONE audio-device switch (see _device_change_parts for the
+    wording). _refresh_devices announces a whole pass through
+    _announce_device_changes instead."""
+    _enqueue_device_announcement(_device_change_sentence(
+        [(want_input, *_device_change_parts(prev_name, new_name,
+                                            want_input))]))
+
+
+# ── Owner-confirmed switches (2026-11-17, overhaul actions-09) ─────────────
+# Live 11-17 17:12:19 he said "switch the microphone to <the desk mic>";
+# use_desk_mic moved the Windows default and answered "Listening on <the desk
+# mic> now, sir." at 17:12:22. The refresh pass followed the move
+# at 17:12:33 and queued the neutral "Switched to <the desk mic>, sir.",
+# which was SPOKEN at 17:13:10 - a second announcement of the switch he had
+# ordered and been told about, interrupting the conversation. The voice
+# actions that move a default (skills/audio_autoswitch.py use_desk_mic /
+# use_headset_mic / use_headset / use_speakers) now stamp what they moved; a
+# refresh-pass switch that lands on that endpoint inside
+# _OWNER_SWITCH_CONFIRMED_S is logged, not spoken, and the stamp is used up.
+# A switch to any OTHER device is announced as always.
+_OWNER_SWITCH_CONFIRMED_S = 60.0
+_owner_audio_switch: dict = {"in": None, "out": None}
+_owner_audio_switch_lock = threading.Lock()
+_owner_switch_clock = time.monotonic      # a seam: tests drive it by hand
+
+
+def _note_owner_audio_switch(direction: str, endpoint_id, name) -> None:
+    """A voice action moved the Windows default ``direction`` ("in" / "out")
+    to (``endpoint_id``, ``name``) and has SAID so. Never raises."""
+    try:
+        if direction not in ("in", "out"):
+            return
+        stamp = {"ep": str(endpoint_id or ""), "name": str(name or ""),
+                 "t": float(_owner_switch_clock())}
+        # Timed: never an unbounded wait (the lock only guards dict ops).
+        if not _owner_audio_switch_lock.acquire(timeout=0.5):
+            return
+        try:
+            _owner_audio_switch[direction] = stamp
+        finally:
+            _owner_audio_switch_lock.release()
+    except Exception:
+        pass
+
+
+def _owner_switch_confirmed(direction: str, new_name: str, new_ep) -> bool:
+    """True (and the stamp is used up) when this refresh-pass switch is the
+    one a voice action already confirmed in words. Never raises; an error
+    announces as before."""
+    try:
+        # Timed: _refresh_devices may run on the voice thread.
+        if not _owner_audio_switch_lock.acquire(timeout=0.5):
+            return False
+        try:
+            st = _owner_audio_switch.get(direction)
+            if not st:
+                return False
+            age = float(_owner_switch_clock()) - float(st.get("t") or 0.0)
+            if not 0.0 <= age <= _OWNER_SWITCH_CONFIRMED_S:
+                _owner_audio_switch[direction] = None
+                return False
+            hit = bool((new_ep and st.get("ep") and new_ep == st["ep"])
+                       or _pa_name_matches_endpoint(new_name or "",
+                                                    st.get("name") or ""))
+            if hit:
+                _owner_audio_switch[direction] = None
+            return hit
+        finally:
+            _owner_audio_switch_lock.release()
+    except Exception:
+        return False
+
+
+def _announce_device_changes(switches) -> None:
+    """Announce everything one refresh pass switched, as ONE sentence.
+    ``switches``: [(kind "in"/"out", previous name, new name, new endpoint
+    id or None)]. A switch the owner ordered by voice and was already told
+    about is logged and left out (_owner_switch_confirmed). Never raises."""
+    try:
+        parts = []
+        for kind, prev_name, new_name, new_ep in switches:
+            want_input = kind == "in"
+            if _owner_switch_confirmed(kind, new_name, new_ep):
+                print(f"  [audio] {'mic' if want_input else 'speakers'} → "
+                      f"{new_name} is the switch sir asked for and was "
+                      f"already told about — not announcing it again")
+                continue
+            parts.append((want_input,
+                          *_device_change_parts(prev_name, new_name,
+                                                want_input)))
+        if parts:
+            _enqueue_device_announcement(_device_change_sentence(parts))
+    except Exception as e:
+        print(f"  [audio] device-change announcement failed: {e}")
+
+
+# ── A newly plugged microphone is asked about, not followed (2026-11-17) ──
+# Overhaul speech-mic-announce. Live 11-17 17:09:57 a "USB microphone" became
+# Active and the Windows default; 17:10:23 JARVIS moved onto it ("Switched to
+# USB microphone") and listened there until he typed the switch back. Following
+# the default is the design (the Stream Deck moves it) and stays so for every
+# mic he has used or configured: the mics Windows listed when JARVIS started,
+# the headset / AUDIO_AUTOSWITCH_MIC_FALLBACK / PREFERRED_INPUT_DEVICES names,
+# and any mic JARVIS followed this session. Only a STRANGER is held (flag
+# AUDIO_FOLLOW_NEW_MIC, default True = follow as before; False opts in), and only while the mic JARVIS is on is
+# still present: a gone mic is always left. The hold is applied to the endpoint
+# pair read at the top of _refresh_devices, so the rest of the pass sees a mic
+# that never moved. It ends when Windows moves the default elsewhere, the old
+# mic goes, or he says "use the new microphone" (_accept_held_new_mic).
+_NEW_MIC_STATE: dict = {"known": None, "held": None, "accepted": "",
+                        "notified": {}}
+_new_mic_lock = threading.Lock()
+
+
+def _fragment_matches_endpoint(endpoint_id, fragments) -> bool:
+    """Does the endpoint's Windows friendly name contain any of the name
+    ``fragments`` (case-insensitive, empty ones ignored)? Never raises."""
+    try:
+        friendly = (_win_endpoint_friendly_name(endpoint_id) or "").lower()
+        return bool(friendly) and any(
+            f and str(f).strip().lower() in friendly for f in (fragments or ()))
+    except Exception:
+        return False
+
+
+def _new_mic_name_known(endpoint_id) -> bool:
+    """Is this capture endpoint one he has configured: the headset, the desk-mic
+    fallback or a PREFERRED_INPUT_DEVICES fragment? Unreadable = not known (the
+    caller then asks, which is safe)."""
+    frags = [globals().get("AUDIO_AUTOSWITCH_HEADSET", ""),
+             globals().get("AUDIO_AUTOSWITCH_MIC_FALLBACK", "")]
+    frags += list(globals().get("PREFERRED_INPUT_DEVICES") or [])
+    return _fragment_matches_endpoint(endpoint_id, frags)
+
+
+def _apply_new_mic_hold(now_eps, prev_eps, act, now: float):
+    """The (render, capture) default endpoints JARVIS should act on this pass:
+    ``now_eps`` unless its capture endpoint is a stranger that has just become
+    the default while the mic JARVIS is on is still present, in which case the
+    capture half stays ``prev_eps``'. Never raises (it runs in _refresh_devices;
+    any error follows the default as before)."""
+    try:
+        if (globals().get("AUDIO_FOLLOW_NEW_MIC", True) or act is None
+                or prev_eps is None or now_eps is None
+                or globals().get("MICROPHONE_INDEX") is not None
+                or not now_eps[1] or not prev_eps[1]):
+            with _new_mic_lock:
+                _NEW_MIC_STATE["held"] = None
+            return now_eps
+        new_ep, prev_ep = now_eps[1], prev_eps[1]
+        with _new_mic_lock:
+            known = _NEW_MIC_STATE["known"]
+            if known is None:       # the boot baseline: what is there is his
+                known = _NEW_MIC_STATE["known"] = set(
+                    _endpoint_ids_of(act, True)) | {new_ep, prev_ep}
+            held = _NEW_MIC_STATE["held"]
+            if new_ep == prev_ep or new_ep in known:
+                _NEW_MIC_STATE["held"] = None
+                return now_eps
+            if _NEW_MIC_STATE["accepted"] == new_ep:
+                known.add(new_ep)
+                _NEW_MIC_STATE["held"] = None
+                return now_eps
+            if _audio_endpoint_gone(prev_ep, act):
+                known.add(new_ep)       # what he was on is gone: leave it
+                _NEW_MIC_STATE["held"] = None
+                return now_eps
+            if _new_mic_name_known(new_ep):
+                known.add(new_ep)
+                _NEW_MIC_STATE["held"] = None
+                return now_eps
+            # PREFERRED_INPUT_DEVICES names the mic JARVIS is on: _pick_device
+            # keeps it whatever the default does, so there is nothing to hold
+            # and nothing to ask (the preference is respected as it always was).
+            if _fragment_matches_endpoint(
+                    prev_ep, globals().get("PREFERRED_INPUT_DEVICES")):
+                _NEW_MIC_STATE["held"] = None
+                return now_eps
+            first = not (held and held.get("ep") == new_ep
+                         and held.get("prev") == prev_ep)
+            if first:
+                _NEW_MIC_STATE["held"] = {"ep": new_ep, "prev": prev_ep,
+                                          "since": now}
+            # A flapping USB mic clears the hold on every unplug, so each
+            # replug is "first" again: speak once per endpoint per flap window.
+            notified = _NEW_MIC_STATE.setdefault("notified", {})
+            last = notified.get(new_ep)
+            window = float(globals().get("AUDIO_FLAP_WINDOW_S", 300.0) or 300.0)
+            speak = first and not (last is not None and 0 <= now - last < window)
+            if speak:
+                notified[new_ep] = now
+        if first and not speak:
+            print(f"  [audio] new microphone {_audio_endpoint_label(new_ep)} "
+                  f"is back - already told sir within the last "
+                  f"{window:.0f}s, staying quiet")
+        if speak:
+            new_name = _audio_endpoint_label(new_ep)
+            cur_name = _audio_endpoint_label(prev_ep)
+            print(f"  [audio] new microphone {new_name} became the Windows "
+                  f"default - staying on {cur_name} until sir says to switch "
+                  f"(AUDIO_FOLLOW_NEW_MIC is off)")
+            try:
+                proactive_announce(
+                    f"{new_name[0].upper()}{new_name[1:]} appeared and "
+                    f"Windows made it the default, sir. I'm staying on "
+                    f"{cur_name}. Say 'use the new microphone' to switch.",
+                    source="audio", dedupe_key="audio:new_mic")
+            except Exception as e:
+                print(f"  [audio] new-microphone notice failed: {e}")
+        return (now_eps[0], prev_ep)
+    except Exception:
+        return now_eps
+
+
+def _accept_held_new_mic() -> str:
+    """Voice action: follow the held new microphone. Returns its spoken name,
+    or "" when nothing is held. The next refresh pass (<= 4 s) switches."""
+    with _new_mic_lock:
+        held = _NEW_MIC_STATE.get("held")
+        if not held:
+            return ""
+        _NEW_MIC_STATE["accepted"] = held["ep"]
+        ep = held["ep"]
+    try:
+        # He is told in words ("Listening on ... now"), so the pass that
+        # follows must not announce the same switch again (actions-09).
+        _note_owner_audio_switch("in", ep, _win_endpoint_friendly_name(ep) or "")
+        _device_cache["checked_at"] = 0.0
+    except Exception:
+        pass
+    return _audio_endpoint_label(ep)
 
 
 def _refresh_devices(force: bool = False):
@@ -15610,17 +15933,20 @@ def _refresh_devices(force: bool = False):
         # hotplug in steady state, fall THROUGH to the reinit once every
         # DEVICE_REENUM_INTERVAL even when the signature matches (the reinit is
         # still deferred below if any mic/TTS stream is live, so this adds no
-        # teardown-during-capture risk). 2026-07-14 bug-hunt (#4).
+        # teardown-during-capture risk). 2026-07-14 bug-hunt (#4). Since
+        # 2026-11-17 only on a host where the live endpoint watch below cannot
+        # be read - with it, hotplug makes a direction STALE and that
+        # re-enumerates (_reenum_sweep_due, AUDIO_PERIODIC_REENUM).
         last_sig = _device_cache["last_devices_signature"]
         _since_reenum = now - _device_cache.get("last_reenum_at", 0.0)
-        _reenum_due = (_since_reenum >= DEVICE_REENUM_INTERVAL
-                       # A capture open failed on a resolved index (2026-09-29,
-                       # _note_input_open_failure): re-enumerate soon rather
-                       # than in up to DEVICE_REENUM_INTERVAL, but never more
-                       # often than _OPEN_FAIL_REENUM_MIN_S — a device that
-                       # keeps failing must not turn into a teardown loop.
-                       or (bool(_device_cache.get("reenum_requested"))
-                           and _since_reenum >= _OPEN_FAIL_REENUM_MIN_S))
+        # A capture open failed on a resolved index (2026-09-29,
+        # _note_input_open_failure), or an adopted default move renumbered
+        # the list: re-enumerate soon, but never more often than
+        # _OPEN_FAIL_REENUM_MIN_S — a device that keeps failing must not turn
+        # into a teardown loop. The TIME-ONLY sweep is decided further down,
+        # once the live endpoint watch has been read (_reenum_sweep_due).
+        _reenum_requested_due = (bool(_device_cache.get("reenum_requested"))
+                                 and _since_reenum >= _OPEN_FAIL_REENUM_MIN_S)
         # FOLLOW-THE-DEFAULT TRIGGER (2026-08-20). The owner moves his mic and
         # speakers from a Stream Deck, i.e. by moving the WINDOWS DEFAULT — and
         # a moved default changes NEITHER current_sig (it is built from
@@ -15687,6 +16013,20 @@ def _refresh_devices(force: bool = False):
         # 15:24:59). A stale direction is never re-picked from the frozen
         # list; it is re-enumerated first. None (unreadable) = old behaviour.
         _act = _win_active_endpoint_ids() if _have_eps else None
+        # THE PERIODIC SWEEP IS ONLY FOR A BLIND HOST (2026-11-17, overhaul
+        # reliability-01). It existed because nothing else could see USB
+        # hotplug; the endpoint set read just above now does, live, every
+        # 4 s pass (an endpoint coming or going makes a direction STALE and
+        # _stale_reinit re-enumerates). With the watch readable the sweep found
+        # nothing in 209 forced re-enumerations over the 11-16/11-17 sessions
+        # (10 real default moves, each already caught by the watch), yet every
+        # one closed the always-open mic bus, the wake stream and the loopback
+        # and re-anchored the echo canceller - every ~5 min, all night.
+        # Decided on the RAW read: a pass whose two snapshots disagree (the
+        # check below) is still a working watch.
+        _reenum_due = (_reenum_requested_due
+                       or _reenum_sweep_due(_since_reenum,
+                                            endpoint_watch=_act is not None))
         if _act is not None and any(e is not None and e not in _act
                                     for e in _now_eps):
             # A default endpoint is Active by definition, so a set that does
@@ -15694,6 +16034,10 @@ def _refresh_devices(force: bool = False):
             # source than the default). Never decide from two snapshots that
             # disagree — unknown for this pass, the next pass re-reads.
             _act = None
+        # A stranger microphone that just became the default is held, not
+        # followed (2026-11-17, AUDIO_FOLLOW_NEW_MIC): everything below sees a
+        # capture default that never moved.
+        _now_eps = _apply_new_mic_hold(_now_eps, _prev_eps, _act, now)
         _in_stale, _out_stale = _audio_endpoint_state_pass(_act)
         _audio_default_flip_pass(_now_eps if _have_eps else None)
         _default_moved = bool(_have_eps and _prev_eps is not None
@@ -16164,16 +16508,20 @@ def _refresh_devices(force: bool = False):
             # has actually vanished from the device list.
             #
             # One Stream Deck press usually moves BOTH defaults (the headset is
-            # mic AND speakers), so both branches enqueue — deliberately. The
-            # two lines are IDENTICAL text in that case, and _speak_pending's
-            # seen_in_batch / _speech_was_recently_spoken dedupe collapses them
-            # to one spoken sentence; when the endpoints differ the owner gets
-            # both, which is the information he asked for. Do NOT "fix" this by
-            # announcing only one direction. (2026-09-29: both now pass the
-            # audio flap governor — an identical repeat inside
-            # AUDIO_ANNOUNCE_MIN_GAP_S is dropped there, a different second
-            # line is held until the gap opens, and nothing is said while a
-            # device is flapping.)
+            # mic AND speakers), so both directions are announced —
+            # deliberately: when the endpoints differ the owner gets both,
+            # which is the information he asked for. Do NOT "fix" this by
+            # announcing only one direction. (2026-09-29: the sentence passes
+            # the audio flap governor — an identical repeat inside
+            # AUDIO_ANNOUNCE_MIN_GAP_S is dropped there, a different one is
+            # held until the gap opens, and nothing is said while a device is
+            # flapping.) 2026-11-17: both directions of ONE pass are collected
+            # and said as ONE sentence (_announce_device_changes). Two
+            # sentences went through the governor one after the other and the
+            # second REPLACED the first while it was held - live 11-16
+            # 09:33:38 the mic line was superseded by the speaker line and
+            # never said. A switch he ordered by voice and was already told
+            # about is left out of it (_owner_switch_confirmed).
             #
             # WHAT COUNTS AS A SWITCH, AND WHAT ONLY COUNTS AS A RE-KEY
             # (2026-08-20, second pass). Tracking the pair is right; ANNOUNCING
@@ -16201,6 +16549,7 @@ def _refresh_devices(force: bool = False):
             # not spoken — silence beats a confident wrong sentence.
             _ep_now = {"in": (_follow_eps[1] if in_from_default else None),
                        "out": (_follow_eps[0] if out_from_default else None)}
+            _switches: list = []
             for _kind, (_track_idx, _track_name) in (("in", in_track),
                                                      ("out", out_track)):
                 if not _track_name:
@@ -16222,8 +16571,8 @@ def _refresh_devices(force: bool = False):
                                    and _new_ep != _prev_ep)
                 if _prev_name and (_track_name != _prev_name
                                    or _endpoint_moved):
-                    _announce_device_change(_prev_name, _track_name,
-                                            want_input=(_kind == "in"))
+                    _switches.append((_kind, _prev_name, _track_name,
+                                      _new_ep))
                 elif _prev_name:
                     print(f"  [audio] {_label} index moved "
                           f"[{_prev_idx}] → [{_track_idx}] with the same "
@@ -16232,6 +16581,8 @@ def _refresh_devices(force: bool = False):
                 _device_cache[f"last_{_kind}_name"]  = _track_name
                 _device_cache[f"last_{_kind}_index"] = _track_idx
                 _device_cache[f"last_{_kind}_endpoint"] = _new_ep
+            if _switches:
+                _announce_device_changes(_switches)
 
             _device_cache["in"]         = in_idx
             _device_cache["out"]        = out_idx
@@ -19268,22 +19619,97 @@ def _ambient_offer_main_transcript(text, conf) -> None:
 # still-enumerable dead endpoint that left this box deaf for 90 minutes.
 # PREFERRED_INPUT_DEVICES is empty here, so there is no "next preferred entry"
 # to demote to either. The honest move is to name the endpoint and the remedy.
+#
+# 2026-11-17 (overhaul, speech-mic-silent-rearm / proactive-04): THE THROTTLE
+# NEVER HELD. The recovery arm in record_speech cleared the latch AND
+# _silent_mic_warned_at the moment ONE chunk crossed _AUDIBLE_RMS_FLOOR (5e-5),
+# and a quiet room on the desk mic sits right at that floor: 33 warnings in six
+# logs, every one followed seconds later by "audible again" at RMS 0.00005 -
+# 0.00054 (11-17 14:49:10 / 14:50:52 / 14:54:50 / 14:57:14 / 14:58:41, 1.5-4 min
+# apart; five copies folded into one recap). Now:
+#   * _silent_mic_warned_at / _device are the THROTTLE and only a new report
+#     writes them - one report per device per MIC_SILENT_REWARN_SECONDS, a
+#     different device re-arms at once (unchanged);
+#   * _silent_mic_warned is the "believed silent" LATCH. It clears only on a
+#     SUSTAINED recovery (_silent_mic_note_audio: a raw chunk over VAD_THRESHOLD,
+#     or _SILENT_MIC_RECOVER_S of chunks over _SILENT_MIC_RECOVER_RMS), never
+#     on one chunk of noise floor. A queued warning is spoken only while it is
+#     still set (still_valid "mic_silent:<device>", checked at drain time);
+#   * the queue holds at most one copy (supersede _MIC_SILENT_SUPERSEDE), and
+#     core/pending_policy never folds it into a recap as a stale fragment;
+#   * the silence clock counts only time spent listening (core.audio_processor
+#     _POLL_GAP_S): 16:02:53 "silent for 40 seconds" came 12 s into listening.
 _silent_mic_warned = [False]
 _silent_mic_warned_at = [0.0]
 _silent_mic_warned_device = [""]
 # Bounded re-warn so a persistent fault stays visible across a long session
 # without becoming chatter. Not a config knob: MIC_SILENT_WARN_SECONDS already
 # owns the "how long is too long" decision; this only bounds repetition.
+# core/pending_policy.QUEUE_RULES["mic_silent"] uses the same 900 s as its age
+# limit (tests pin the two together).
 MIC_SILENT_REWARN_SECONDS = 900.0
+# A SUSTAINED recovery, not one chunk at the floor: 3 s of chunks at or above
+# 3e-4 ("the quietest working mic idles at 3e-4", core/audio_processor 11-12),
+# or one raw chunk over VAD_THRESHOLD (speech). The 33 false re-arms above all
+# came from single chunks of 5e-5 - 5.4e-4.
+_SILENT_MIC_RECOVER_RMS = 3.0e-4
+_SILENT_MIC_RECOVER_S = 3.0
+_silent_mic_recover_s = [0.0]
+# The queued warning's supersede family and still_valid prefix (the prefix is
+# core/pending_policy's, which classes the queued line by it).
+_MIC_SILENT_SUPERSEDE = "mic-silent"
+from core.pending_policy import (  # noqa: E402
+    MIC_SILENT_VALID_PREFIX as _MIC_SILENT_VALID_PREFIX)
+
+
+def _silent_mic_note_audio(raw_rms: float, chunk_s: float,
+                           vad_trip: bool) -> bool:
+    """While the silent-mic latch is set, count CLEARLY audible audio. True
+    on the chunk that makes the recovery sustained: the latch is cleared then
+    (the throttle is not touched). Never raises: record_speech's chunk loop."""
+    try:
+        if not _silent_mic_warned[0]:
+            return False
+        if vad_trip:
+            done = True
+        elif float(raw_rms) >= _SILENT_MIC_RECOVER_RMS:
+            _silent_mic_recover_s[0] += max(0.0, float(chunk_s))
+            done = _silent_mic_recover_s[0] >= _SILENT_MIC_RECOVER_S
+        else:
+            return False
+        if done:
+            _silent_mic_warned[0] = False
+            _silent_mic_recover_s[0] = 0.0
+        return done
+    except Exception:
+        return False
+
+
+def _silent_mic_still_valid(token: str) -> bool:
+    """Drain-time check for a queued silent-mic warning ("mic_silent:<device>"):
+    still worth saying only while the latch is set and JARVIS is still on that
+    device. A sustained recovery (he was heard) or a device change since makes
+    it false - live 11-17 16:02:41 the recap told him the desk mic was
+    silent right after a turn he spoke on it. Never raises; unreadable state
+    keeps the line (a real fault must not be lost to a bug here)."""
+    try:
+        dev = str(token)[len(_MIC_SILENT_VALID_PREFIX):]
+        if not _silent_mic_warned[0]:
+            return False
+        cur = _device_cache.get("last_in_name") or ""
+        return cur == dev
+    except Exception:
+        return True
 
 
 def _report_silent_mic(silent_age: float, now: float) -> bool:
     """Report a mic that enumerates and opens but returns only zeros.
 
     Console AND spoken, because the failure mode removes the owner's ability to
-    ask. Throttled by MIC_SILENT_REWARN_SECONDS, and re-armed immediately when
-    the selected input device changes (a fresh endpoint that is ALSO silent is
-    new information). Returns True when it reported this time.
+    ask. Throttled by MIC_SILENT_REWARN_SECONDS per device - a recovery does
+    not reset that (2026-11-17, see the block above) - and re-armed immediately
+    when the selected input device changes (a fresh endpoint that is ALSO
+    silent is new information). Returns True when it reported this time.
 
     Never raises: this runs inside record_speech's per-chunk loop."""
     try:
@@ -19291,12 +19717,14 @@ def _report_silent_mic(silent_age: float, now: float) -> bool:
     except Exception:
         device = ""
     changed = device != _silent_mic_warned_device[0]
-    if (_silent_mic_warned[0] and not changed
-            and (now - _silent_mic_warned_at[0]) < MIC_SILENT_REWARN_SECONDS):
+    since = now - _silent_mic_warned_at[0]
+    if (not changed and _silent_mic_warned_at[0] > 0.0
+            and 0.0 <= since < MIC_SILENT_REWARN_SECONDS):
         return False
     _silent_mic_warned[0] = True
     _silent_mic_warned_at[0] = now
     _silent_mic_warned_device[0] = device
+    _silent_mic_recover_s[0] = 0.0
     try:
         named = _friendly_device_name(device) or "your active microphone"
     except Exception:
@@ -19319,7 +19747,13 @@ def _report_silent_mic(silent_age: float, now: float) -> bool:
         if _audio_flap.storm_active():
             _audio_flap.submit(msg, "alert")      # logs the quiet sentence
         else:
-            proactive_announce(msg, source="audio")
+            # One queued copy at most (a newer one replaces it), deduped by
+            # key not text (the seconds differ), and dropped at drain time if
+            # the mic has been heard since (_silent_mic_still_valid).
+            proactive_announce(
+                msg, source="audio", supersede=_MIC_SILENT_SUPERSEDE,
+                dedupe_key="audio:mic_silent",
+                still_valid=f"{_MIC_SILENT_VALID_PREFIX}{device}")
     except Exception as e:
         print(f"  [vad] silent-mic announcement failed: {e}")
     return True
@@ -21122,21 +21556,27 @@ def record_speech(timeout: float | None = None, *,
                 # capture driver). Emit one warning per silent stretch
                 # so the user sees a concrete pointer instead of just
                 # "JARVIS isn't hearing me".
+                # seconds_since_audible_chunk counts only time spent
+                # listening (2026-11-17); not while JARVIS's own voice plays.
                 silent_age = _ap_for_vad.seconds_since_audible_chunk()
                 if (silent_age != float("inf")
-                        and silent_age > float(MIC_SILENT_WARN_SECONDS)):
+                        and silent_age > float(MIC_SILENT_WARN_SECONDS)
+                        and not _tts_playback_active[0]):
                     # _report_silent_mic owns the latch, the re-warn throttle
                     # and the spoken escalation.
                     _report_silent_mic(silent_age, now_ts)
-                elif (raw_rms > _ap_for_vad._AUDIBLE_RMS_FLOOR
-                      and _silent_mic_warned[0]):
-                    # Mic recovered — allow the warning to re-fire next
-                    # time we drop silent for that long.
-                    _silent_mic_warned[0] = False
-                    _silent_mic_warned_at[0] = 0.0
-                    _silent_mic_warned_device[0] = ""
-                    print(f"  [vad] mic is audible again "
-                          f"(RMS {raw_rms:.5f}) — silent-mic warning re-armed")
+                elif _silent_mic_warned[0]:
+                    # Clears the "believed silent" latch only on a SUSTAINED
+                    # recovery, never on one chunk at the noise floor, and
+                    # never resets the re-warn throttle (2026-11-17).
+                    if _silent_mic_note_audio(
+                            raw_rms, len(data) / float(SAMPLE_RATE),
+                            raw_rms > VAD_THRESHOLD):
+                        print(f"  [vad] mic is audible again (RMS "
+                              f"{raw_rms:.5f}, sustained) — silent-mic latch "
+                              f"cleared; a new warning on the same device "
+                              f"still waits out the "
+                              f"{MIC_SILENT_REWARN_SECONDS:.0f}s re-warn limit")
             except Exception:
                 pass
 
@@ -52228,6 +52668,15 @@ def _speak_pending(only_sources=None):
         if not msg:
             continue
         _sv = item.get("still_valid")
+        if _sv and str(_sv).startswith(_MIC_SILENT_VALID_PREFIX):
+            # A queued silent-mic warning (2026-11-17): said only while the
+            # mic is still believed silent on the same device.
+            if not _silent_mic_still_valid(str(_sv)):
+                print(f"  [pending] dropped stale announcement (the mic has "
+                      f"been heard since, or JARVIS moved off it): {msg[:80]}")
+                _rewrite_queue_snapshot(consume_path, back + items[_pos + 1:])
+                continue
+            _sv = None
         if _sv:
             try:
                 # FINISH_LINE_KEEP (v3.0.10): ask the LIVE skill. The import

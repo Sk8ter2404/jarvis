@@ -736,7 +736,23 @@ _vad_state: dict = {
     # "user is quiet" (mic alive, rms hovers above 1e-5) from "mic is
     # delivering literal zero-frames" (driver / privacy block / dead mic).
     "last_audible_chunk_ts":  0.0,
+    # 2026-11-17: seconds since that chunk during which NOBODY WAS LISTENING
+    # (gaps between two inspected chunks longer than _POLL_GAP_S: JARVIS
+    # speaking, thinking, transcribing). seconds_since_audible_chunk()
+    # subtracts it, so the silence it reports is silence that was HEARD.
+    # Reset by every audible chunk.
+    "unpolled_s":             0.0,
 }
+
+# A gap between two inspected chunks longer than this is time the capture
+# loop was not listening, and it is not counted as silence (2026-11-17).
+# record_speech inspects a chunk every ~64 ms while it holds the mic; it does
+# not hold it while JARVIS speaks, thinks or transcribes. Live 11-17 16:02:53:
+# "<the desk mic> has been completely silent for 40 seconds" was spoken 12 s
+# into listening, right after a 28 s turn and a 12 s recap - the mic he had
+# just been heard on. 2 s = the mic bus's own no-audio stall window, so a
+# stream that really stalls is still the bus's to report, never hidden here.
+_POLL_GAP_S = 2.0
 
 # Anything above this RMS counts as "the mic is alive". The hardware noise
 # floor of a working capture device sits well above this even in a quiet
@@ -762,9 +778,14 @@ def note_vad_poll(ts: Optional[float] = None) -> None:
     didn't trip). Used to distinguish a stalled input pipeline from idle."""
     t = float(time.time() if ts is None else ts)
     with _vad_state_lock:
+        prev = float(_vad_state.get("last_vad_poll_ts") or 0.0)
         _vad_state["last_vad_poll_ts"] = t
         if _vad_state["vad_session_start"] == 0.0:
             _vad_state["vad_session_start"] = t
+        elif prev > 0.0 and (t - prev) > _POLL_GAP_S:
+            # Nobody was listening for (t - prev): pause the silence clock.
+            _vad_state["unpolled_s"] = (
+                float(_vad_state.get("unpolled_s") or 0.0) + (t - prev))
 
 
 def get_vad_state() -> dict:
@@ -797,22 +818,30 @@ def note_raw_rms(rms: float, ts: Optional[float] = None) -> None:
     with _vad_state_lock:
         if float(rms) > _AUDIBLE_RMS_FLOOR:
             _vad_state["last_audible_chunk_ts"] = t
+            _vad_state["unpolled_s"] = 0.0
 
 
 def seconds_since_audible_chunk() -> float:
-    """Seconds since the mic last delivered a chunk with raw RMS above
-    _AUDIBLE_RMS_FLOOR. When the mic has never produced audible audio
-    *this* session but polling is active, returns time since the session
-    started — so the silent-mic warning fires after MIC_SILENT_WARN_SECONDS
-    even from cold start. Returns float('inf') when polling hasn't begun."""
+    """Seconds of LISTENING since the mic last delivered a chunk with raw RMS
+    above _AUDIBLE_RMS_FLOOR. When the mic has never produced audible audio
+    *this* session but polling is active, it is measured from the session's
+    first poll — so the silent-mic warning fires after MIC_SILENT_WARN_SECONDS
+    even from cold start. Returns float('inf') when polling hasn't begun.
+
+    Gaps between two inspected chunks longer than _POLL_GAP_S (JARVIS
+    speaking / thinking: nobody listening) are NOT counted (2026-11-17); a
+    gap still running now is, so callers keep their own poll-freshness gate
+    (audio_switch.CAPTURE_POLL_FRESH_S, self_diagnostic._PASSIVE_POLL_FRESH_S)
+    and record_speech asks right after inspecting a chunk."""
     with _vad_state_lock:
         ts_audible = _vad_state["last_audible_chunk_ts"]
         ts_start = _vad_state["vad_session_start"]
+        unpolled = float(_vad_state.get("unpolled_s") or 0.0)
     now = time.time()
     if ts_audible > 0.0:
-        return max(0.0, now - ts_audible)
+        return max(0.0, now - ts_audible - unpolled)
     if ts_start > 0.0:
-        return max(0.0, now - ts_start)
+        return max(0.0, now - ts_start - unpolled)
     return float("inf")
 
 

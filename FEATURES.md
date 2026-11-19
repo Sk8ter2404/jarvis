@@ -142,7 +142,7 @@ A system-tray applet (`tray.py`) shows live status and a grouped right-click men
   - Actions: `volume_up`, `volume_down`, `volume_mute`, `volume_unmute`, `set_volume`
 - **Audio devices** — which mic and speakers are in use, manual headset/speaker and mic switching, an auto-switch watcher that follows the wireless headset's power (off by default - setting `AUDIO_AUTOSWITCH_ENABLED`, or "turn on audio auto switching"), and the headset's own power and battery state.
   - "what microphone are you using", "switch to my headset", "use my desk mic", "is my headset on", "how much battery does my headset have"
-  - Actions: `what_microphone` / `current_mic`, `what_speakers` / `current_speaker`, `audio_devices`, `use_headset`, `use_speakers`, `use_headset_mic`, `use_desk_mic`, `which_mic_is_active`, `audio_autoswitch_on` / `audio_autoswitch_off` / `audio_autoswitch_status`, `headset_status`, `headset_battery`
+  - Actions: `what_microphone` / `current_mic`, `what_speakers` / `current_speaker`, `audio_devices`, `use_headset`, `use_speakers`, `use_headset_mic`, `use_desk_mic`, `use_new_mic`, `which_mic_is_active`, `audio_autoswitch_on` / `audio_autoswitch_off` / `audio_autoswitch_status`, `headset_status`, `headset_battery`
   - Skills: `skills/audio_devices.py`, `skills/audio_autoswitch.py`, `skills/headset_status.py`
 
 ### Category 5: Apple Music intelligence (taste-aware music)

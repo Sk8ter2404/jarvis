@@ -4290,17 +4290,35 @@ class FollowTheDefaultDeviceTests(_FollowTheDefaultFixtures, _MonolithSec2Base):
 
     def test_one_press_moving_both_defaults_enqueues_identical_text(self):
         # A single Stream Deck press moves the mic AND the speakers to the
-        # headset. Both branches announce (by design), and because the text is
-        # IDENTICAL _speak_pending's dedupe collapses it to one spoken line.
+        # headset. Both directions are announced (by design) - since
+        # 2026-11-17 as ONE sentence per refresh pass (_announce_device_changes):
+        # two sentences went through the flap governor one after the other and
+        # the second REPLACED the first while it was held (live 11-16 09:33:38
+        # the mic line was never said). The same device both ways is one plain
+        # sentence, exactly the text the old pair collapsed to.
         self._boot()
         names = [self.SNOWBALL, self.SPEAKERS, self.CORSAIR, self.HEADPHONES]
         announced = []
         self._refresh(self._sd(names, 0, 1), announced=announced)   # boot
         self._refresh(self._sd(names, 2, 3), announced=announced)
-        self.assertEqual(announced,
-                         ["Switched to your headset, sir."] * 2)
-        self.assertEqual(len(set(announced)), 1,
-                         "identical text is what the speech dedupe collapses")
+        self.assertEqual(announced, ["Switched to your headset, sir."])
+
+    def test_one_press_moving_both_to_different_devices_names_both(self):
+        # 2026-11-17 (overhaul speech-mic-announce): headset off -> the desk
+        # mic AND the speakers, in ONE sentence that names both, never the
+        # speaker line alone.
+        self._boot()
+        names = [self.CORSAIR, self.SNOWBALL, self.HEADPHONES, self.SPEAKERS]
+        announced = []
+        self._refresh(self._sd(names, 0, 2), announced=announced)   # boot
+        self._refresh(self._sd(names, 1, 3), announced=announced)
+        self.assertEqual(len(announced), 1, announced)
+        mic = self.bc._friendly_device_name(self.SNOWBALL)
+        self.assertIn(f"{mic} for the microphone", announced[0])
+        self.assertIn("for the speakers", announced[0])
+        self.assertTrue(announced[0].startswith("Switched to "),
+                        "core/pending_policy classes it as a mic change by "
+                        "its 'Switched to' opening")
 
     def test_unchanged_default_never_repeats_the_announcement(self):
         # Anti-spam: the refresh runs every DEVICE_CHECK_INTERVAL (4 s); a
@@ -4381,7 +4399,8 @@ class FollowTheDefaultWhileStreamsAreLiveTests(_FollowTheDefaultFixtures,
                          "the new default SPEAKERS must be adopted")
         sd._terminate.assert_not_called()
         sd._initialize.assert_not_called()
-        self.assertEqual(announced, ["Switched to your headset, sir."] * 2)
+        # Both directions, one sentence (2026-11-17 _announce_device_changes).
+        self.assertEqual(announced, ["Switched to your headset, sir."])
 
     def test_adopted_move_rebases_the_baseline_so_it_cannot_re_fire(self):
         # The shipped version rebased ONLY after a successful re-enumeration,

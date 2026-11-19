@@ -152,6 +152,54 @@ class LiveMorningTests(_Base):
         self.assertEqual(self.spoke, [msg])
 
 
+SILENT_DEV = "Microphone (Synthetic Desk Mic)"
+SILENT = ("Sir, the Synthetic Desk Mic has been completely silent for 30 "
+          "seconds — I can hear nothing at all from it.")
+
+
+@requires_monolith
+class QueuedSilentMicTests(_Base):
+    """2026-11-17 (overhaul speech-mic-silent-rearm / proactive-04): a queued
+    silent-mic warning is said only while the mic is still believed silent
+    on the same device - never after he has been heard on it."""
+
+    def setUp(self):
+        super().setUp()
+        self.input_age[0] = 3.0
+        self._p(self.bc, "PENDING_SOURCE_POLICY", True, create=True)
+        cache = dict(self.bc._device_cache)
+        cache["last_in_name"] = SILENT_DEV
+        self._p(self.bc, "_device_cache", cache)
+
+    def _silent_line(self, age=20.0):
+        e = self._e(SILENT, "audio", age)
+        e["still_valid"] = f"mic_silent:{SILENT_DEV}"
+        e["supersede"] = "mic-silent"
+        return e
+
+    def test_still_silent_is_said(self):
+        self.bc._silent_mic_warned[0] = True
+        self._write([self._silent_line()])
+        self._drain()
+        self.assertEqual(self.spoke, [SILENT])
+
+    def test_heard_since_is_dropped(self):
+        self.bc._silent_mic_warned[0] = False     # a sustained recovery
+        self._write([self._silent_line()])
+        _, log = self._drain()
+        self.assertEqual(self.spoke, [])
+        self.assertIn("dropped stale announcement", log)
+        self.assertEqual(self._read(), [])
+
+    def test_past_the_re_warn_limit_is_too_old(self):
+        self.bc._silent_mic_warned[0] = True
+        self._write([self._silent_line(age=self.bc.MIC_SILENT_REWARN_SECONDS
+                                       + 60.0)])
+        _, log = self._drain()
+        self.assertEqual(self.spoke, [])
+        self.assertIn("mic_silent:", log)
+
+
 @requires_monolith
 class ClapMediaRecentTests(_Base):
     def setUp(self):

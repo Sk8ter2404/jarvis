@@ -185,6 +185,11 @@ _MONOLITH_RESTORE_NAMES = (
     "_last_heartbeat_publish", "_main_loop_heartbeat_path_cache",
     "_bg_handoff_grace_s",
     "_silent_mic_warned", "_silent_mic_warned_at", "_silent_mic_warned_device",
+    "_silent_mic_recover_s",
+    # 2026-11-17: the owner-confirmed audio switch stamps (actions-09).
+    "_owner_audio_switch",
+    # 2026-11-17: the held-new-microphone state (speech-mic-announce).
+    "_NEW_MIC_STATE",
     # ── voice fast-path latches (bobert_companion-local single-element lists) ─
     # Reset to [None]/[False] so a wake detector built (or a disable-latch
     # tripped) in one test can't bleed into the next. (tests/monolith/
