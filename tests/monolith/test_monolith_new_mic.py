@@ -34,7 +34,8 @@ class NewMicHoldTests(F._Base):
     def setUp(self):
         super().setUp()
         bc = self.bc
-        bc._NEW_MIC_STATE.update(known=None, held=None, accepted="")
+        bc._NEW_MIC_STATE.update(known=None, held=None, accepted="",
+                                 notified={})
         for name, val in (("AUDIO_AUTOSWITCH_HEADSET", ""),
                           ("AUDIO_AUTOSWITCH_MIC_FALLBACK", "")):
             self._p(bc, name, val, create=True)
@@ -53,6 +54,13 @@ class NewMicHoldTests(F._Base):
         self.addCleanup(F.ORDER.remove, STRANGER)
         w.default_in = STRANGER
 
+    def _plug_stranger_once(self):
+        self.world.active.add(STRANGER)
+        if STRANGER not in F.ORDER:
+            F.ORDER.insert(0, STRANGER)
+            self.addCleanup(F.ORDER.remove, STRANGER)
+        self.world.default_in = STRANGER
+
     def _passes(self, n=4):
         for _ in range(n):               # past the 8 s hysteresis, twice over
             self._pass()
@@ -68,6 +76,17 @@ class NewMicHoldTests(F._Base):
         self.assertFalse([m for m in self.spoken if m.startswith("Switched")])
         self.assertTrue(any("[audio] new microphone" in ln
                             for ln in self.printed), self.printed)
+
+    def test_a_flapping_stranger_is_announced_once_per_flap_window(self):
+        for _ in range(3):
+            self._plug_stranger_once()
+            self._passes(3)
+            self.world.active.discard(STRANGER)       # unplugged ...
+            self.world.default_in = F.DESK            # ... default back
+            self._passes(3)
+        asked = [m for m in self.spoken if "appeared" in m]
+        self.assertEqual(len(asked), 1, self.spoken)
+        self.assertTrue(any("already told sir" in ln for ln in self.printed))
 
     def test_saying_yes_follows_it_without_a_second_announcement(self):
         self._plug_stranger()

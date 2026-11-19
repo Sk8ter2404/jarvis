@@ -15727,7 +15727,8 @@ def _announce_device_changes(switches) -> None:
 # pair read at the top of _refresh_devices, so the rest of the pass sees a mic
 # that never moved. It ends when Windows moves the default elsewhere, the old
 # mic goes, or he says "use the new microphone" (_accept_held_new_mic).
-_NEW_MIC_STATE: dict = {"known": None, "held": None, "accepted": ""}
+_NEW_MIC_STATE: dict = {"known": None, "held": None, "accepted": "",
+                        "notified": {}}
 _new_mic_lock = threading.Lock()
 
 
@@ -15800,7 +15801,19 @@ def _apply_new_mic_hold(now_eps, prev_eps, act, now: float):
             if first:
                 _NEW_MIC_STATE["held"] = {"ep": new_ep, "prev": prev_ep,
                                           "since": now}
-        if first:
+            # A flapping USB mic clears the hold on every unplug, so each
+            # replug is "first" again: speak once per endpoint per flap window.
+            notified = _NEW_MIC_STATE.setdefault("notified", {})
+            last = notified.get(new_ep)
+            window = float(globals().get("AUDIO_FLAP_WINDOW_S", 300.0) or 300.0)
+            speak = first and not (last is not None and 0 <= now - last < window)
+            if speak:
+                notified[new_ep] = now
+        if first and not speak:
+            print(f"  [audio] new microphone {_audio_endpoint_label(new_ep)} "
+                  f"is back - already told sir within the last "
+                  f"{window:.0f}s, staying quiet")
+        if speak:
             new_name = _audio_endpoint_label(new_ep)
             cur_name = _audio_endpoint_label(prev_ep)
             print(f"  [audio] new microphone {new_name} became the Windows "
