@@ -27615,11 +27615,13 @@ def _presence_watch_start() -> bool:
 # the OS idle timer counts AFK-Helper and automation input as his, which is
 # exactly the 19:05 empty-room nudge. Polled input is presence only when his
 # voice or a face backs it up within OWNER_PRESENT_POLLED_INPUT_BACKUP_S.
-def _polled_input_backed() -> bool:
-    """His mic turn or a face within OWNER_PRESENT_POLLED_INPUT_BACKUP_S.
-    Never raises (False)."""
+def _polled_input_backed(window_s=None) -> bool:
+    """His mic turn or a face within OWNER_PRESENT_POLLED_INPUT_BACKUP_S
+    (``window_s`` instead when given: the alarm skill's own, shorter window,
+    skills/alarm._input_is_his). Never raises (False)."""
     try:
-        window = float(OWNER_PRESENT_POLLED_INPUT_BACKUP_S)
+        window = float(OWNER_PRESENT_POLLED_INPUT_BACKUP_S
+                       if window_s is None else window_s)
         voice_at = float(_last_owner_voice_at[0] or 0.0)
         if voice_at > 0.0 and 0.0 <= _proactive_mono() - voice_at <= window:
             return True
@@ -27631,11 +27633,12 @@ def _polled_input_backed() -> bool:
     return False
 
 
-def _physical_input_age_s() -> float:
+def _physical_input_age_s(backup_s=None) -> float:
     """Seconds since the last PHYSICAL keyboard / mouse input (injected input
     excluded); inf when unknown. On the watcher's polling fallback
     (input_source() == "poll") the reading cannot tell an automation from him,
-    so it counts only when _polled_input_backed. Never raises."""
+    so it counts only when _polled_input_backed (over ``backup_s`` when
+    given). Never raises."""
     try:
         y = _yield_watch_mod()
         if y is None:
@@ -27643,7 +27646,7 @@ def _physical_input_age_s() -> float:
         age = max(0.0, float(y.seconds_since_real_input()))
         source = getattr(y, "input_source", None)
         if (callable(source) and source() == "poll"
-                and not _polled_input_backed()):
+                and not _polled_input_backed(backup_s)):
             return float("inf")
         return age
     except Exception:
@@ -43348,6 +43351,11 @@ SPEAK_RESULT_VERBATIM_ACTIONS: set[str] = {
     # Single-sentence health/status aggregator (skills/system_pulse.py) and its
     # natural-phrasing aliases. Each returns one finished status sentence.
     "system_pulse", "check_system", "status_report",
+    # "Clear the RAM" (skills/system_pulse.free_memory_answer, 2026-11-17):
+    # the reading, the biggest users and an offer, built only from what was
+    # read. Spoken as written: the model's own restatement of the 11-16 turn
+    # was "I don't have the permissions".
+    "free_memory",
     # The audio READING (core/audio_check.py, 2026-10-09): one finished
     # answer built only from what was read. Spoken as written - an LLM
     # restatement could put back the very invented number it replaces - and
@@ -53576,8 +53584,20 @@ _ALARM_ANSWER_HOUR_RE = re.compile(
     r"\d{1,2}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve")
 _ALARM_ANSWER_NUMBER_RE = re.compile(
     r"\d|\b(?:noon|midnight|one|two|three|four|five|six|seven|eight|nine|ten"
-    r"|eleven|twelve|half|quarter)\b")
+    r"|eleven|twelve|fifteen|twenty|thirty|forty|fifty|half|quarter)\b")
 _ALARM_ANSWER_WINDOW_S = 120.0
+# The ask around the answer (live 2026-11-16 09:19:13: "Jarvis, go ahead and
+# set it for one minute from now", right after "What time should it ring,
+# sir?", went to the brain, which set a one-line TIMER instead of the alarm
+# he was testing). Peeled off in this order before the bare-time check; what
+# is left must still be nothing but a time.
+_ALARM_ANSWER_LEAD_RE = re.compile(
+    r"^(?:(?:go ahead and|ok so|okay so|so|yes|yeah|yep|just|please|"
+    r"(?:can|could|would) you(?: please)?|i want you to|i need you to)\s+)+")
+_ALARM_ANSWER_SET_IT_RE = re.compile(
+    r"^(?:set|make|put|have|schedule)\s+(?:it|that|the alarm|that alarm|it up)"
+    r"(?:\s+(?:to\s+)?(?:ring|go off))?(?:\s+(?:for|at|to))?\s+")
+_ALARM_ANSWER_FROM_NOW_RE = re.compile(r"\s+from now$")
 
 
 def _alarm_question_open() -> bool:
@@ -53620,13 +53640,19 @@ def _alarm_when_answer(text: str) -> str:
     routes nowhere, which the brain may read as anything, and which the
     speech filter drops as too short ("7 am" is four characters). A bare
     hour answering "what time?" is an hour, said as a digit or a word
-    ("7", "seven", "about 7"). Never raises."""
+    ("7", "seven", "about 7"). The ask around it is peeled off first ("go
+    ahead and set it for one minute from now", live 2026-11-16 09:19:13,
+    became a timer). Never raises."""
     try:
         if not _alarm_question_open():
             return ""
         t = re.sub(r"^\W*(?:(?:hey|ok|okay)\W+)?(?:jarvis\W+)?", "",
                    str(text or "").strip(), flags=re.IGNORECASE)
         t = t.strip(" .!?,").lower()
+        # "go ahead and set it for one minute from now" -> "one minute".
+        t = _ALARM_ANSWER_LEAD_RE.sub("", t)
+        t = _ALARM_ANSWER_SET_IT_RE.sub("", t)
+        t = _ALARM_ANSWER_FROM_NOW_RE.sub("", t).strip(" .!?,")
         words = re.findall(r"[a-z0-9:.']+", t)
         if not words or len(words) > _ALARM_ANSWER_MAX_WORDS:
             return ""

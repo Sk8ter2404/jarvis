@@ -63,6 +63,21 @@ ALIASES: dict[str, str] = {
     "check_cpu": "system_pulse",
     "system_info": "system_pulse",
     "check_system_health": "system_pulse",
+    # "Clear the RAM" (live 2026-11-16 12:11:36: [ACTION: clear_ram] was
+    # unknown, the autocorrector found nothing at 0.74, and the reply claimed
+    # he lacked "the permissions"). free_memory is read-only: the reading,
+    # the biggest users, an offer to close one by name. Not "clear_memory":
+    # that is as often JARVIS's own memory.
+    "clear_ram": "free_memory",
+    "free_ram": "free_memory",
+    "free_up_ram": "free_memory",
+    "free_up_memory": "free_memory",
+    "clean_ram": "free_memory",
+    "clean_up_ram": "free_memory",
+    "clean_up_memory": "free_memory",
+    "clear_ram_usage": "free_memory",
+    "optimize_memory": "free_memory",
+    "optimize_ram": "free_memory",
     # Sound and media
     "volume_set": "set_volume",           # fuzzy: volume_mute vs volume_up
     "set_the_volume": "set_volume",

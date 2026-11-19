@@ -1452,6 +1452,26 @@ STT_RESCUE_EMPTY_MIN_SPEECH_S = 0.25
 # and answered with "422 what?" the next time. False = every alarm ask goes
 # through the brain again. FAST_PATHS_ENABLED off turns this off too.
 ALARM_SET_FAST_PATH        = True
+# ALARM_INPUT_NEEDS_WITNESS (2026-11-17, skills/alarm.py _input_is_his): a
+# ringing alarm stops on a key or the mouse only when that input is his. The
+# low-level input hook is off by default (AIR_MOUSE_LL_HOOK_ENABLED) and was
+# off at every boot of 11-16/17, so the only reading was the OS input timer,
+# which counts injected input too: AFK-Helper, an automation or the Kinect
+# air-mouse could end a wake-up alarm with nobody awake. Polled input now
+# counts only with his voice or a face in the last 3 minutes (all three live
+# input stops on 11-16 had his voice under 30 s before them, so those still
+# stop it); with the hook, injected input never counts. "Stop" by voice
+# always works. False = any input stops it, the old way. Grep the log for
+# "[alarm] #N input not counted".
+ALARM_INPUT_NEEDS_WITNESS  = True
+# PROJECT_STATUS_LEARNED_FALLBACK (2026-11-17, skills/project_status.py):
+# with no data/projects_status.json, a general "what am I working on" names up
+# to 3 projects learned from past conversations and says they are unconfirmed
+# (live 11-16 23:58: "I don't have a project list yet" with 12 learned ones in
+# memory). Garbled labels are skipped; a question naming a project never uses
+# them. False = "no project list" only. Grep the log for "[project_status]
+# no project list; named".
+PROJECT_STATUS_LEARNED_FALLBACK = True
 STT_SHADOW                 = ""          # '' | 'parakeet'
 PARAKEET_MODEL_DIR         = r"C:\JARVIS-models\parakeet-tdt-0.6b-v2-onnx"
 PARAKEET_THREADS           = 8

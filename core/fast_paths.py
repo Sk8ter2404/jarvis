@@ -63,7 +63,8 @@ before the LLM dispatch (bobert_companion._run_fast_paths, gated by
 FAST_PATHS_ENABLED) and speaks the reply itself. Every grammar is anchored on
 the whole utterance, so commands and other domains fall through untouched.
 Stdlib only, no I/O (but the memory answer, which the loaded system_pulse
-skill reads), never raises.
+skill reads, and the "what can you do" sign-in gates, which check that a
+token file exists), never raises.
 
 The recall helpers are shared with core.actions._act_session_memory_recall so
 the LLM route can never recall the current utterance either.
@@ -81,7 +82,7 @@ class FastAnswer(NamedTuple):
     kind: str    # "owner-name" | "owner-identity" | "last-utterance" |
     #              "first-utterance" | "world-clock" | "time" |
     #              "arithmetic" | "capabilities" | "capabilities-more" |
-    #              "memory-users" |
+    #              "memory-users" | "memory-free" |
     #              a date_math kind
     reply: str
 
@@ -793,11 +794,59 @@ def _server_configured() -> bool:
         return False
 
 
+def _loaded_skill(name: str):
+    """A loaded skill module (the loader's "skill_<name>", else an imported
+    "skills.<name>"), or None. sys.modules only: no import. Never raises."""
+    try:
+        import sys as _sys
+        for key in (f"skill_{name}", f"skills.{name}"):
+            mod = _sys.modules.get(key)
+            if mod is not None:
+                return mod
+    except Exception:
+        pass
+    return None
+
+
+def _microsoft_signed_in() -> bool:
+    """A Microsoft sign-in is saved on this PC (the loaded ms_graph skill's
+    has_saved_sign_in: its token file or MSAL cache, file checks only).
+    Live 2026-11-17 00:23:25 "what can you do" offered "read your calendar"
+    and "sort and draft your email" because calendar_today and the email
+    actions are REGISTERED on every install, with neither a Microsoft nor a
+    Gmail sign-in on disk, so every such ask then failed. False on any
+    error. Never raises."""
+    try:
+        fn = getattr(_loaded_skill("ms_graph"), "has_saved_sign_in", None)
+        return bool(fn()) if callable(fn) else False
+    except Exception:
+        return False
+
+
+def _email_connected() -> bool:
+    """A mailbox the email actions can read: the loaded email_triage skill's
+    Gmail token on disk (GMAIL_TOKEN_FILE, written by its --auth-gmail), or
+    a Microsoft sign-in (its Outlook backend is Microsoft Graph). Never
+    raises."""
+    try:
+        path = getattr(_loaded_skill("email_triage"), "GMAIL_TOKEN_FILE", "")
+        if isinstance(path, str) and path:
+            import os as _os
+            if _os.path.isfile(path):
+                return True
+    except Exception:
+        pass
+    return _microsoft_signed_in()
+
+
 # Phrases that need more than a registered action: phrase -> a zero-argument
 # check, consulted only when `available` is given (None = the fixed shipped
-# overview, which has no live setup to ask).
+# overview, which has no live setup to ask). A gated phrase that is False
+# drops out of the short overview, its "the rest" list and the full one.
 _CAPABILITY_GATES = {
     "check on the home server": _server_configured,
+    "read your calendar": _microsoft_signed_in,
+    "sort and draft your email": _email_connected,
 }
 
 
@@ -1039,6 +1088,58 @@ def is_memory_question(text) -> bool:
         return False
 
 
+# ── "clear the RAM" (2026-11-17) ───────────────────────────────────────────
+# Live 2026-11-16 12:11:36 "Jarvis, try to clear the ram." -> the model
+# invented [ACTION: clear_ram] (no such action; the autocorrector found
+# nothing) and then told him it lacked "the permissions to reach into the
+# system core". The loaded system_pulse skill's free_memory_answer is the
+# honest answer: the reading, the biggest users, and an offer to close one he
+# names. Whole utterance only. "Clear" + plain "memory" is JARVIS's own
+# memory as often as the PC's ("clear your memory", "clear the memory"), so
+# only RAM, or a free / free-up verb, matches.
+_FREE_LEAD = (r"(?:(?:can|could|would) you |try to |try and |i need you to |"
+              r"i want you to |go ahead and |lets |let us |just )*")
+_FREE_TAIL = (r"(?: up)?(?: (?:on|for) (?:the|my|this) "
+              r"(?:pc|computer|system|machine))?(?: a bit| some)?")
+_FREE_MEMORY_RES = tuple(re.compile(p) for p in (
+    rf"{_FREE_LEAD}(?:clear|clean|flush|empty|purge|free|release|reduce|"
+    rf"lower|trim|optimi[sz]e)(?: up| out)? (?:some |the |my |up |of )*"
+    rf"(?:ram|system memory)(?: usage| use)?{_FREE_TAIL}",
+    rf"{_FREE_LEAD}(?:free|release)(?: up)? (?:some |the |my |up )*memory"
+    rf"(?: usage| use)?{_FREE_TAIL}",
+    rf"{_FREE_LEAD}(?:make|get) (?:some )?(?:more )?(?:ram|memory) "
+    rf"(?:free|available)(?: on (?:the|my|this) (?:pc|computer))?",
+))
+
+
+def is_free_memory_request(text) -> bool:
+    """True for a whole-utterance ask to clear / free this PC's RAM. Never
+    raises."""
+    if not isinstance(text, str) or not text.strip():
+        return False
+    try:
+        t = re.sub(r"\s+", " ", normalize(text)).strip()
+        return len(t) <= 80 and any(rx.fullmatch(t) for rx in _FREE_MEMORY_RES)
+    except Exception:
+        return False
+
+
+def free_memory_reply(text) -> Optional[str]:
+    """The loaded system_pulse skill's free_memory_answer(text), or None
+    when the skill is not loaded or has no answer. Never raises."""
+    try:
+        import sys as _sys
+        fn = getattr(_sys.modules.get("skill_system_pulse"),
+                     "free_memory_answer", None)
+        if not callable(fn):
+            return None
+        reply = fn(text)
+        reply = reply.strip() if isinstance(reply, str) else ""
+        return reply or None
+    except Exception:
+        return None
+
+
 def memory_users_reply(text) -> Optional[str]:
     """The loaded system_pulse skill's memory_answer(text) (sys.modules
     "skill_system_pulse", as skills/system_monitor reads it), or None when
@@ -1104,6 +1205,10 @@ def match(text, *, now=None, history=(), owner_name="",
             reply = memory_users_reply(text)
             if reply:
                 return FastAnswer("memory-users", reply)
+        if is_free_memory_request(text):
+            reply = free_memory_reply(text)
+            if reply:
+                return FastAnswer("memory-free", reply)
         if now is not None:
             clock = world_clock.answer(text, now)
             if clock is not None:

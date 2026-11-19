@@ -13,6 +13,11 @@ Actions:
                   about memory, it opens with the memory reading itself,
                   never "All systems nominal" (v3.0.7,
                   SYSTEM_PULSE_MEMORY_ANSWER).
+  free_memory   — "clear the RAM" / "free up some memory" (2026-11-17,
+                  free_memory_answer): the reading, the biggest users
+                  (Python processes named by what they run), and an offer
+                  to close the biggest one he can close, by name. Read-only:
+                  nothing is closed, unloaded or trimmed.
 
 Fast-path answer (v3.0.7):
   memory_answer(said) is the short spoken answer to an explicit memory
@@ -911,6 +916,61 @@ def _mem_app_name(name: str) -> str:
     return stem
 
 
+# Python processes are named by what they run (live 2026-11-16: "Python at
+# 28 GB" in a memory line, which names nothing he can act on): JARVIS's own
+# helpers ("my face tracker") apart from anything else run in Python. At most
+# this many command lines are read per answer, and only for processes big
+# enough to matter.
+MEM_PY_LABEL_MAX = 12
+MEM_PY_LABEL_MIN_GB = 0.25
+_PY_IMAGES = frozenset({"python", "pythonw", "python3", "py", "pyw"})
+_PY_SCRIPT_RE = re.compile(r"[\\/]?([A-Za-z0-9_.-]+?)\.pyw?$", re.IGNORECASE)
+
+
+def _python_cmdline(pid: int) -> list:
+    """The process's command line (psutil), [] when it cannot be read (gone,
+    access denied, no psutil). The machine hook tests replace. Never
+    raises."""
+    if not _HAS_PSUTIL:
+        return []
+    try:
+        return list(psutil.Process(int(pid)).cmdline() or [])
+    except Exception:
+        return []
+
+
+def _python_label(pid: int) -> str:
+    """How to say a Python process: "my face tracker" for a script in
+    JARVIS's own folder, "Python running snapshot tool" for another script
+    or module, plain "Python" when the command line says nothing. Never
+    raises."""
+    try:
+        args = [str(a) for a in _python_cmdline(pid)]
+        target, own = "", False
+        for i, a in enumerate(args[1:], start=1):
+            if a == "-m" and i + 1 < len(args):
+                target = args[i + 1].rsplit(".", 1)[-1]
+                own = args[i + 1].split(".", 1)[0] in ("skills", "core",
+                                                       "tools", "hud")
+                break
+            m = _PY_SCRIPT_RE.search(a)
+            if m and not a.startswith("-"):
+                target = m.group(1)
+                try:
+                    full = os.path.normcase(os.path.abspath(a))
+                    root = os.path.normcase(os.path.abspath(_PROJECT_DIR))
+                    own = full.startswith(root + os.sep)
+                except Exception:
+                    own = False
+                break
+        words = " ".join(re.split(r"[_\-.\s]+", target)).strip().lower()
+        if not words:
+            return "Python"
+        return f"my {words}" if own else f"Python running {words}"
+    except Exception:
+        return "Python"
+
+
 def _memory_users(procs=None, *, own_pid: int | None = None,
                   top: int = MEM_USERS_TOP) -> list:
     """[(spoken app name, GB)] for the `top` apps holding the most RAM,
@@ -930,6 +990,7 @@ def _memory_users(procs=None, *, own_pid: int | None = None,
         rows = _read_process_memory() if procs is None else procs
         own = os.getpid() if own_pid is None else int(own_pid)
         totals: dict = {}
+        py_reads = 0
         for row in rows or ():
             try:
                 pid, name, wset = int(row[0]), str(row[1] or ""), float(row[2])
@@ -938,6 +999,13 @@ def _memory_users(procs=None, *, own_pid: int | None = None,
             label = _MEM_SELF_NAME if pid == own else _mem_app_name(name)
             if not label or wset <= 0:
                 continue
+            stem = name.strip().lower()
+            stem = stem[:-4] if stem.endswith(".exe") else stem
+            if (pid != own and stem in _PY_IMAGES
+                    and wset >= MEM_PY_LABEL_MIN_GB * (1024 ** 3)
+                    and py_reads < MEM_PY_LABEL_MAX):
+                py_reads += 1
+                label = _python_label(pid)
             totals[label] = totals.get(label, 0.0) + wset
         ranked = sorted(totals.items(), key=lambda kv: kv[1], reverse=True)
         out = [(label, b / (1024 ** 3)) for label, b in ranked]
@@ -1170,6 +1238,60 @@ def memory_answer(said: str = "", *, pulse=None, procs=None,
         return " ".join(p for p in parts if p)
     except Exception:
         return ""
+
+
+# The only users "clear the RAM" offers to close: apps of his with a window
+# whose title "close <name>" matches (core/actions._act_close_window, the
+# window's own X button). Never JARVIS, his helpers or his brain, never
+# Windows' own processes, and never a name the close would not find ("VS
+# Code": its windows say "Visual Studio Code"; an unknown image name such
+# as a service host) - the offer must be one sentence that works.
+_MEM_CLOSABLE = frozenset({
+    "Chrome", "Edge", "Firefox", "Claude", "Bambu Studio", "OBS", "Discord",
+    "Spotify", "Fortnite",
+})
+# No failure marker in either line (core/failure_markers: "can't", "could
+# not" ...): a result carrying one goes to the failure follow-up, where the
+# model invented the 11-16 "I don't have the permissions" line.
+FREE_MEMORY_CANT = ("Memory another program holds only comes back when that "
+                    "program closes, and closing one is your call.")
+_FREE_MEMORY_NO_USERS = "No one app is holding much of it just now."
+
+
+def _closable(label: str) -> bool:
+    return label in _MEM_CLOSABLE
+
+
+def free_memory_answer(said: str = "", *, pulse=None, procs=None,
+                       own_pid: int | None = None) -> str:
+    """The answer to "clear the RAM" / "free up some memory" (the
+    free_memory action and the core/fast_paths.py grammar).
+
+    Live 2026-11-16 12:11:36 "Jarvis, try to clear the ram." ran the
+    invented [ACTION: clear_ram] ("[router-miss] clear_ram unknown"), and
+    the reply was "I don't have the permissions to reach into the system
+    core like that" - false: there was no handler at all. The honest answer:
+    the reading, the biggest users, and that memory another program holds
+    is freed only by closing it, which is his call - with the biggest one
+    he can close named, so "close Chrome" is one sentence away. Nothing is
+    closed, unloaded or trimmed here: unloading the brain model would only
+    make the next answer slower. Never raises."""
+    try:
+        pulse = pulse if pulse is not None else _current_pulse()
+        ram = float((pulse or {}).get("ram_pct") or 0.0)
+        users = _memory_users(procs, own_pid=own_pid)
+        parts = [_memory_lead(ram)] if ram > 0.0 else []
+        parts.append(_memory_users_sentence(users) or _FREE_MEMORY_NO_USERS)
+        parts.append(FREE_MEMORY_CANT)
+        target = next((label for label, _gb in users if _closable(label)), "")
+        if target:
+            parts.append(f"Say 'close {target}' and I'll close it.")
+        if any(label == "my local brain model" for label, _gb in users):
+            parts.append("Unloading my brain model would only make my next "
+                         "answer slower.")
+        return " ".join(p for p in parts if p)
+    except Exception:
+        return FREE_MEMORY_CANT
 
 
 def _gpu_load_is_ours(gpu_procs=None, *, own_pid: int | None = None) -> bool:
@@ -1512,6 +1634,14 @@ def register(actions):
     actions["system_pulse"] = system_pulse
     # Common aliases the LLM may emit for "JARVIS, status report"
     actions["status_report"] = system_pulse
+
+    def free_memory(arg: str = "") -> str:
+        # "Clear the RAM" (live 2026-11-16 12:11:36): read-only - the
+        # reading, the biggest users, and an offer he answers by name.
+        return free_memory_answer(
+            f"{_turn_words()} {arg if isinstance(arg, str) else ''}")
+
+    actions["free_memory"] = free_memory
 
     if not _HAS_PSUTIL:
         print("  [pulse] psutil missing — actions registered but threads disabled. "

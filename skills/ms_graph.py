@@ -470,6 +470,19 @@ def is_configured() -> bool:
     return bool(_msal_app()) or bool(_load_token())
 
 
+def has_saved_sign_in() -> bool:
+    """Has a Microsoft sign-in ever been saved on this PC (the manual token
+    file or the MSAL token cache)? File checks only: no MSAL app is built
+    and nothing touches the network, so the "what can you do" fast path can
+    ask it on the voice thread (core/fast_paths._CAPABILITY_GATES). Live
+    2026-11-17 00:23:25 the overview offered "read your calendar" with
+    neither file on disk. Never raises."""
+    try:
+        return os.path.isfile(_TOKEN_FILE) or os.path.isfile(_MSAL_CACHE_FILE)
+    except Exception:
+        return False
+
+
 def get_teams_unread_count() -> dict | None:
     """Count unread Microsoft Teams chats and identify the most recent sender.
 

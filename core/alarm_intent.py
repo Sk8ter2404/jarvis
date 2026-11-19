@@ -54,8 +54,17 @@ _LEAD_RE = re.compile(
     r"|i(?: would|'d) like you to "
     r"|i need to |i want to |i wanna |i(?: would|'d) like to |let'?s )")
 
-_VERB = (r"(?:set(?:ting)?(?: up)?|make|create|start|add|schedule|put on|do|"
-         r"give me|i need|i want|i(?: would|'d) like|we need)(?: me)?")
+# "send" is how speech-to-text heard "set" (live 2026-11-16 09:20:33 "send an
+# alarm for 921"); only ever followed by an alarm and a time, like the rest.
+_VERB = (r"(?:set(?:ting)?(?: up)?|send|make|create|start|add|schedule|put on|"
+         r"do|give me|i need|i want|i(?: would|'d) like|we need)(?: me)?")
+# "set an alarm" heard as "sent along" / "setting long" (live 2026-11-16
+# 11:12:39 and 11:12:51; the third try was heard right and set at once). Only
+# at the very start of the line and only right before a time: anywhere else
+# "sent along for" is plain English, which is why this is not an
+# STT_REPLACEMENTS entry (those rewrite every transcript).
+_MISHEARD_HEAD_RE = re.compile(
+    r"^(?:sent|send|set|setting|sending) (?:a ?long|long) (?=(?:for|at) \d)")
 _ADJ = r"(?:(?:new|wake ?up|morning|loud|quick|test|second) )*"
 _PRE = (r"(?:tomorrow morning|in the morning|this morning|tomorrow afternoon|"
         r"this afternoon|tomorrow evening|this evening|tonight|tomorrow night|"
@@ -116,7 +125,7 @@ def _clean(text: str) -> str:
     while prev != t:
         prev = t
         t = _LEAD_RE.sub("", t, count=1).strip()
-    return _digits(t)
+    return _MISHEARD_HEAD_RE.sub("set an alarm ", _digits(t), count=1)
 
 
 def _clock_arg(h_txt, m_txt, ap, hint) -> Optional[str]:

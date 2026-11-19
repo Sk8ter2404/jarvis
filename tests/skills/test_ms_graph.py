@@ -118,6 +118,30 @@ class _MsGraphBase(unittest.TestCase):
         shutil.rmtree(self._tmp, ignore_errors=True)
 
 
+class SavedSignInTests(_MsGraphBase):
+    """has_saved_sign_in backs "read your calendar" in the "what can you do"
+    overview (core/fast_paths._CAPABILITY_GATES). Live 2026-11-17 00:23:25 the
+    overview offered the calendar with neither file on disk."""
+
+    def test_no_file_is_no_sign_in(self):
+        self.assertFalse(self.mod.has_saved_sign_in())
+
+    def test_either_file_is_a_sign_in(self):
+        for path in (self.token_path, self.cache_path):
+            with self.subTest(path=os.path.basename(path)):
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("{}")
+                self.assertTrue(self.mod.has_saved_sign_in())
+                os.remove(path)
+        self.assertFalse(self.mod.has_saved_sign_in())
+
+    def test_it_builds_no_msal_app(self):
+        # File checks only: the overview asks on the voice thread.
+        with mock.patch.object(self.mod, "_msal_app",
+                               side_effect=AssertionError("msal built")):
+            self.assertFalse(self.mod.has_saved_sign_in())
+
+
 class StripHtmlTests(unittest.TestCase):
     def setUp(self):
         self.mod, _ = load_skill_isolated("ms_graph")
