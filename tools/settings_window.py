@@ -975,7 +975,7 @@ SCHEMA: dict[str, dict] = {
     # The music gate (core/music_gate.py, 2026-10-04).
     "MUSIC_GATE_MODE": {
         "tab": "hearing", "label": "Stop transcribing music", "type": "enum",
-        "choices": ["off", "shadow", "on"], "default": "off",
+        "choices": ["off", "shadow", "on"], "default": "shadow",
         "help": "While music plays and he needs 'JARVIS' to answer: on = "
                 "song lyrics are not transcribed (every recording is still "
                 "checked for your wake word and your voice); shadow = no "
@@ -2254,8 +2254,10 @@ SCHEMA: dict[str, dict] = {
     },
     "VAD_DEBUG": {
         "tab": "advanced", "label": "VAD debug prints", "type": "bool",
-        "default": True,
-        "help": "Print peak RMS after each utterance to tune VAD_THRESHOLD.",
+        "default": False,
+        "help": "Print peak RMS after each utterance to tune VAD_THRESHOLD "
+                "(off by default: 30,000 lines a day; the 10-minute "
+                "'[vad-floor]' line keeps the counts).",
     },
     "SCREEN_VISION_ENABLED": {
         "tab": "advanced", "label": "Screen vision", "type": "bool",

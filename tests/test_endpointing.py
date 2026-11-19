@@ -165,6 +165,40 @@ class SpeechTailTests(unittest.TestCase):
         self.assertIsNotNone(v.speech_tail_ms(a))
 
 
+class SpeechSecondsTests(unittest.TestCase):
+    """speech_seconds (v3.0.26, STT_RESCUE_EMPTY 'speech'): how much of a
+    clip Parakeet heard nothing in is speech at all."""
+
+    def test_counts_speech_windows_in_one_run(self):
+        v, sess, _ = _vad()
+        secs = v.speech_seconds(_clip(1.0, 1.0, lead_s=0.5))
+        self.assertAlmostEqual(secs, (int(1.0 * SR) // W) * ep.WINDOW_S,
+                               delta=2 * ep.WINDOW_S)
+        self.assertEqual(len(sess.batches), 1)
+
+    def test_noise_only_is_zero(self):
+        v, _, _ = _vad()
+        rng = np.random.default_rng(7)
+        hum = (rng.standard_normal(2 * SR) * 0.01).astype(np.float32)
+        self.assertEqual(v.speech_seconds(hum), 0.0)
+
+    def test_scan_is_capped_and_start_skips(self):
+        v, sess, _ = _vad()
+        long = np.full(int((ep.MAX_SCAN_S + 5) * SR), 0.3, np.float32)
+        self.assertAlmostEqual(v.speech_seconds(long),
+                               (int(ep.MAX_SCAN_S * SR) // W) * ep.WINDOW_S)
+        clip = _clip(1.0, 0.5, lead_s=0.2)
+        self.assertEqual(v.speech_seconds(clip, start=int(1.2 * SR)), 0.0)
+
+    def test_cannot_tell_is_none(self):
+        v, sess, _ = _vad()
+        self.assertIsNone(v.speech_seconds(np.zeros(W - 1, np.float32)))
+        self.assertIsNone(v.speech_seconds(_clip(1.0, 0.0), sample_rate=8000))
+        self.assertIsNone(v.speech_seconds(np.zeros((2, SR), np.float32)))
+        dead, _, _ = _vad(_FakeSession(fail=RuntimeError("boom")))
+        self.assertIsNone(dead.speech_seconds(_clip(1.0, 1.0)))
+
+
 class SpeechInHeadTests(unittest.TestCase):
     """speech_in_head (speed plan R6): the wake-word rescue's question —
     does the clip's first 0.8 s hold speech?"""

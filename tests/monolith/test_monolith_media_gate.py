@@ -377,9 +377,12 @@ class WiringTests(_Base):
         for fn in (self.bc._capture_utterance, self.bc._handle_sleep_standby):
             with self.subTest(fn=fn.__name__):
                 src = inspect.getsource(fn)
-                self.assertIn("_media_probe_start(audio)", src)
-                self.assertLess(src.index("_last_capture_audio = audio"),
-                                src.index("_media_probe_start(audio)"))
+                # v3.0.26: the probe is keyed on the voice-ID clip the gate
+                # will check (_voice_clip_for(audio): raw by default).
+                self.assertIn("_media_probe_start(_last_capture_audio)", src)
+                self.assertLess(
+                    src.index("_last_capture_audio = _voice_clip_for(audio)"),
+                    src.index("_media_probe_start(_last_capture_audio)"))
 
     def test_config_defaults(self):
         import core.config as cfg

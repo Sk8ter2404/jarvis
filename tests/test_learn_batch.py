@@ -138,6 +138,32 @@ class TimingTests(unittest.TestCase):
         self.assertIsNotNone(b.flush_once())
         self.assertEqual(got, ["PERSON"])
 
+    def test_owner_active_deferral_is_logged_once_per_streak(self):
+        """v3.0.26: the 5 s poll printed 'deferred N job(s): owner active'
+        on every pass while he talked (183 lines in one hour). One line
+        starts the streak, one closes it with the count; the stats still
+        count every deferred pass."""
+        b, clock, llm, state, logs = _make(quiet=False)
+        b.submit(_simple([]))
+        clock.t += 400.0
+        for _ in range(5):
+            self.assertIsNone(b.flush_once())
+        deferred = [l for l in logs if "owner active" in l]
+        self.assertEqual(len(deferred), 1, logs)
+        self.assertEqual(b.stats["deferred"], 5)
+        state["quiet"] = True
+        llm.reply = lambda *a: "PERSON"
+        self.assertIsNotNone(b.flush_once())
+        self.assertTrue(any("owner quiet again after 5 deferred passes" in l
+                            for l in logs), logs)
+        # a new streak logs again
+        b.submit(_simple([]))
+        clock.t += 400.0
+        state["quiet"] = False
+        b.flush_once()
+        b.flush_once()
+        self.assertEqual(len([l for l in logs if "owner active" in l]), 2)
+
     def test_owner_speaks_between_assembly_and_send_defers_the_batch(self):
         """Owner turns win: the quiet check runs again right before the
         request, and a lazily built job hands its input back."""

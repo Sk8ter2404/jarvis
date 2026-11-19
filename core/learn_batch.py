@@ -43,7 +43,8 @@ False and the caller runs its job the way it used to.
 
 Log lines (numbers and tags only, never prompt or speech text):
 ``[learn-batch] sent N job(s) (a=x b=y) chars=C in T.Ts`` and
-``[learn-batch] deferred N job(s): <reason>``.
+``[learn-batch] deferred N job(s): <reason>`` (for "owner active": once per
+streak of deferred polls, then ``owner quiet again after N deferred passes``).
 """
 from __future__ import annotations
 
@@ -260,6 +261,10 @@ class LearnBatcher:
         self._stop = threading.Event()
         self.stats = {"flushes": 0, "jobs": 0, "deferred": 0, "retried": 0,
                       "solo": 0}
+        # "owner active" deferrals in a row (v3.0.26): logged once at the
+        # start of a streak and once, with the count, when it ends - the
+        # 5 s poll used to print a line every pass (183 in one hour).
+        self._defer_streak = 0
 
     # -- settings (read at call time, never raise) --------------------------
     @staticmethod
@@ -382,9 +387,15 @@ class LearnBatcher:
                 n_waiting = len(self._queue)
             if not self._is_quiet():
                 self.stats["deferred"] += 1
-                self._say(f"  [learn-batch] deferred {n_waiting} job(s): "
-                          "owner active")
+                self._defer_streak += 1
+                if self._defer_streak == 1:
+                    self._say(f"  [learn-batch] deferred {n_waiting} job(s): "
+                              "owner active")
                 return None
+            if self._defer_streak > 1:
+                self._say(f"  [learn-batch] owner quiet again after "
+                          f"{self._defer_streak} deferred passes")
+            self._defer_streak = 0
             return self._send_one_batch()
         finally:
             self._flush_lock.release()

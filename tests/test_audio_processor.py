@@ -728,6 +728,20 @@ class NsTests(_ResetSingletonMixin, unittest.TestCase):
             p._ns(sig)
         ss.assert_called_once()
 
+    def test_partial_chunk_under_the_fft_window_routes_to_spectral(self):
+        # v3.0.26: a 256..1023-sample partial chunk never reaches noisereduce
+        # (its "nperseg is greater than input length" warning, every session).
+        fake = _fake_noisereduce("identity")
+        pdict = mock.patch.dict(sys.modules, {"noisereduce": fake})
+        pdict.start(); self.addCleanup(pdict.stop)
+        p = _new_processor()
+        sig = tone(secs=0.03)  # 480 samples
+        self.assertTrue(256 <= sig.size < 1024)
+        with mock.patch.object(p, "_spectral_subtract",
+                               wraps=p._spectral_subtract) as ss:
+            p._ns(sig)
+        ss.assert_called_once()
+
     def test_near_silent_routes_to_spectral(self):
         p = _new_processor()
         sig = silence(secs=0.05)  # >256 samples but peak < 1e-4

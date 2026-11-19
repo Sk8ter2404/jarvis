@@ -293,6 +293,39 @@ class SileroVad:
         except Exception:
             return None
 
+    def speech_seconds(self, audio, sample_rate: int = SAMPLE_RATE,
+                       start: int = 0) -> "float | None":
+        """Seconds of speech in the clip from sample ``start``: whole windows
+        scoring at or above SPEECH_THRESHOLD, times WINDOW_S, over at most
+        the first MAX_SCAN_S (about 940 windows in one run). 0.0 when no
+        window does. None when the clip is not 16 kHz mono float audio,
+        holds less than one window, or the detector is unusable. The empty
+        rescue (STT_RESCUE_EMPTY 'speech', v3.0.26) asks this: did Parakeet
+        hear nothing in speech, or in noise? Never raises."""
+        try:
+            if self._failed or int(sample_rate) != SAMPLE_RATE:
+                return None
+            import numpy as np
+            a = np.asarray(audio, dtype=np.float32)
+            if a.ndim != 1:
+                if a.ndim == 2 and 1 in a.shape:
+                    a = a.reshape(-1)
+                else:
+                    return None
+            s0 = max(0, int(start))
+            n = min(len(a) - s0, int(MAX_SCAN_S * SAMPLE_RATE)) \
+                // WINDOW * WINDOW
+            if n < WINDOW:
+                return None
+            ctx0 = a[s0 - CONTEXT:s0] if s0 >= CONTEXT else None
+            probs = self._probs(np.ascontiguousarray(a[s0:s0 + n]), ctx0)
+            if probs is None:
+                return None
+            return float(np.count_nonzero(probs >= SPEECH_THRESHOLD)) \
+                * WINDOW_S
+        except Exception:
+            return None
+
     def speech_tail_ms(self, audio, sample_rate: int = SAMPLE_RATE
                        ) -> "int | None":
         """Clip end minus the end of the last speech window, in ms.

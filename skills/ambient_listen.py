@@ -121,6 +121,105 @@ _TTS_ECHO_COOLDOWN_S = 3.0
 _prev_mic_batch: list = [None, 0.0]
 _SPLIT_JOIN_MAX_GAP_S = 6.0
 
+# Main-loop dedupe (AMBIENT_MAIN_DEDUPE, v3.0.26; core/config.py says why).
+# On the record_speech tap path every frame this daemon batches was also
+# heard by the main loop, which decodes each capture it records (asleep too).
+# A batch at least _DEDUPE_MIN_COVER inside the main loop's capture spans
+# (bobert_companion.capture_spans_since, monotonic clock, each chunk stamped
+# when it reached this daemon, +/- _DEDUPE_TOL_S) is not decoded again; the
+# main loop hands its own transcript of that capture to note_main_transcript
+# and this worker keeps it through the same gates as a decoded batch (never
+# a wake nudge: the main loop already judged that line). Bounded queue; the
+# skill's own stream path (no tap) never dedupes.
+AMBIENT_MAIN_DEDUPE_DEFAULT = "on"
+_DEDUPE_MIN_COVER = 0.6
+_DEDUPE_TOL_S = 0.3
+_DEDUPE_LOG_EVERY = 200
+_main_transcripts: "deque[tuple]" = deque(maxlen=16)
+_dedupe_live: list = [False]
+_dedupe_stats: dict = {"covered": 0, "reused": 0}
+
+
+def _dedupe_on() -> bool:
+    """AMBIENT_MAIN_DEDUPE as the host has it ('on' | 'off'; True / False
+    read as on / off). Never raises (the default)."""
+    try:
+        v = _get_config("AMBIENT_MAIN_DEDUPE", AMBIENT_MAIN_DEDUPE_DEFAULT)
+        if v is True or v is False:
+            return bool(v)
+        return str(v if v is not None else AMBIENT_MAIN_DEDUPE_DEFAULT
+                   ).strip().lower() == "on"
+    except Exception:
+        return AMBIENT_MAIN_DEDUPE_DEFAULT == "on"
+
+
+def note_main_transcript(text, conf, peak_rms, audio, sample_rate,
+                         span=None) -> bool:
+    """The main loop's transcript of the capture it just decoded
+    (bobert_companion._ambient_offer_main_transcript). Queued for the mic
+    worker only while it runs on the tap path with the dedupe on - else
+    ignored (the worker decodes those frames itself). Never blocks, never
+    raises; True when queued."""
+    try:
+        if not _dedupe_live[0] or not text or not str(text).strip():
+            return False
+        _main_transcripts.append((str(text),
+                                  dict(conf) if isinstance(conf, dict) else {},
+                                  float(peak_rms or 0.0), audio,
+                                  int(sample_rate or 0), span, time.time()))
+        return True
+    except Exception:
+        return False
+
+
+def _batch_cover(stamps, spans, now: Optional[float] = None,
+                 tol: float = _DEDUPE_TOL_S) -> float:
+    """The fraction of a batch's samples heard inside the main loop's
+    capture spans. ``stamps``: [(arrival monotonic time, samples, sample
+    rate)] per chunk (a chunk's middle sample stands for it); ``spans``:
+    [(start, end)] with end None for the capture recording now. Never
+    raises (0.0: decode as always)."""
+    try:
+        total = sum(int(n) for _t, n, _sr in stamps)
+        if total <= 0 or not spans:
+            return 0.0
+        now = time.monotonic() if now is None else float(now)
+        wins = [(float(s) - tol, (float(e) if e is not None else now) + tol)
+                for s, e in spans]
+        inside = 0
+        for t, n, sr in stamps:
+            mid = float(t) - (int(n) / float(sr or 16000)) / 2.0
+            if any(lo <= mid <= hi for lo, hi in wins):
+                inside += int(n)
+        return inside / float(total)
+    except Exception:
+        return 0.0
+
+
+def _host_spans(b, t0: float) -> list:
+    """The host's capture spans since ``t0`` (empty on an older host)."""
+    try:
+        fn = getattr(b, "capture_spans_since", None)
+        return list(fn(float(t0))) if callable(fn) else []
+    except Exception:
+        return []
+
+
+def _note_dedupe(kind: str) -> None:
+    """Count one deduped batch / kept main transcript; one count line at the
+    first batch and every _DEDUPE_LOG_EVERY after (numbers only)."""
+    try:
+        _dedupe_stats[kind] = int(_dedupe_stats.get(kind, 0)) + 1
+        if kind == "covered":
+            n = _dedupe_stats["covered"]
+            if n == 1 or n % _DEDUPE_LOG_EVERY == 0:
+                print(f"  [ambient-listen] dedupe: {n} batch(es) the main "
+                      f"loop already decoded were not decoded again; "
+                      f"{_dedupe_stats.get('reused', 0)} of its transcripts "
+                      f"kept")
+    except Exception:
+        pass
+
 # System-audio daemon
 _audio_thread: Optional[threading.Thread] = None
 _audio_stop_evt = threading.Event()
@@ -1002,7 +1101,9 @@ def _worker_loop() -> None:
     except Exception:
         device = None
 
-    audio_q: "deque[np.ndarray]" = deque()
+    # (arrival time.monotonic(), chunk): the stamp places each chunk against
+    # the main loop's capture spans (AMBIENT_MAIN_DEDUPE).
+    audio_q: "deque[tuple]" = deque()
     q_lock = threading.Lock()
 
     def _audio_cb(indata, frames, time_info, status):
@@ -1013,7 +1114,7 @@ def _worker_loop() -> None:
         except Exception:
             return
         with q_lock:
-            audio_q.append(chunk)
+            audio_q.append((time.monotonic(), chunk))
 
     # Never open a capture stream when the mic is hard-disabled (staging green
     # candidate / MICROPHONE_INDEX < 0): device would be None, and InputStream
@@ -1071,7 +1172,7 @@ def _worker_loop() -> None:
                 except Exception:
                     continue
                 with q_lock:
-                    audio_q.append(chunk)
+                    audio_q.append((time.monotonic(), chunk))
 
         tap_drain_stop = threading.Event()
         tap_drain_thread = threading.Thread(
@@ -1140,10 +1241,19 @@ def _worker_loop() -> None:
 
     samples_per_batch = int(sample_rate * batch_secs)
     pending: list[np.ndarray] = []
+    pending_t: list = []        # (arrival, samples, rate) per pending chunk
     pending_samples = 0
     # AMBIENT_STT_YIELD: None when the flag is off (see _SttYield).
     stt_yield = (_SttYield(b, "ambient-listen")
                  if getattr(b, "AMBIENT_STT_YIELD", False) is True else None)
+    # AMBIENT_MAIN_DEDUPE: only on the tap path (the main loop heard these
+    # very frames); read once per worker start, like AMBIENT_STT_YIELD.
+    dedupe = tap_q is not None and _dedupe_on()
+    _main_transcripts.clear()
+    _dedupe_live[0] = dedupe
+    if dedupe:
+        print("  [ambient-listen] main-loop dedupe on: audio the main loop "
+              "already decoded is not decoded again (AMBIENT_MAIN_DEDUPE)")
 
     def _decode_batch(audio, rms, cap_ts, ctx, out):
         """Transcribe one batch and keep it. cap_ts / ctx are set only for a
@@ -1157,7 +1267,15 @@ def _worker_loop() -> None:
             _last_error = f"transcribe failed: {e}"
             print(f"  [ambient-listen] {_last_error}")
             return
+        _keep_text(text, conf, rms, audio, sample_rate, cap_ts, ctx, out,
+                   nudge=cap_ts is None)
 
+    def _keep_text(text, conf, rms, audio, sr, cap_ts, ctx, out, *,
+                   nudge, via=None):
+        """One transcript through the gates and into the buffer and the
+        transcript log (a decoded batch's, or - AMBIENT_MAIN_DEDUPE - the
+        main loop's own for audio it already decoded, ``via`` 'main-loop').
+        ``nudge``: may it nudge a wake (a live batch only)."""
         if not text:
             return
         # Known-device speech: checked on EVERY transcript (so the
@@ -1186,7 +1304,7 @@ def _worker_loop() -> None:
         # call is best-effort: None when resemblyzer is missing, no
         # one is enrolled, or the embedding doesn't clear the
         # confidence threshold — single-user mode stays untouched.
-        speaker_id, speaker_score = _identify_speaker_safe(audio, sample_rate)
+        speaker_id, speaker_score = _identify_speaker_safe(audio, sr)
         out["kept"] = True
         out["speaker"] = (speaker_id, speaker_score)
         out["wake"] = bool(_wake_pattern is not None
@@ -1201,6 +1319,8 @@ def _worker_loop() -> None:
             "speaker_id":     speaker_id,
             "speaker_score":  float(speaker_score),
         }
+        if via:
+            entry["via"] = via
         with _lock:
             _buffer.append(entry)
             _trim_buffer(entry["ts"])
@@ -1213,7 +1333,7 @@ def _worker_loop() -> None:
                             else ctx["window"])
         _append_jsonl(_AUDIO_JSONL, mirror)
         _rotate_jsonl_if_needed(_AUDIO_JSONL)
-        if cap_ts is None:
+        if nudge:
             _maybe_nudge_wake(text)
 
     def _keep_batch(audio, rms, cap_ts=None, ctx=None):
@@ -1227,6 +1347,23 @@ def _worker_loop() -> None:
         out = {"kept": False, "wake": False, "speaker": None}
         try:
             _decode_batch(audio, rms, cap_ts, ctx, out)
+        finally:
+            _music_gate_report(b, gate, out)
+
+    def _keep_main(text, conf, peak, audio, sr, _span, ts):
+        """AMBIENT_MAIN_DEDUPE: the main loop's transcript of a capture
+        whose batches were not decoded here, through the music gate and
+        _keep_text exactly as a decoded batch (its capture time; no nudge)."""
+        sr = int(sr or sample_rate)
+        gate = _music_gate_check(b, audio, sr)
+        if isinstance(gate, dict) and gate.get("verdict") == "skip":
+            return
+        out = {"kept": False, "wake": False, "speaker": None}
+        try:
+            _keep_text(text, conf, peak, audio, sr, ts, None, out,
+                       nudge=False, via="main-loop")
+            if out.get("kept"):
+                _note_dedupe("reused")
         finally:
             _music_gate_report(b, gate, out)
 
@@ -1247,6 +1384,8 @@ def _worker_loop() -> None:
                 with q_lock:
                     audio_q.clear()
                 pending.clear()
+                pending_t.clear()
+                _main_transcripts.clear()
                 pending_samples = 0
                 if not _paused[0]:
                     _prev_mic_batch[0] = None   # a mute ends any split line
@@ -1262,10 +1401,20 @@ def _worker_loop() -> None:
                     if _stop_evt.is_set():
                         break
 
+            # The main loop's own transcripts (AMBIENT_MAIN_DEDUPE), oldest
+            # first; no decode, so nothing waits for the owner's turn.
+            while _main_transcripts:
+                try:
+                    item = _main_transcripts.popleft()
+                except IndexError:
+                    break
+                _keep_main(*item)
+
             with q_lock:
                 while audio_q:
-                    chunk = audio_q.popleft()
+                    chunk_t, chunk = audio_q.popleft()
                     pending.append(chunk)
+                    pending_t.append((chunk_t, chunk.shape[0], sample_rate))
                     pending_samples += chunk.shape[0]
 
             if pending_samples < samples_per_batch:
@@ -1275,8 +1424,21 @@ def _worker_loop() -> None:
                 continue
 
             audio = np.concatenate(pending).astype(np.float32, copy=False)
+            stamps = list(pending_t)
             pending.clear()
+            pending_t.clear()
             pending_samples = 0
+
+            # AMBIENT_MAIN_DEDUPE: audio the main loop recorded (and so
+            # decodes, or decoded) is not decoded again here; its own
+            # transcript arrives through note_main_transcript.
+            if dedupe and stamps:
+                spans = _host_spans(b, float(stamps[0][0]) - 2.0)
+                if _batch_cover(stamps, spans) >= _DEDUPE_MIN_COVER:
+                    _note_dedupe("covered")
+                    _prev_mic_batch[0] = None
+                    _heartbeat = time.time()
+                    continue
 
             # Gate on the RAW RMS — the noise-cancel-1 processor's
             # AGC could otherwise inflate near-silent batches above
@@ -1309,6 +1471,8 @@ def _worker_loop() -> None:
         _last_error = f"worker crashed: {e}"
         print(f"  [ambient-listen] {_last_error}")
     finally:
+        _dedupe_live[0] = False
+        _main_transcripts.clear()
         # Tap path: detach from record_speech's fan-out and stop the drain
         # thread. Stream path: close our dedicated InputStream. Exactly one of
         # these is live depending on which acquisition branch ran above.

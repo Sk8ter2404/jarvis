@@ -1017,6 +1017,128 @@ class MicTapSharingTests(_TmpDirMixin, unittest.TestCase):
         self.assertEqual(self.mod._buffer[0]["text"], "fallback speech")
 
 
+class MainLoopDedupeTests(_TmpDirMixin, unittest.TestCase):
+    """AMBIENT_MAIN_DEDUPE (v3.0.26): on the tap path, a batch the main
+    loop's own capture covered is not decoded again; the main loop's
+    transcript of that capture is kept instead (same gates, no wake nudge).
+    The 11-16 overnight session decoded TV twice around the clock."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("ambient_listen")
+        self._redirect_paths()
+        self.mod._buffer.clear()
+        self.mod._last_error = None
+        self.mod._main_transcripts.clear()
+        self.mod._dedupe_live[0] = False
+
+    def _tap_bobert(self):
+        return MicTapSharingTests._tap_bobert(self)
+
+    def _run(self, bc, *, spans, offer=None, rounds=4):
+        """Drive the real worker on the tap path. ``spans(now)`` is what the
+        host's capture_spans_since answers; ``offer`` runs on the first wait
+        (the main loop handing over a transcript)."""
+        self.mod._wake_pattern = None
+        bc.capture_spans_since = lambda t0: spans(time.monotonic())
+        sd = _make_sd(open_raises=AssertionError("no stream on the tap path"))
+        block = (np.ones(16000 * 3, dtype=np.float32) * 0.2)
+
+        def _on_wait(n):
+            if n == 1:
+                for q in bc._tap_queues:
+                    q.put(block)
+                if offer is not None:
+                    offer()
+            time.sleep(0.03)
+
+        evt = _ScriptedEvent([False] * (rounds - 1) + [True], on_wait=_on_wait)
+        out = io.StringIO()
+        with inject_modules(sounddevice=sd), \
+             mock.patch.object(self.mod, "_get_bobert", return_value=bc), \
+             mock.patch.object(self.mod, "_stop_evt", evt), \
+             mock.patch.object(self.mod, "_focused_window_title",
+                               return_value="Notepad"), \
+             contextlib.redirect_stdout(out):
+            self.mod._worker_loop()
+        return out.getvalue()
+
+    def test_shipped_default_is_on(self):
+        from core import config
+        self.assertEqual(config.AMBIENT_MAIN_DEDUPE, "on")
+        self.assertEqual(self.mod.AMBIENT_MAIN_DEDUPE_DEFAULT, "on")
+
+    def test_a_batch_inside_a_main_capture_is_not_decoded_again(self):
+        bc = self._tap_bobert()
+        self.mod._dedupe_stats.update({"covered": 0, "reused": 0})
+        log = self._run(bc, spans=lambda now: [(now - 30.0, None)])
+        bc.transcribe.assert_not_called()
+        self.assertEqual(len(self.mod._buffer), 0)
+        self.assertIn("main-loop dedupe on", log)
+        self.assertIn("[ambient-listen] dedupe: 1 batch(es)", log)
+        self.assertFalse(self.mod._dedupe_live[0])     # off again on exit
+
+    def test_the_main_loops_transcript_is_kept_instead(self):
+        bc = self._tap_bobert()
+        nudges = []
+        audio = np.ones(16000, dtype=np.float32) * 0.1
+
+        def offer():
+            self.assertTrue(self.mod.note_main_transcript(
+                "the main loop heard this", _good_conf(), 0.03, audio, 16000,
+                (0.0, 1.0)))
+
+        with mock.patch.object(self.mod, "_maybe_nudge_wake",
+                               side_effect=nudges.append), \
+             mock.patch.object(self.mod, "_identify_speaker_safe",
+                               return_value=("owner", 0.8)) as vid:
+            self._run(bc, spans=lambda now: [(now - 30.0, None)],
+                      offer=offer)
+        bc.transcribe.assert_not_called()
+        self.assertEqual(len(self.mod._buffer), 1)
+        entry = self.mod._buffer[0]
+        self.assertEqual(entry["text"], "the main loop heard this")
+        self.assertEqual(entry["via"], "main-loop")
+        self.assertEqual(entry["speaker_id"], "owner")
+        self.assertIs(vid.call_args.args[0], audio)    # its own clip
+        self.assertEqual(nudges, [])                   # never a wake nudge
+        # the same gates as a decoded batch: the validity check ran on it
+        bc.is_valid_speech.assert_called()
+        with open(self.mod._AUDIO_JSONL, encoding="utf-8") as f:
+            rows = [json.loads(line) for line in f if line.strip()]
+        self.assertEqual(rows[-1]["via"], "main-loop")
+
+    def test_audio_between_captures_is_decoded_as_before(self):
+        bc = self._tap_bobert()
+        self._run(bc, spans=lambda now: [(now - 300.0, now - 200.0)])
+        bc.transcribe.assert_called()
+        self.assertEqual(self.mod._buffer[-1]["text"], "tapped speech")
+        self.assertNotIn("via", self.mod._buffer[-1])
+
+    def test_off_decodes_every_batch(self):
+        bc = self._tap_bobert()
+        bc.AMBIENT_MAIN_DEDUPE = "off"
+        self._run(bc, spans=lambda now: [(now - 30.0, None)])
+        bc.transcribe.assert_called()
+        self.assertFalse(self.mod.note_main_transcript(
+            "x", {}, 0.0, None, 16000))     # nobody is deduping
+
+    def test_offers_are_ignored_unless_a_worker_dedupes(self):
+        self.mod._dedupe_live[0] = False
+        self.mod._main_transcripts.clear()
+        self.assertFalse(self.mod.note_main_transcript(
+            "hello", {}, 0.02, None, 16000))
+        self.assertEqual(len(self.mod._main_transcripts), 0)
+
+    def test_batch_cover_fraction(self):
+        cover = self.mod._batch_cover
+        stamps = [(10.0 + 0.064 * i, 1024, 16000) for i in range(40)]
+        self.assertEqual(cover(stamps, [], now=20.0), 0.0)
+        self.assertEqual(cover(stamps, [(9.0, None)], now=20.0), 1.0)
+        half = cover(stamps, [(9.0, 10.0 + 0.064 * 20)], now=20.0, tol=0.0)
+        self.assertAlmostEqual(half, 0.5, delta=0.05)
+        self.assertEqual(cover("bad", [(0, 1)]), 0.0)
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # System-audio (WASAPI loopback) worker (_audio_worker_loop)
 # ─────────────────────────────────────────────────────────────────────────

@@ -57,15 +57,77 @@ class CaptureAutoGainTests(unittest.TestCase):
         self.assertEqual(out.dtype, np.float32)
 
     def test_boosted_audio_is_clipped_into_range(self):
-        # A very quiet peak forces a large gain; samples that would exceed 1.0
-        # after multiplication must be HARD-CLIPPED to [-1, 1].
+        # The old rule ('raw' basis): a very quiet RAW peak forces a large
+        # gain; samples that would exceed 1.0 after multiplication are
+        # HARD-CLIPPED to [-1, 1].
         peak = 0.01
         # Mix of small and (relatively) large samples so the boost overshoots 1.0.
         audio = np.array([peak, -peak, 0.2, -0.2, 0.5, -0.5], dtype=np.float32)
-        out, gain = self._gain_fn()(audio, peak)
-        self.assertGreater(gain, 1.0)
-        self.assertLessEqual(float(np.max(out)), 1.0)
-        self.assertGreaterEqual(float(np.min(out)), -1.0)
+        with mock.patch.object(self.cfg, "CAPTURE_AUTO_GAIN_BASIS", "raw"):
+            out, gain = self._gain_fn()(audio, peak)
+        self.assertEqual(gain, 10.0)
+        self.assertEqual(float(np.max(out)), 1.0)
+        self.assertEqual(float(np.min(out)), -1.0)
+
+    # ── v3.0.26: the gain comes from the clip it multiplies ─────────────────
+    def test_shipped_basis_is_the_clip(self):
+        self.assertEqual(self.cfg.CAPTURE_AUTO_GAIN_BASIS, "clip")
+
+    @staticmethod
+    def _sine(rms, n=4096):
+        t = np.arange(n, dtype=np.float32) / 16000.0
+        return (np.sin(2 * np.pi * 220.0 * t) * rms * np.sqrt(2.0)).astype(
+            np.float32)
+
+    def test_clip_basis_gain_comes_from_the_processed_clip(self):
+        # record_speech's RAW peak was 0.0098, but the clip STT hears was
+        # already AGC'd to ~0.05 RMS. The old rule multiplied it x10 (0.25 /
+        # 0.0098 capped) into ~0.5 RMS and clipped; the clip's own level
+        # gives 0.25 / 0.05 = x5 and lands the loudest chunk on the target.
+        raw_peak = 0.0098
+        clip = self._sine(0.05)
+        out, gain = self._gain_fn()(clip, raw_peak)
+        self.assertAlmostEqual(gain, 5.0, delta=0.05)
+        from core import capture_chain as cc
+        self.assertAlmostEqual(cc.peak_chunk_rms(out), 0.25, places=3)
+
+    def test_raw_peak_still_guards_silence_on_the_clip_basis(self):
+        # Room hiss the AGC lifted: the raw peak at the floor still means
+        # silence, so nothing is amplified whatever the clip's level.
+        clip = self._sine(0.02)
+        out, gain = self._gain_fn()(clip, 0.004)
+        self.assertEqual(gain, 1.0)
+        self.assertIs(out, clip)
+
+    def test_loud_clip_is_untouched_even_with_a_quiet_raw_peak(self):
+        clip = self._sine(0.3)
+        out, gain = self._gain_fn()(clip, 0.012)
+        self.assertEqual(gain, 1.0)
+        self.assertIs(out, clip)
+
+    def test_clip_basis_soft_limits_instead_of_clipping(self):
+        # A quiet clip with a few crests: x10 sends the crests past 1.0. They
+        # are squeezed under 1.0 (never flattened AT 1.0), and everything
+        # under the knee keeps its exact boosted value.
+        clip = self._sine(0.012, n=8192)
+        clip[100] = 0.13
+        clip[200] = -0.11
+        out, gain = self._gain_fn()(clip, 0.012)
+        self.assertEqual(gain, 10.0)
+        self.assertLess(float(np.max(np.abs(out))), 1.0)
+        self.assertGreater(float(out[100]), 0.9)
+        self.assertLess(float(out[200]), -0.9)
+        self.assertGreater(float(out[100]), float(-out[200]),
+                           "the limiter keeps the order of the crests")
+        small = np.abs(clip * 10.0) < 0.9
+        np.testing.assert_allclose(out[small], clip[small] * 10.0, rtol=1e-6)
+
+    def test_clip_peak_argument_sets_one_gain_for_every_chunk(self):
+        # Smart Turn's streamed Silero boosts a capture chunk by chunk: each
+        # chunk gets the gain of the WHOLE clip so far, never its own.
+        quiet_chunk = self._sine(0.005, n=1024)
+        out, gain = self._gain_fn()(quiet_chunk, 0.02, clip_peak=0.05)
+        self.assertAlmostEqual(gain, 5.0, places=3)
 
     def test_gain_never_exceeds_max(self):
         # peak just above the floor would want a gigantic gain; it must cap at

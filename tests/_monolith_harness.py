@@ -484,6 +484,12 @@ _MONOLITH_RESTORE_NAMES = (
     "_mic_bus_active", "_mic_bus_obj", "_mic_bus_carry", "_media_aec_obj",
     "_loopback_obj", "_pregate_obj", "_loopveto_obj", "_pregate_hit",
     "_pregate_seq", "_last_capture_meta", "_aec_ref_missing",
+    # The capture chain (v3.0.26, core/capture_chain.py): the last capture's
+    # raw clip / clip level / STT clip, the ambient-dedupe capture spans, and
+    # the rescue / held-noise counters.
+    "_last_capture_raw", "_last_recording_clip_peak", "_last_capture_stt",
+    "_capture_spans", "_capture_open_since", "_vad_held_prev",
+    "_empty_rescue_skipped",
     "_aec_ref_quiet_since", "_aec_tts_device_checked", "_aec_backend_said",
     "_wake_duck_seq", "_wake_duck_timer", "_listen_aec_frames",
     "_reanchor_taken", "_mic_stream_closed_at",
@@ -636,6 +642,15 @@ def _restore_monolith_pristine(bc) -> None:
     # reason). Wiped in place.
     try:
         bc._self_echo._reset_for_tests()
+    except Exception:
+        pass
+    # The VAD floor and its "[vad-floor]" book (v3.0.26): one process-wide
+    # instance each. A floor one test's idle chunks measured would raise a
+    # LATER test's capture start threshold (green or red for the wrong
+    # reason). Wiped in place.
+    try:
+        bc._vad_floor.reset()
+        bc._vad_book.reset()
     except Exception:
         pass
     # Capture-open backoff (R10, 2026-09-29): one process-wide instance, so

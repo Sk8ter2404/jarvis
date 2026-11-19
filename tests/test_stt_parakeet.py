@@ -346,6 +346,35 @@ class RescueReasonTests(unittest.TestCase):
         self.assertEqual(self._r("Travis", head=RuntimeError("x")),
                          ("check-failed", 1))
 
+    # v3.0.26 (STT_RESCUE_EMPTY): the empty rescue asks for speech first.
+    def _e(self, text, speech):
+        calls = []
+
+        def empty_speech():
+            calls.append(1)
+            if isinstance(speech, Exception):
+                raise speech
+            return speech
+        why = sp.rescue_reason(text, wake_lost=lambda t: True,
+                               head_speech=lambda: True,
+                               empty_speech=empty_speech)
+        return why, len(calls)
+
+    def test_empty_with_no_speech_keeps_the_empty_text(self):
+        self.assertEqual(self._e("", False), ("", 1))
+        self.assertEqual(self._e("  ", False), ("", 1))
+
+    def test_empty_with_speech_or_unknown_is_rescued(self):
+        self.assertEqual(self._e("", True), ("empty", 1))
+        self.assertEqual(self._e("", None), ("empty", 1))
+
+    def test_empty_speech_check_failing_rescues(self):
+        self.assertEqual(self._e("", RuntimeError("vad")),
+                         ("check-failed", 1))
+
+    def test_empty_speech_is_asked_only_about_an_empty_text(self):
+        self.assertEqual(self._e("Travis, lights", False), ("no-wake", 0))
+
 
 # ── the primary path ──────────────────────────────────────────────────────
 class _Whisper:
