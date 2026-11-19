@@ -26,7 +26,7 @@ from unittest import mock
 from core import owner_presence as op
 from core import queue_receipts as qr
 from tests._monolith_harness import requires_monolith
-from tests.monolith.test_monolith_presence_hold import _Base, MONO
+from tests.monolith.test_monolith_presence_hold import _Base
 
 CLAP_LINE = "You rang, sir?"
 BRIEFING = "[intent:briefing] Good morning, sir. Rain at four."

@@ -85,7 +85,7 @@ class ChangelogBootTests(MonolithGlobalsTestCase):
     def test_nothing_to_say_says_nothing(self):
         bc = self.bc
         self._p(bc, "BOOT_CHANGELOG_BACKGROUND", False, create=True)
-        llm = self._p(bc, "_llm_quick", lambda *a, **k: "")
+        self._p(bc, "_llm_quick", lambda *a, **k: "")
         spoke = self._p(bc, "_speak")
         hist: list = []
         bc._changelog_announce("1.0", "1.1", "", hist)     # empty entry

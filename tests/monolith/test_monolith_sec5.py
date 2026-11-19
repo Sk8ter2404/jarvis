@@ -1951,7 +1951,11 @@ class AmbientLearnFromGatedTests(SectionFiveBase):
         # the gate must forward them — otherwise voice-ID silently goes blind.
         import inspect
         cap_src = inspect.getsource(self.bc._capture_utterance)
-        self.assertIn("_last_capture_audio = audio", cap_src)
+        # v3.0.26 (speech-voiceid-mismatch): the stash goes through
+        # _voice_clip_for, which hands voice-ID the raw frames record_speech
+        # kept for this clip (the form the voiceprint was enrolled from), or
+        # the clip itself when there are none.
+        self.assertIn("_last_capture_audio = _voice_clip_for(audio)", cap_src)
         main_src = inspect.getsource(self.bc.main)
         # The gate dispatches _ambient_learn_from_gated on a daemon thread (so the
         # local-LLM content judge can't block the main loop); the audio buffer is
