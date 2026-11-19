@@ -120,6 +120,11 @@ TICK_MS = 500                 # cheap data refresh + repaint cadence
 CAMERA_TICK_MS = 33           # camera-preview-only refresh cadence (~30 Hz poll)
 SLOW_REFRESH_S = 600.0        # weather/calendar refresh cadence (background)
 GPU_CACHE_SECONDS = 1.0       # utilization swings 0→100→0 fast; a long cache aliases it
+# v3.0.26 (reliability-05): the 1 s reading comes from core.gpu_sampler (NVML
+# in this process: no process start, initialised once for the HUD's life). It
+# used to be an nvidia-smi start every second, all day (~86,000 a day). Only
+# when NVML is unavailable does nvidia-smi run, and then at most this often.
+GPU_SMI_FALLBACK_S = 5.0
 
 PROJECT_DIR      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Prod defaults. main() repoints HUD_STATE_FILE / CONTROL_FILE / GEOMETRY_FILE
@@ -198,6 +203,17 @@ def _read_json(path: str) -> dict:
             return json.load(f) or {}
     except Exception:
         return {}
+
+
+def _shared_gpu_util(max_age_s: float) -> "float | None":
+    """The busiest GPU's utilization from core.gpu_sampler (in-process NVML,
+    v3.0.26), or None without NVML (the caller's nvidia-smi fallback).
+    Never raises."""
+    try:
+        from core import gpu_sampler
+        return gpu_sampler.util_pct(max_age_s)
+    except Exception:
+        return None
 
 
 def _is_parent_alive(pid: int) -> bool:
@@ -622,10 +638,19 @@ class UnifiedHud(QWidget):
         previously-cached value; the worker writes the fresh reading back when
         it lands. The displayed value and GPU_CACHE_SECONDS TTL are unchanged —
         _gpu_cached_at is stamped here (sample start) exactly as before so the
-        refresh cadence stays the same and overlapping spawns are avoided."""
+        refresh cadence stays the same and overlapping spawns are avoided.
+        While the HUD is hidden nothing is sampled (v3.0.26): the tick keeps
+        running so 'show HUD' works, but nobody sees the arc."""
         now = time.time()
         if (now - self._gpu_cached_at) < GPU_CACHE_SECONDS:
             return self.gpu_util
+        visible = getattr(self, "isVisible", None)
+        if callable(visible):
+            try:
+                if not visible():
+                    return self.gpu_util
+            except Exception:
+                pass
         # Stamp the sample-start time up front so the next tick won't re-trigger
         # while this sample is in flight (preserves the old TTL behaviour).
         self._gpu_cached_at = now
@@ -643,10 +668,23 @@ class UnifiedHud(QWidget):
             self._gpu_sampling = False
 
     def _sample_gpu_util(self) -> float | None:
-        """Blocking GPU-utilization sample (runs OFF the GUI thread)."""
+        """Blocking GPU-utilization sample (runs OFF the GUI thread).
+        core.gpu_sampler's NVML reading first (v3.0.26); nvidia-smi only
+        without NVML, at most every GPU_SMI_FALLBACK_S; then the
+        pulse_strip."""
+        shared = _shared_gpu_util(GPU_CACHE_SECONDS)
+        if shared is not None:
+            return shared
+        now = time.time()
+        smi_due = (now - float(getattr(self, "_gpu_smi_at", 0.0) or 0.0)
+                   >= GPU_SMI_FALLBACK_S)
+        last = getattr(self, "gpu_util", None)
+        if not smi_due and last is not None:
+            return last        # the last nvidia-smi reading stands until then
         try:
-            exe = shutil.which("nvidia-smi")
+            exe = shutil.which("nvidia-smi") if smi_due else None
             if exe:
+                self._gpu_smi_at = now
                 out = subprocess.run(
                     [exe, "--query-gpu=utilization.gpu",
                      "--format=csv,noheader,nounits"],

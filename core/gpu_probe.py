@@ -53,7 +53,9 @@ Public API (stdlib only, never raises, never creates a CUDA context):
     find(spec, env=None)        -> (cuda_index, dict) | None
     describe(gpu)               -> str
 Each GPU dict: index (NVML), name, uuid, pci_bus, total_mb, free_mb,
-used_mb, util_pct (None when unreadable). cuda_gpus() also holds an
+used_mb, util_pct, and (v3.0.26, for core/gpu_sampler) temp_c, power_w and
+alloc_mb - the memory nvidia-smi calls memory.used; v1's used_mb also counts
+the driver's reservation (None when unreadable). cuda_gpus() also holds an
 UNREADABLE entry (``unreadable: True``, every reading None) for a GPU NVML
 counts but cannot read; gpus() leaves those out.
 """
@@ -80,6 +82,19 @@ class _Utilization(ctypes.Structure):       # nvmlUtilization_t
     _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
 
 
+class _MemoryV2(ctypes.Structure):          # nvmlMemory_v2_t (R510+)
+    _fields_ = [("version", ctypes.c_uint),
+                ("total", ctypes.c_ulonglong),
+                ("reserved", ctypes.c_ulonglong),
+                ("free", ctypes.c_ulonglong),
+                ("used", ctypes.c_ulonglong)]
+
+
+# NVML_STRUCT_VERSION(Memory, 2) = sizeof(nvmlMemory_v2_t) | (2 << 24)
+_MEMORY_V2_VERSION = ctypes.sizeof(_MemoryV2) | (2 << 24)
+_NVML_TEMPERATURE_GPU = 0
+
+
 class _PciInfo(ctypes.Structure):           # nvmlPciInfo_t
     _fields_ = [("busIdLegacy", ctypes.c_char * 16),
                 ("domain", ctypes.c_uint), ("bus", ctypes.c_uint),
@@ -98,7 +113,18 @@ def _candidate_paths() -> "list[str]":
 
 
 def _default_loader():
-    """The NVML library, or None when no driver ships one."""
+    """The NVML library, or None when no driver ships one.
+
+    JARVIS_NO_NVML=1 (tests/__init__.py sets it, v3.0.26): loads nothing, so
+    a test run never reads the owner's live GPUs through this module - core/
+    gpu_sampler made it the source every GPU poller tries first. Tests pass a
+    fake library through set_loader() instead; tools/hermetic_guard refuses
+    a direct load of the library as well."""
+    try:
+        if str(os.environ.get("JARVIS_NO_NVML", "")).strip() == "1":
+            return None
+    except Exception:
+        pass
     for path in _candidate_paths():
         try:
             return ctypes.CDLL(path)
@@ -110,7 +136,9 @@ def _default_loader():
 
 
 _loader = _default_loader     # tests: set_loader()
-_state = {"lib": None, "tried": False}
+# gen: bumped by set_loader, so core/gpu_sampler drops a reading taken
+# through the previous library.
+_state = {"lib": None, "tried": False, "gen": 0}
 _lock = threading.Lock()
 _io_lock = threading.Lock()   # one NVML device read at a time (see docstring)
 
@@ -123,6 +151,7 @@ def set_loader(fn) -> None:
         _loader = fn if fn is not None else _default_loader
         _state["lib"] = None
         _state["tried"] = False
+        _state["gen"] = int(_state.get("gen", 0)) + 1
 
 
 def _lib():
@@ -196,10 +225,41 @@ def _read_one(lib, i: int) -> "dict | None":
             util = int(u.gpu)
     except Exception:
         util = None
+    # v3.0.26 (core/gpu_sampler): temperature, power and the allocated
+    # memory nvidia-smi reports as memory.used (v1's used also counts the
+    # driver's reservation). Each optional: None when the call is missing
+    # or fails.
+    temp = None
+    try:
+        t = ctypes.c_uint(0)
+        if int(lib.nvmlDeviceGetTemperature(
+                h, ctypes.c_int(_NVML_TEMPERATURE_GPU), ctypes.byref(t))) \
+                == NVML_SUCCESS:
+            temp = int(t.value)
+    except Exception:
+        temp = None
+    power = None
+    try:
+        mw = ctypes.c_uint(0)
+        if int(lib.nvmlDeviceGetPowerUsage(h, ctypes.byref(mw))) \
+                == NVML_SUCCESS:
+            power = round(int(mw.value) / 1000.0, 1)
+    except Exception:
+        power = None
+    alloc = None
+    try:
+        m2 = _MemoryV2()
+        m2.version = _MEMORY_V2_VERSION
+        if int(lib.nvmlDeviceGetMemoryInfo_v2(h, ctypes.byref(m2))) \
+                == NVML_SUCCESS and int(m2.total):
+            alloc = int(m2.used) // _MB
+    except Exception:
+        alloc = None
     return {"index": int(i), "name": _text(name), "uuid": _text(uuid),
             "pci_bus": pci_bus, "total_mb": int(mem.total) // _MB,
             "free_mb": int(mem.free) // _MB, "used_mb": int(mem.used) // _MB,
-            "util_pct": util}
+            "util_pct": util, "temp_c": temp, "power_w": power,
+            "alloc_mb": alloc}
 
 
 def _unreadable(i: int) -> dict:
@@ -208,7 +268,8 @@ def _unreadable(i: int) -> dict:
     UUID."""
     return {"index": int(i), "name": "", "uuid": "", "pci_bus": None,
             "total_mb": None, "free_mb": None, "used_mb": None,
-            "util_pct": None, "unreadable": True}
+            "util_pct": None, "temp_c": None, "power_w": None,
+            "alloc_mb": None, "unreadable": True}
 
 
 def _slots() -> "list[dict]":

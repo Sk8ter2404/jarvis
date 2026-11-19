@@ -1049,6 +1049,46 @@ class GpuUtilTests(_HudBase):
                                   side_effect=OSError("spawn failed")):
             self.assertEqual(self._drive_gpu_read(s), 51.0)
 
+    # v3.0.26 (reliability-05): core.gpu_sampler (in-process NVML) first;
+    # nvidia-smi only without it, and at most every GPU_SMI_FALLBACK_S.
+    def test_the_shared_nvml_reading_starts_no_process(self):
+        s = self._new_scene()
+        with mock.patch.object(self.hud, "_shared_gpu_util",
+                               return_value=33.0), \
+                mock.patch.object(self.hud.subprocess, "run") as run:
+            self.assertEqual(s._sample_gpu_util(), 33.0)
+        run.assert_not_called()
+
+    def test_without_nvml_nvidia_smi_runs_at_most_every_fallback_interval(self):
+        self.assertGreaterEqual(self.hud.GPU_SMI_FALLBACK_S, 5.0)
+        s = self._new_scene()
+        out = mock.MagicMock()
+        out.stdout = "58\n"
+        calls = 0
+        for dt in (0.0, 1.0, 2.0, 4.5, self.hud.GPU_SMI_FALLBACK_S):
+            with mock.patch.object(self.hud, "_shared_gpu_util",
+                                   return_value=None), \
+                    mock.patch.object(self.hud.time, "time",
+                                      return_value=40_000.0 + dt), \
+                    mock.patch.object(self.hud.shutil, "which",
+                                      return_value="nvidia-smi"), \
+                    mock.patch.object(self.hud.subprocess, "run",
+                                      return_value=out) as run:
+                s.gpu_util_pct = s._sample_gpu_util()
+            calls += run.call_count
+            self.assertEqual(s.gpu_util_pct, 58.0)
+        self.assertEqual(calls, 2)          # at 0 s and at the interval
+
+    def test_runs_as_a_script_with_the_project_on_its_path(self):
+        # Launched as `python skills/holographic_overlay/hud_v2.py`: its own
+        # sys.path insert was skills/, so `core.*` never resolved there.
+        root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(self.hud.__file__))))
+        self.assertEqual(os.path.normcase(self.hud._PROJECT_ROOT),
+                         os.path.normcase(root))
+        self.assertTrue(os.path.isfile(os.path.join(
+            self.hud._PROJECT_ROOT, "core", "gpu_sampler.py")))
+
     def test_updates_cache_timestamp(self):
         s = self._new_scene()
         s._gpu_cached_at = 0.0

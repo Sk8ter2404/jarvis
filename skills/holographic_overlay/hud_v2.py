@@ -73,6 +73,14 @@ import time
 # `from core.parent_watch import ...` resolves (2026-07-14).
 try:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    # v3.0.26: that is skills/, not the project dir (this file lives one
+    # level deeper than hud/*.py), so `core.*` never resolved when this ran
+    # as its own script: the parent watch fell through to psutil and the
+    # shared GPU sampler was unreachable. The project dir, too:
+    _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))))
+    if _PROJECT_ROOT not in sys.path:
+        sys.path.insert(0, _PROJECT_ROOT)
 except Exception:
     pass
 
@@ -129,6 +137,10 @@ TICK_MS = 500  # spec — 500 ms refresh cadence
 TRACK_REFRESH_TICKS    = 12     # ~6 s
 CALENDAR_REFRESH_TICKS = 240    # ~2 min
 GPU_CACHE_SECONDS      = 1.0   # utilization swings fast; a 4 s cache aliases it
+# v3.0.26 (reliability-05): the reading comes from core.gpu_sampler (NVML
+# in this process, no process start); nvidia-smi only without NVML, and
+# then at most this often (it was once a second).
+GPU_SMI_FALLBACK_S = 5.0
 
 # Palette — kept in lockstep with arc_reactor_status_hud so the two
 # surfaces read as one system.
@@ -164,6 +176,17 @@ RAM_WARN_PCT      = 75.0
 RAM_CRIT_PCT      = 90.0
 GPU_WARN_PCT      = 70.0
 GPU_CRIT_PCT      = 90.0
+
+
+def _shared_gpu_util(max_age_s: float) -> "float | None":
+    """The busiest GPU's utilization from core.gpu_sampler (in-process NVML,
+    v3.0.26), or None without NVML (the caller's nvidia-smi fallback).
+    Never raises."""
+    try:
+        from core import gpu_sampler
+        return gpu_sampler.util_pct(max_age_s)
+    except Exception:
+        return None
 
 
 def _is_parent_alive(pid: int) -> bool:
@@ -373,10 +396,23 @@ class StarkStatusRingScene(_QtSceneBase):
             self._gpu_sampling = False
 
     def _sample_gpu_util(self) -> float | None:
-        """Blocking GPU-utilization sample (runs OFF the GUI thread)."""
+        """Blocking GPU-utilization sample (runs OFF the GUI thread).
+        core.gpu_sampler's NVML reading first (v3.0.26); nvidia-smi only
+        without NVML, at most every GPU_SMI_FALLBACK_S; then the
+        pulse_strip."""
+        shared = _shared_gpu_util(GPU_CACHE_SECONDS)
+        if shared is not None:
+            return shared
+        now = time.time()
+        smi_due = (now - float(getattr(self, "_gpu_smi_at", 0.0) or 0.0)
+                   >= GPU_SMI_FALLBACK_S)
+        last = getattr(self, "gpu_util_pct", None)
+        if not smi_due and last is not None:
+            return last        # the last nvidia-smi reading stands until then
         try:
-            exe = shutil.which("nvidia-smi")
+            exe = shutil.which("nvidia-smi") if smi_due else None
             if exe:
+                self._gpu_smi_at = now
                 out = subprocess.run(
                     [exe, "--query-gpu=utilization.gpu",
                      "--format=csv,noheader,nounits"],

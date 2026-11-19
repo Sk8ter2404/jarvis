@@ -98,7 +98,9 @@ message).
 installed", the CI runner's own answer): launching a live-hardware or
 live-service probe - ``PROBE_PROGRAMS`` (``nvidia-smi``, the ``ollama`` CLI,
 ``powercfg``, ``pnputil``, the audio-device switchers, ``shutdown``, the
-network probes, the ``claude`` CLI ...) directly or through a shell, a
+network probes, the ``claude`` CLI ...) directly or through a shell, loading
+a live-hardware library (``PROBE_LIBRARIES``: NVML, nvidia-smi's own, at the
+``ctypes.dlopen`` event, v3.0.26), a
 PowerShell command line that queries or changes devices
 (``SHELL_PROBE_PATTERNS``), a python launch of one of the project's HUD
 overlays (``hud/*.py``: a real window on the owner's desktop), and a desktop
@@ -211,6 +213,18 @@ PROBE_PROGRAMS = frozenset({
     # the cloud coding CLI the self-upgrade pipeline drives: a real call
     # bills the owner and edits files
     "claude",
+})
+
+# Native libraries whose LOAD is a live-hardware probe: NVML is the library
+# nvidia-smi is built on (core/gpu_probe reads it in-process since v3.0.26,
+# reliability-05: one cached sampler instead of an nvidia-smi spawn per poll),
+# so a test that reached it would read the owner's live GPUs exactly as a
+# spawned nvidia-smi did. Refused at ``ctypes.dlopen`` (raised before the
+# library loads) like the program above: "not installed", the CI runner's own
+# answer. Tests drive core.gpu_probe through set_loader(<fake NVML>), which
+# loads nothing. Matched on the lower-case basename.
+PROBE_LIBRARIES = frozenset({
+    "nvml", "nvml.dll", "libnvidia-ml.so", "libnvidia-ml.so.1",
 })
 
 # Desktop file launchers: each hands a file (or URL) to its registered app ON
@@ -452,7 +466,7 @@ _EVENTS = frozenset({
     "socket.getaddrinfo", "socket.gethostbyname", "socket.gethostbyaddr",
     "subprocess.Popen", "os.system", "os.spawn", "os.posix_spawn",
     "os.startfile", "os.startfile/2",
-    "ctypes.call_function",
+    "ctypes.call_function", "ctypes.dlopen",
 })
 
 
@@ -606,6 +620,17 @@ def _shell_command_words(tokens: list[str]) -> list[str]:
         if t and t[-1] in ";&|":
             expect = True
     return words
+
+
+def library_verdict(name) -> str | None:
+    """Why loading this native library must be refused (PROBE_LIBRARIES),
+    or None."""
+    text = _as_text(name)
+    base = os.path.basename(text.replace("\\", "/").strip().strip('"')).lower()
+    if base in PROBE_LIBRARIES or base.startswith("libnvidia-ml.so"):
+        return (f"{base} (NVML, nvidia-smi's own library) reads the owner's "
+                f"live GPUs")
+    return None
 
 
 def probe_verdict(executable, args) -> str | None:
@@ -936,6 +961,14 @@ def _decide(event, args) -> None:
             _refuse("input", f"user32.{name}", name, why)
         return
     if not _active("probe"):
+        return
+    if event == "ctypes.dlopen":
+        # (name,) - raised before the library loads, so a refusal loads
+        # nothing (ctypes.CDLL raises the refusal, an OSError).
+        target = _as_text(args[0]) if args else ""
+        why = library_verdict(target)
+        if why:
+            _refuse("probe", event, target[:160] or "<library>", why)
         return
     if event in ("os.startfile", "os.startfile/2"):
         # (path, operation[, arguments, cwd, show_cmd]) - the Windows shell

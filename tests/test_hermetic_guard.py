@@ -354,6 +354,33 @@ class HookTests(_Armed):
             sys.audit("subprocess.Popen", None, "nvidia-smi -L", None, None)
         self.assertIsInstance(cm.exception, hg.ProbeGuardError)
 
+    def test_loading_nvml_is_a_refused_probe(self):
+        """v3.0.26: core/gpu_probe reads NVML in-process (the one cached GPU
+        sampler); a test reaching it must not read the live GPUs."""
+        self.require_armed("probe")
+        for name in ("nvml.dll", r"C:\Windows\System32\nvml.dll",
+                     "libnvidia-ml.so.1"):
+            with self.subTest(name=name), _ledger_restored(), \
+                    self.assertRaises(hg.ProbeGuardError):
+                sys.audit("ctypes.dlopen", name)
+        with _ledger_restored():
+            sys.audit("ctypes.dlopen", "kernel32")      # anything else passes
+            import ctypes
+            with self.assertRaises(OSError):
+                ctypes.CDLL("nvml.dll")                  # never loads
+        from core import gpu_probe as gp
+        gp.set_loader(None)                              # the REAL loader
+        self.addCleanup(gp.set_loader, None)
+        with _ledger_restored():
+            self.assertFalse(gp.available())
+            self.assertEqual(gp.gpus(), [])
+
+    def test_library_verdict(self):
+        self.assertTrue(hg.library_verdict("NVML.DLL"))
+        self.assertTrue(hg.library_verdict(b"/usr/lib/libnvidia-ml.so.535"))
+        self.assertIsNone(hg.library_verdict("user32"))
+        self.assertIsNone(hg.library_verdict(None))
+
     def test_os_startfile_is_refused_before_it_launches(self):
         # CPython raises both events BEFORE ShellExecute, so a refusal opens
         # nothing. Synthetic here: a regressed guard must not open a file.

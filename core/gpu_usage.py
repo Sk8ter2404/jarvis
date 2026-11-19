@@ -16,8 +16,10 @@ Data sources (all best-effort — a missing one degrades, never raises):
     ``.models[].size_vram`` bytes + ``.models[].size``), preferred because it's
     exact and machine-readable. Falls back to parsing the ``ollama ps`` table
     (NAME / SIZE / PROCESSOR columns) when the HTTP endpoint is unreachable.
-  • Total VRAM + util + temp — ``nvidia-smi --query-gpu=memory.used,memory.free,
-    memory.total,utilization.gpu,temperature.gpu --format=csv,noheader,nounits``.
+  • Total VRAM + util + temp — core.gpu_sampler's in-process NVML reading
+    (v3.0.26: the same counters, no process start), else ``nvidia-smi
+    --query-gpu=memory.used,memory.free,memory.total,utilization.gpu,
+    temperature.gpu --format=csv,noheader,nounits``.
   • Routing            — ``core.config.MODEL_ROUTING`` / ``model_route(fn)``.
 
 Design rules (match core/gpu_state.py + the system_pulse/status_panel skills):
@@ -291,6 +293,34 @@ def _parse_nvidia_smi(text: str) -> dict:
     return out
 
 
+def _shared_card_totals() -> dict | None:
+    """The total/used/free/util/temp keys from core.gpu_sampler's in-process
+    NVML reading (v3.0.26, reliability-05: no nvidia-smi start), in the
+    shape _parse_nvidia_smi returns - or None without NVML (the caller then
+    runs nvidia-smi as before). used_mb is the memory nvidia-smi calls
+    memory.used. Never raises."""
+    try:
+        from core import gpu_sampler
+        s = gpu_sampler.sample(_CACHE_TTL_S)
+    except Exception:
+        return None
+    if not s:
+        return None
+    out: dict = {}
+    try:
+        if None not in (s.get("used_mb"), s.get("free_mb"), s.get("total_mb")):
+            out["used_mb"] = int(s["used_mb"])
+            out["free_mb"] = int(s["free_mb"])
+            out["total_mb"] = int(s["total_mb"])
+        if s.get("util_pct") is not None:
+            out["util_pct"] = int(s["util_pct"])
+        if s.get("temp_c") is not None:
+            out["temp_c"] = int(s["temp_c"])
+    except Exception:
+        return None
+    return out or None
+
+
 # ─── snapshot ────────────────────────────────────────────────────────────
 
 def gpu_snapshot(*, use_cache: bool = True) -> dict:
@@ -324,9 +354,13 @@ def gpu_snapshot(*, use_cache: bool = True) -> dict:
     except Exception:
         snap["models"] = []
     try:
-        smi = _run_nvidia_smi_query()
-        if smi:
-            snap.update(_parse_nvidia_smi(smi))
+        shared = _shared_card_totals()
+        if shared is not None:
+            snap.update(shared)
+        else:
+            smi = _run_nvidia_smi_query()
+            if smi:
+                snap.update(_parse_nvidia_smi(smi))
     except Exception:
         pass
 

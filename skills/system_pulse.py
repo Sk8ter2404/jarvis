@@ -227,15 +227,41 @@ def _read_uptime_seconds() -> float:
         return 0.0
 
 
+# v3.0.26 (reliability-05): the GPU readers below ask core.gpu_sampler first
+# (NVML in this process: no process start, one cached reading shared with
+# the HUD's VRAM panel and the diagnostics panel). nvidia-smi runs only where
+# NVML is unavailable. The reading may be this old: under the 5 s resample
+# gap of _qualify_gpu_reason, so its second sample is always a new one.
+GPU_SHARED_MAX_AGE_S = 1.0
+
+
+def _shared_gpu_sample() -> dict | None:
+    """core.gpu_sampler's reading (dict) or None without NVML. Never
+    raises."""
+    try:
+        from core import gpu_sampler
+        return gpu_sampler.sample(GPU_SHARED_MAX_AGE_S)
+    except Exception:
+        return None
+
+
 def _read_gpu_util_pct() -> float | None:
-    """Best-effort GPU utilization percent (0-100), via nvidia-smi.
+    """Best-effort GPU utilization percent (0-100): core.gpu_sampler's NVML
+    reading (v3.0.26), else nvidia-smi.
 
     Utilization is what the HUD now surfaces (temps are reliably fine on this
-    rig). nvidia-smi is the only source that exposes a load percentage —
-    HWiNFO/psutil sensor blocks report *temperature*, not utilization, so they
-    are deliberately NOT consulted here; the temperature fallback lives in the
-    separate `_read_gpu_temp_c`. Returns the busiest GPU's load, or None when
-    nvidia-smi is unavailable (caller then falls back to temperature)."""
+    rig). NVML / nvidia-smi are the only sources that expose a load
+    percentage — HWiNFO/psutil sensor blocks report *temperature*, not
+    utilization, so they are deliberately NOT consulted here; the temperature
+    fallback lives in the separate `_read_gpu_temp_c`. Returns the busiest
+    GPU's load, or None when neither is available (caller then falls back to
+    temperature)."""
+    shared = _shared_gpu_sample()
+    if shared is not None and shared.get("util_pct") is not None:
+        try:
+            return float(shared["util_pct"])
+        except Exception:
+            pass
     try:
         exe = shutil.which("nvidia-smi")
         if exe:
@@ -269,7 +295,15 @@ def _read_gpu_temp_c(hwinfo_gpu_temp_c: float | None = None) -> float | None:
     `hwinfo_gpu_temp_c` is the pre-fetched HWiNFO `gpu_temp_c` (from a single
     hwinfo.summary() in _gather_pulse). When the caller supplies it we skip the
     in-function HWiNFO read so the shared-memory block is parsed once per pulse;
-    the nvidia-smi-first ordering is preserved either way."""
+    the nvidia-smi-first ordering is preserved either way. v3.0.26:
+    core.gpu_sampler's NVML reading (the same counter nvidia-smi prints)
+    comes before nvidia-smi, which then runs only without NVML."""
+    shared = _shared_gpu_sample()
+    if shared is not None and shared.get("temp_c") is not None:
+        try:
+            return float(shared["temp_c"])
+        except Exception:
+            pass
     try:
         exe = shutil.which("nvidia-smi")
         if exe:
@@ -1555,7 +1589,25 @@ def _gpu_busy_processes() -> list | None:
 def _read_pinned_gpus() -> set | None:
     """The indices of the GPUs at or over GPU_UTIL_ABNORMAL_PCT right now
     (`nvidia-smi --query-gpu=index,utilization.gpu`), or None when that
-    cannot be read. Never raises."""
+    cannot be read. Never raises. v3.0.26: from core.gpu_sampler's per-card
+    NVML reading first (NVML numbers the cards in PCI order, as nvidia-smi
+    and its pmon do); nvidia-smi only without NVML."""
+    shared = _shared_gpu_sample()
+    if shared is not None:
+        try:
+            pinned_nvml: set = set()
+            seen_nvml = False
+            for g in shared.get("gpus") or ():
+                util = g.get("util_pct")
+                if util is None or g.get("index") is None:
+                    continue
+                seen_nvml = True
+                if float(util) >= GPU_UTIL_ABNORMAL_PCT:
+                    pinned_nvml.add(int(g["index"]))
+            if seen_nvml:
+                return pinned_nvml
+        except Exception:
+            pass
     try:
         exe = shutil.which("nvidia-smi")
         if not exe:

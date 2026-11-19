@@ -212,13 +212,28 @@ def _read_cpu_ram() -> tuple[float, float]:
         return 0.0, 0.0
 
 
+# v3.0.26 (reliability-05): core.gpu_sampler's in-process NVML reading is
+# asked first (no process start; shared with the HUD panel and the pulse
+# strip); nvidia-smi runs only without NVML. The reading may be this old.
+GPU_SHARED_MAX_AGE_S = 2.0
+
+
 def _read_gpu_util_pct() -> float | None:
-    """Best-effort GPU utilization percent (0-100), via nvidia-smi.
+    """Best-effort GPU utilization percent (0-100): core.gpu_sampler's NVML
+    reading (v3.0.26), else nvidia-smi.
 
     Utilization is what the diagnostics readout surfaces now (temps are reliably
-    fine on this rig). Only nvidia-smi exposes a load percentage — psutil sensor
-    blocks report *temperature*, not utilization, so they're not consulted here.
-    Returns the busiest GPU's load, or None when nvidia-smi is unavailable."""
+    fine on this rig). Only NVML / nvidia-smi expose a load percentage — psutil
+    sensor blocks report *temperature*, not utilization, so they're not
+    consulted here. Returns the busiest GPU's load, or None when neither is
+    available."""
+    try:
+        from core import gpu_sampler
+        shared = gpu_sampler.util_pct(GPU_SHARED_MAX_AGE_S)
+        if shared is not None:
+            return float(shared)
+    except Exception:
+        pass
     try:
         exe = shutil.which("nvidia-smi")
         if exe:
