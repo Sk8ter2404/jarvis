@@ -61,6 +61,24 @@ PACKET = 160                    # 10 ms at 16 kHz
 RECORDER_BUFFER_FRAMES = 3200
 # A capture gap that still happens is counted and logged at most this often.
 GAP_REPORT_EVERY_S = 300.0
+# TIMELINE SLIPS (3.0.26, diagnostics only). The canceller reads the ring by
+# SAMPLE COUNT after it anchors, so the ring must hold exactly one sample per
+# 1/16000 s of what the PC played. soundcard keeps that only approximately:
+# while the endpoint delivers no packets it pads zeros for the idle time it
+# measured, but only once the idle passes 4 device periods, so the last
+# partial idle before the audio resumes is never padded (samples LOST), and
+# a packet that reads empty is padded with a block of zeros at once (samples
+# ADDED). Neither raises a discontinuity, so nothing re-anchors; the echo then
+# sits somewhere else on the reference and only the canceller's GCC re-
+# measure finds it - which is what the live log's delay swings of 100-300 ms
+# and 6-16 realigns a minute look like. Each SLIP_BUCKET_S the earliest-
+# arrival time base of the packets in that second is compared with the
+# level it held; a move of SLIP_MIN_S or more that the next bucket confirms
+# is one slip (signed: + = the ring ran ahead of the clock). Counted for the
+# canceller's minute line; nothing changes.
+SLIP_BUCKET_S = 1.0
+SLIP_MIN_S = 0.008
+SLIP_CONFIRM_S = 0.004          # the confirming bucket agrees within this
 RESOLVE_EVERY_S = 5.0
 TIMEBASE_WINDOW_S = 10.0
 BACKOFF_MIN_S, BACKOFF_MAX_S = 0.5, 5.0
@@ -250,6 +268,12 @@ class LoopbackReference:
         self.opens = 0
         self.capture_gaps = 0          # lost stretches of capture (see above)
         self._gaps_reported = 0
+        # Timeline slips (SLIP_BUCKET_S): count, and the signed / absolute
+        # total in ms (+ = ring ahead of the clock: samples added).
+        self.slips = 0
+        self.slip_ms_net = 0.0
+        self.slip_ms_abs = 0.0
+        self._slip_reset()
         self._fallback_at = None          # last pyaudiowpatch try (monotonic)
         self._episode_logged = False
         self.last_error = ""
@@ -285,7 +309,49 @@ class LoopbackReference:
                     self._tb.popleft()
                 self._t0 = min(b for _t, b in self._tb)
                 self._last_write = float(t)
+                self._note_slip(float(t), base)
                 self._cv.notify_all()
+        except Exception:
+            pass
+
+    # ── timeline slips (diagnostics, SLIP_BUCKET_S) ──────────────────────
+    def _slip_reset(self) -> None:
+        self._slip_t0 = None           # this bucket's first arrival
+        self._slip_min = None          # its earliest-arrival base
+        self._slip_level = None        # the confirmed level
+        self._slip_pending = None      # a move waiting for its confirmation
+
+    def _note_slip(self, t: float, base: float) -> None:
+        """One packet's base (t - n_written / sr), under self._cv. Never
+        raises."""
+        try:
+            if self._slip_t0 is None:
+                self._slip_t0, self._slip_min = t, base
+                return
+            if t - self._slip_t0 < SLIP_BUCKET_S:
+                if base < self._slip_min:
+                    self._slip_min = base
+                return
+            cur, self._slip_t0, self._slip_min = self._slip_min, t, base
+            level = self._slip_level
+            if level is None:
+                self._slip_level = cur
+                return
+            move = cur - level              # + = later base = samples lost
+            if abs(move) < SLIP_MIN_S:
+                self._slip_pending = None
+                self._slip_level = cur      # follows the clock drift
+                return
+            pend = self._slip_pending
+            if pend is not None and abs(cur - pend) <= SLIP_CONFIRM_S:
+                ms = -move * 1000.0         # + = the ring ran ahead
+                self.slips += 1
+                self.slip_ms_net += ms
+                self.slip_ms_abs += abs(ms)
+                self._slip_level = cur
+                self._slip_pending = None
+            else:
+                self._slip_pending = cur    # one late bucket is jitter
         except Exception:
             pass
 
@@ -296,6 +362,7 @@ class LoopbackReference:
             self.gap_seq += 1
             self._tb.clear()
             self._t0 = None
+            self._slip_reset()
 
     def read(self, start: int, n: int) -> "np.ndarray | None":
         """Samples [start, start+n), or None when any of them is not in the
@@ -384,6 +451,9 @@ class LoopbackReference:
                 "endpoint": self.endpoint, "n_written": self.n_written,
                 "gap_seq": self.gap_seq, "opens": self.opens,
                 "failures": self.failures, "capture_gaps": self.capture_gaps,
+                "slips": self.slips,
+                "slip_ms_net": round(self.slip_ms_net, 1),
+                "slip_ms_abs": round(self.slip_ms_abs, 1),
                 "age_s": self.age_s(),
                 "last_error": self.last_error}
 

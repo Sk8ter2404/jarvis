@@ -39767,9 +39767,76 @@ def _listen_tick() -> None:
                      f"{st.get('delay_clamped')} clamped)"
                      if "realign_rejected" in st else "")
                   + ("" if not _aec_ref_missing[0]
-                     else " - reference MISSING (protected playback?)"))
+                     else " - reference MISSING (protected playback?)")
+                  + _media_aec_minute_extra(st, fr))
     except Exception:
         pass
+
+
+# ── the canceller's minute-line diagnostics (3.0.26, numbers only) ────────
+# speech-aec-ineffective: 85 % of the 11-16..11-17 [media-aec] minutes read
+# "NOT converging", but many of them had nothing to judge (a headset, the
+# reference missing, a quiet room), and the line could not say WHY the
+# others failed. This tail says whether the minute is scoreable and counts,
+# per minute, what moves the canceller's timeline: its re-anchors, blocks
+# cancelled against a late reference, filter resets, realigns, the
+# loopback's timeline slips (core/loopback_ref SLIP_*) and the bus's input
+# overflows / queue drops (core/mic_bus). Nothing here changes a frame.
+_aec_minute_prev: list = [None]
+_AEC_SCOREABLE_RAW = 0.05      # under this share of frames over VAD: quiet
+
+
+def _media_aec_minute_extra(st: dict, fr: dict) -> str:
+    """'; why <reason>' when the minute says nothing about the canceller
+    (headset / no loopback / reference missing / reference stale / no
+    frames / quiet), then '; per minute: ...' counters since the last line.
+    '' on any fault. Never raises."""
+    try:
+        why = _media_aec_bypass()
+        if not why and _aec_ref_missing[0]:
+            why = "reference missing"
+        if not why and _loopback_stale():
+            why = "reference stale"
+        n = int(fr.get("n", 0) or 0)
+        if not why and n <= 0:
+            why = "no frames"
+        if not why and float(fr.get("raw", 0)) / max(1, n) < _AEC_SCOREABLE_RAW:
+            why = "quiet"
+        cur = {k: float(st.get(k, 0) or 0)
+               for k in ("sessions", "ref_late", "resets", "realigns",
+                         "realign_rejected")}
+        lb = _loopback_obj[0]
+        if lb is not None:
+            ls = lb.status()
+            cur["slips"] = float(ls.get("slips", 0) or 0)
+            cur["slip_ms_net"] = float(ls.get("slip_ms_net", 0) or 0)
+            cur["capture_gaps"] = float(ls.get("capture_gaps", 0) or 0)
+        bus = _mic_bus_obj[0]
+        if bus is not None:
+            bs = bus.status()
+            cur["mic_overflows"] = float(bs.get("input_overflows", 0) or 0)
+            cur["mic_drops"] = float(bs.get("callback_dropped", 0) or 0)
+        prev, _aec_minute_prev[0] = _aec_minute_prev[0], cur
+        prev = prev or {}
+
+        def d(k):
+            return cur.get(k, 0.0) - prev.get(k, 0.0)
+
+        parts = [f"re-anchors {d('sessions'):.0f}",
+                 f"realigns {d('realigns'):.0f}",
+                 f"ref late {d('ref_late'):.0f}",
+                 f"resets {d('resets'):.0f}"]
+        if "slips" in cur:
+            parts.append(f"ref slips {d('slips'):.0f} "
+                         f"(net {d('slip_ms_net'):+.0f} ms, gaps "
+                         f"{d('capture_gaps'):.0f})")
+        if "mic_overflows" in cur:
+            parts.append(f"mic overflows {d('mic_overflows'):.0f}, "
+                         f"drops {d('mic_drops'):.0f}")
+        return ((f"; why {why}" if why else "; scoreable")
+                + "; per minute: " + ", ".join(parts))
+    except Exception:
+        return ""
 
 
 def _listen_ambient_wake_hit() -> None:

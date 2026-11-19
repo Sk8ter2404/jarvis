@@ -884,6 +884,74 @@ class MediaTestAndLogTests(_Base):
         self.assertTrue(any("[listen-media] 61 s with media" in s
                             and "captures 2" in s for s in lines), lines)
 
+    def _aec_fakes(self, endpoint="Speakers (Desk)"):
+        bc = self.bc
+        lb = mock.Mock(n_written=16000, endpoint=endpoint, running=False)
+        lb.age_s.return_value = 0.05
+        lb.status.return_value = {"slips": 3, "slip_ms_net": -42.0,
+                                  "capture_gaps": 1}
+        bus = mock.Mock()
+        bus.status.return_value = {"input_overflows": 5,
+                                   "callback_dropped": 0}
+        bus.take_closed_s.return_value = 0.0
+        self._p(bc, "_loopback_obj", [lb])
+        self._p(bc, "_mic_bus_obj", [bus])
+        self._p(bc, "_aec_ref_missing", [False])
+        self._p(bc, "_aec_minute_prev", [{
+            "sessions": 1, "ref_late": 10, "resets": 0, "realigns": 4,
+            "realign_rejected": 0, "slips": 1, "slip_ms_net": -12.0,
+            "capture_gaps": 1, "mic_overflows": 2, "mic_drops": 0}])
+        return lb
+
+    def test_the_canceller_minute_line_says_why_and_counts(self):
+        # speech-aec-ineffective (3.0.26): a minute with nothing to judge
+        # says why, and the timeline movers are counted per minute.
+        bc = self.bc
+        lb = self._aec_fakes()
+        st = {"sessions": 3, "ref_late": 40, "resets": 1, "realigns": 10,
+              "realign_rejected": 0}
+        tail = bc._media_aec_minute_extra(st, {"n": 100, "raw": 40, "sup": 30})
+        self.assertIn("; scoreable; per minute: ", tail)
+        self.assertIn("re-anchors 2, realigns 6, ref late 30, resets 1", tail)
+        self.assertIn("ref slips 2 (net -30 ms, gaps 0)", tail)
+        self.assertIn("mic overflows 3, drops 0", tail)
+        self.assertIn("; why quiet", bc._media_aec_minute_extra(
+            st, {"n": 100, "raw": 2, "sup": 2}))
+        self.assertIn("; why no frames", bc._media_aec_minute_extra(
+            st, {"n": 0, "raw": 0, "sup": 0}))
+        bc._aec_ref_missing[0] = True
+        self.assertIn("; why reference missing", bc._media_aec_minute_extra(
+            st, {"n": 100, "raw": 40, "sup": 30}))
+        lb.endpoint = "Headset Earphone (Synthetic)"
+        self.assertIn("; why headset", bc._media_aec_minute_extra(
+            st, {"n": 100, "raw": 40, "sup": 30}))
+
+    def test_the_minute_line_carries_the_diagnostics(self):
+        bc = self.bc
+        self._aec_fakes()
+        now = [1000.0]
+        bc._listen_counter = bc._lm.MinuteCounter(clock=lambda: now[0])
+        aec = mock.Mock()
+        aec.erle_db.return_value = 2.0
+        aec.status.return_value = {
+            "erle_db": 2.0, "delay_ms": -120.0, "drift_ppm": -50.0,
+            "converging": False, "sessions": 3, "ref_late": 40, "resets": 1,
+            "realigns": 10, "realign_rejected": 0, "delay_clamped": 0}
+        self._p(bc, "_media_aec_obj", [aec])
+        self._p(bc, "MEDIA_AEC_MODE", "on", create=True)
+        self._p(bc, "_pc_media_playing", lambda refresh=True: True)
+        self._p(bc, "_media_aec_check_reference", lambda *a, **k: None)
+        self._p(bc, "_listen_aec_frames", {"raw": 30, "sup": 25, "n": 100})
+        with mock.patch("builtins.print") as p:
+            bc._listen_tick()
+            now[0] = 1061.0
+            bc._listen_tick()
+        lines = [str(c.args[0]) for c in p.call_args_list
+                 if "[media-aec]" in str(c.args[0])]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("NOT converging", lines[0])
+        self.assertIn("; scoreable; per minute: re-anchors 2", lines[0])
+
     def test_the_shadow_turn_peak(self):
         bc = self.bc
         track = bc._lm.ScoreTrack()
