@@ -3,8 +3,9 @@
   * webcam_users_now(): WHO IS USING a webcam, from Windows' camera privacy
     log - the evidence a camera is held. "Which camera apps are RUNNING" was
     wrong 23 of 23 times that day.
-  * open_camera(): opens ONCE in the final format - the pixel format (MJPG)
-    first, then width, then height, all before the first read.
+  * open_camera(): opens ONCE in the final format, all before the first read.
+    MSMF: pixel format (MJPG), width, height. DirectShow (2026-11-17): width,
+    height, THEN the pixel format, because a size change resets it to YUY2.
   * open_camera(outcome=...): says WHY a failed open failed ("no-frame" is the
     shape of a held device on MSMF; "not-opened" the shape of a vanished one).
 
@@ -178,6 +179,109 @@ class OpenOnceInTheFinalFormatTests(unittest.TestCase):
         cb.open_camera(0, backend="msmf", cv2_mod=cv2)
         self.assertFalse([e for e in cv2.log if e[0] == "set"
                           and e[1] == cv2.CAP_PROP_FOURCC])
+
+
+_YUY2 = "YUY2"
+
+
+class _RenegotiatingCap(_Cap):
+    """A DirectShow capture that models the 2026-11-17 measurement: any
+    width/height change renegotiates the media type and resets the format to
+    uncompressed YUY2; setting the format afterwards sticks."""
+
+    def __init__(self, log, frames=True):
+        super().__init__(log, frames)
+        self.fourcc = _YUY2
+        self.w, self.h = 640, 480
+
+    def set(self, prop, val):
+        self.log.append(("set", prop, val))
+        if prop == _Cv2.CAP_PROP_FRAME_WIDTH:
+            self.w = int(val)
+            self.fourcc = _YUY2
+        elif prop == _Cv2.CAP_PROP_FRAME_HEIGHT:
+            self.h = int(val)
+            self.fourcc = _YUY2
+        elif prop == _Cv2.CAP_PROP_FOURCC:
+            self.fourcc = val
+        return True
+
+    def get(self, prop):
+        if prop == _Cv2.CAP_PROP_FOURCC:
+            v = 0
+            for i, ch in enumerate(self.fourcc):
+                v |= ord(ch) << (8 * i)
+            return float(v)
+        if prop == _Cv2.CAP_PROP_FRAME_WIDTH:
+            return float(self.w)
+        if prop == _Cv2.CAP_PROP_FRAME_HEIGHT:
+            return float(self.h)
+        return 0.0
+
+
+class _RenegotiatingCv2(_Cv2):
+    def VideoCapture(self, idx, api):
+        cap = _RenegotiatingCap(self.log, self._frames)
+        self.caps = getattr(self, "caps", []) + [cap]
+        return cap
+
+
+class DirectShowKeepsTheFormatTests(unittest.TestCase):
+    """The size change must not cost the requested format (measured 2026-11-17:
+    YUY2 at 1280x720 = 3.6-3.8 fps, MJPG = 15 fps in the same light)."""
+
+    def _open(self, backend, env=None):
+        cv2 = _RenegotiatingCv2()
+        logs: list = []
+        with mock.patch.dict(os.environ, env or {}, clear=False):
+            if not env:
+                os.environ.pop("JARVIS_CAMERA_FOURCC", None)
+            cap = cb.open_camera(0, backend=backend, width=1280, height=720,
+                                 require_frame=0.5, cv2_mod=cv2,
+                                 log=logs.append)
+        self.assertIsNotNone(cap)
+        return cv2, cap, logs
+
+    def test_dshow_ends_on_mjpg_at_the_requested_size(self):
+        cv2, cap, _ = self._open("dshow")
+        self.assertEqual(cap.fourcc, "MJPG")
+        self.assertEqual((cap.w, cap.h), (1280, 720))
+
+    def test_dshow_sets_size_before_the_format(self):
+        cv2, _cap, _ = self._open("dshow")
+        props = [e[1] for e in cv2.log if e[0] == "set"]
+        self.assertEqual(props[:3], [cv2.CAP_PROP_FRAME_WIDTH,
+                                     cv2.CAP_PROP_FRAME_HEIGHT,
+                                     cv2.CAP_PROP_FOURCC])
+        self.assertLess(cv2.log.index(("set", cv2.CAP_PROP_FOURCC, "MJPG")),
+                        cv2.log.index(("read",)))
+
+    def test_msmf_order_is_unchanged(self):
+        cv2, _cap, _ = self._open("msmf")
+        props = [e[1] for e in cv2.log if e[0] == "set"]
+        self.assertEqual(props[:3], [cv2.CAP_PROP_FOURCC,
+                                     cv2.CAP_PROP_FRAME_WIDTH,
+                                     cv2.CAP_PROP_FRAME_HEIGHT])
+
+    def test_the_negotiated_format_is_logged_once_per_open(self):
+        _cv2, _cap, logs = self._open("dshow")
+        lines = [m for m in logs if "negotiated" in m]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("MJPG 1280x720", lines[0])
+        self.assertNotIn("NOT HONOURED", lines[0])
+
+    def test_the_escape_hatch_leaves_the_driver_format(self):
+        cv2, cap, logs = self._open("dshow", {"JARVIS_CAMERA_FOURCC": "none"})
+        self.assertEqual(cap.fourcc, _YUY2)
+        self.assertNotIn(cv2.CAP_PROP_FOURCC,
+                         [e[1] for e in cv2.log if e[0] == "set"])
+        self.assertNotIn("NOT HONOURED", " ".join(logs))
+
+    def test_a_cap_without_get_still_opens(self):
+        cv2 = _Cv2()              # the plain fake has no get()
+        cap = cb.open_camera(0, backend="dshow", width=640, height=480,
+                             cv2_mod=cv2, log=lambda m: None)
+        self.assertIsNotNone(cap)
 
 
 class OutcomeTests(unittest.TestCase):
