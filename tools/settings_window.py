@@ -1408,8 +1408,10 @@ SCHEMA: dict[str, dict] = {
                 "(data/turn_check.jsonl holds kinds and action names, never "
                 "your words); on = say 'One moment, sir.' and retry that "
                 "turn once on Claude (a paid cloud call; needs Claude allowed "
-                "for chat: backend claude, a key, chat not routed local); "
-                "off = no check. Applies on the next start.",
+                "for chat: backend claude, a key, chat not routed local) - "
+                "or, when Claude is not allowed and a false 'I did it' was "
+                "actually spoken, say 'Correction, sir - I haven't actually "
+                "done that yet.'; off = no check. Applies on the next start.",
     },
     "TURN_CHECK_ESCALATE_MODEL": {
         "tab": "ai", "label": "Retry a failed turn on", "type": "enum",
