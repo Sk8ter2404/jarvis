@@ -232,15 +232,41 @@ def _read_uptime_seconds() -> float:
         return 0.0
 
 
+# v3.0.26 (reliability-05): the GPU readers below ask core.gpu_sampler first
+# (NVML in this process: no process start, one cached reading shared with
+# the HUD's VRAM panel and the diagnostics panel). nvidia-smi runs only where
+# NVML is unavailable. The reading may be this old: under the 5 s resample
+# gap of _qualify_gpu_reason, so its second sample is always a new one.
+GPU_SHARED_MAX_AGE_S = 1.0
+
+
+def _shared_gpu_sample() -> dict | None:
+    """core.gpu_sampler's reading (dict) or None without NVML. Never
+    raises."""
+    try:
+        from core import gpu_sampler
+        return gpu_sampler.sample(GPU_SHARED_MAX_AGE_S)
+    except Exception:
+        return None
+
+
 def _read_gpu_util_pct() -> float | None:
-    """Best-effort GPU utilization percent (0-100), via nvidia-smi.
+    """Best-effort GPU utilization percent (0-100): core.gpu_sampler's NVML
+    reading (v3.0.26), else nvidia-smi.
 
     Utilization is what the HUD now surfaces (temps are reliably fine on this
-    rig). nvidia-smi is the only source that exposes a load percentage —
-    HWiNFO/psutil sensor blocks report *temperature*, not utilization, so they
-    are deliberately NOT consulted here; the temperature fallback lives in the
-    separate `_read_gpu_temp_c`. Returns the busiest GPU's load, or None when
-    nvidia-smi is unavailable (caller then falls back to temperature)."""
+    rig). NVML / nvidia-smi are the only sources that expose a load
+    percentage — HWiNFO/psutil sensor blocks report *temperature*, not
+    utilization, so they are deliberately NOT consulted here; the temperature
+    fallback lives in the separate `_read_gpu_temp_c`. Returns the busiest
+    GPU's load, or None when neither is available (caller then falls back to
+    temperature)."""
+    shared = _shared_gpu_sample()
+    if shared is not None and shared.get("util_pct") is not None:
+        try:
+            return float(shared["util_pct"])
+        except Exception:
+            pass
     try:
         exe = shutil.which("nvidia-smi")
         if exe:
@@ -274,7 +300,15 @@ def _read_gpu_temp_c(hwinfo_gpu_temp_c: float | None = None) -> float | None:
     `hwinfo_gpu_temp_c` is the pre-fetched HWiNFO `gpu_temp_c` (from a single
     hwinfo.summary() in _gather_pulse). When the caller supplies it we skip the
     in-function HWiNFO read so the shared-memory block is parsed once per pulse;
-    the nvidia-smi-first ordering is preserved either way."""
+    the nvidia-smi-first ordering is preserved either way. v3.0.26:
+    core.gpu_sampler's NVML reading (the same counter nvidia-smi prints)
+    comes before nvidia-smi, which then runs only without NVML."""
+    shared = _shared_gpu_sample()
+    if shared is not None and shared.get("temp_c") is not None:
+        try:
+            return float(shared["temp_c"])
+        except Exception:
+            pass
     try:
         exe = shutil.which("nvidia-smi")
         if exe:
@@ -784,6 +818,44 @@ _MEM_SELF_NAME = "my own process"
 _MEM_SKIP = frozenset({"", "memory compression", "system idle process",
                        "idle", "system", "secure system", "registry"})
 
+# ─── which python.exe is which (v3.0.26, overhaul finding reliability-08) ─
+# The 11-16/17 RAM alerts said "Python at 12 / 17 / 18 / 22 / 28 GB": EVERY
+# python.exe / pythonw.exe but JARVIS's own pid summed into one "Python" -
+# JARVIS's own children (the clone voice server, up since 11-13; the HUD; the
+# reticle overlay; the tray) together with whatever else ran Python - and
+# nothing in the log said which pid it was. A Python process is now named by
+# what it RUNS (its command line's script or -m module): JARVIS's own
+# scripts by role ("my voice server", "my HUD", "the test runner"), any other
+# script as "the Python script <name>"; only one whose command line cannot be
+# read stays plain "Python". _log_memory_hogs puts the top pids in the log
+# when the RAM alert fires.
+_PY_IMAGES = frozenset({"python", "pythonw", "python3", "py", "pyw"})
+_PY_ROLE_NAMES = {
+    "bobert_companion": "another copy of me",
+    "jarvis_unified_hud": "my HUD",
+    "jarvis_hud": "my HUD",
+    "jarvis_reticle": "my reticle overlay",
+    "jarvis_air_cursor": "my air cursor",
+    "holographic_hud_v2": "my holographic HUD",
+    "arc_reactor_status_hud": "my status HUD",
+    "tray": "my tray icon",
+    "kinect_bridge": "my Kinect bridge",
+    "web_interface": "my web interface",
+    "settings_window": "my settings window",
+    "clone_tts_server": "my voice server",
+    "run_tests": "the test runner",
+    "run_tests_ci_sim": "the test runner",
+    "unittest": "the test runner",
+    "pytest": "the test runner",
+}
+_PY_ROLE_VOICE_SERVER = "my voice server"
+# Interpreter options that take the NEXT argument as their value.
+_PY_OPTS_WITH_VALUE = frozenset({"-W", "-X", "-Q"})
+# At most this many Python processes have their command line read per table
+# (biggest first): a psutil cmdline read is ~1 ms each.
+MEM_PY_CMDLINE_MAX = 32
+MEM_HOGS_LOG_TOP = 3
+
 
 def _turn_words() -> str:
     """The owner's words this turn ("" outside a turn, a proactive dispatch,
@@ -901,14 +973,140 @@ def _read_process_memory() -> list:
     return rows if rows else _psutil_process_memory()
 
 
-def _mem_app_name(name: str) -> str:
-    """The spoken app name for a process image, "" for one to leave out."""
+def _image_stem(name) -> str:
+    """'C:\\...\\pythonw.exe' / 'pythonw.exe' -> 'pythonw' (lower case)."""
+    stem = os.path.basename(str(name or "").strip().replace("\\", "/"))
+    if stem.lower().endswith(".exe"):
+        stem = stem[:-4]
+    return stem.lower()
+
+
+def _is_python_image(name) -> bool:
+    return _image_stem(name) in _PY_IMAGES
+
+
+def _python_script(argv) -> str:
+    """What a Python command line runs: the script's stem
+    ('.../clone_tts_server.py' -> 'clone_tts_server'), the last part of a
+    -m module ('tools.settings_window' -> 'settings_window'), '' for -c code,
+    a bare interpreter or anything unreadable. Never raises."""
+    try:
+        args = [str(a) for a in (argv or ())]
+        i = 1
+        while i < len(args):
+            a = args[i]
+            if a == "-c":
+                return ""
+            if a == "-m":
+                mod = args[i + 1] if i + 1 < len(args) else ""
+                return mod.rsplit(".", 1)[-1].strip().lower()
+            if a.startswith("-m") and len(a) > 2:
+                return a[2:].rsplit(".", 1)[-1].strip().lower()
+            if a in _PY_OPTS_WITH_VALUE:
+                i += 2
+                continue
+            if a.startswith("-"):
+                i += 1
+                continue
+            stem = os.path.basename(a.replace("\\", "/"))
+            for ext in (".pyw", ".py"):
+                if stem.lower().endswith(ext):
+                    stem = stem[:-len(ext)]
+                    break
+            return stem.strip().lower()
+        return ""
+    except Exception:
+        return ""
+
+
+def _voice_server_stem() -> str:
+    """The script stem of VOICE_CLONE_SERVER_CMD (the clone voice server this
+    box runs, whatever its file is called), '' when unset or unreadable.
+    Never raises."""
+    try:
+        import core.config as _cfg
+        raw = getattr(_cfg, "VOICE_CLONE_SERVER_CMD", "") or ""
+        if isinstance(raw, (list, tuple)):
+            parts = [str(p) for p in raw]
+        else:
+            text = str(raw).strip()
+            if text.startswith("["):
+                import json as _json
+                parts = [str(p) for p in _json.loads(text)]
+            else:
+                import shlex
+                parts = shlex.split(text, posix=False)
+        for p in parts:
+            p = p.strip().strip('"').strip("'")
+            if p.lower().endswith((".py", ".pyw")):
+                return _python_script(["python", p])
+        return ""
+    except Exception:
+        return ""
+
+
+def _python_role(argv, voice_server: str = "") -> str:
+    """The spoken name of a Python process from its command line: a JARVIS
+    role (_PY_ROLE_NAMES, or the configured voice server's script), "the
+    Python script <name>" for anything else that runs a script, "" when
+    nothing can be read from it. Never raises."""
+    try:
+        stem = _python_script(argv)
+        if not stem:
+            return ""
+        if voice_server and stem == voice_server:
+            return _PY_ROLE_VOICE_SERVER
+        if stem in _PY_ROLE_NAMES:
+            return _PY_ROLE_NAMES[stem]
+        words = " ".join(stem.replace("_", " ").replace("-", " ").split())
+        return f"the Python script {words}" if words else ""
+    except Exception:
+        return ""
+
+
+def _python_cmdlines(rows, limit: int = MEM_PY_CMDLINE_MAX) -> dict:
+    """{pid: argv} for the Python processes in a process table (the
+    ``limit`` biggest by working set), read with psutil. A process that is
+    gone or denied is simply absent. Never raises."""
+    out: dict = {}
+    if not _HAS_PSUTIL:
+        return out
+    try:
+        py = []
+        for row in rows or ():
+            try:
+                pid, name, wset = int(row[0]), row[1], float(row[2])
+            except Exception:
+                continue
+            if _is_python_image(name):
+                py.append((wset, pid))
+        py.sort(reverse=True)
+        for _wset, pid in py[:max(0, int(limit))]:
+            try:
+                argv = psutil.Process(pid).cmdline()
+            except Exception:
+                continue
+            if argv:
+                out[pid] = list(argv)
+    except Exception:
+        return out
+    return out
+
+
+def _mem_app_name(name: str, argv=None, voice_server: str = "") -> str:
+    """The spoken app name for a process image, "" for one to leave out. A
+    Python process with a readable command line (``argv``) is named by what
+    it runs (_python_role), else it is "Python"."""
     stem = (name or "").strip()
     if stem.lower().endswith(".exe"):
         stem = stem[:-4]
     key = stem.lower()
     if key in _MEM_SKIP:
         return ""
+    if argv and key in _PY_IMAGES:
+        role = _python_role(argv, voice_server)
+        if role:
+            return role
     if key in _MEM_APP_NAMES:
         return _MEM_APP_NAMES[key]
     if stem.islower():
@@ -972,10 +1170,14 @@ def _python_label(pid: int) -> str:
 
 
 def _memory_users(procs=None, *, own_pid: int | None = None,
-                  top: int = MEM_USERS_TOP) -> list:
+                  top: int = MEM_USERS_TOP, cmdlines=None) -> list:
     """[(spoken app name, GB)] for the `top` apps holding the most RAM,
     biggest first, each at least MEM_USER_MIN_GB. `procs` is an injected
     [(pid, name, working_set_bytes)] (tests); None reads the live table.
+    `cmdlines` ({pid: argv}) names each Python process by what it runs
+    (v3.0.26); None reads them for the live table only (an injected table's
+    pids are not this box's), so an injected table without them keeps the
+    plain "Python" group.
 
     The metric is the WORKING SET (psutil rss): the pages actually in RAM,
     which is what the memory percent measures and what Task Manager's Memory
@@ -989,6 +1191,9 @@ def _memory_users(procs=None, *, own_pid: int | None = None,
     try:
         rows = _read_process_memory() if procs is None else procs
         own = os.getpid() if own_pid is None else int(own_pid)
+        if cmdlines is None:
+            cmdlines = _python_cmdlines(rows) if procs is None else {}
+        voice_server = _voice_server_stem() if cmdlines else ""
         totals: dict = {}
         py_reads = 0
         for row in rows or ():
@@ -996,7 +1201,8 @@ def _memory_users(procs=None, *, own_pid: int | None = None,
                 pid, name, wset = int(row[0]), str(row[1] or ""), float(row[2])
             except Exception:
                 continue
-            label = _MEM_SELF_NAME if pid == own else _mem_app_name(name)
+            label = (_MEM_SELF_NAME if pid == own else
+                     _mem_app_name(name, cmdlines.get(pid), voice_server))
             if not label or wset <= 0:
                 continue
             stem = name.strip().lower()
@@ -1040,6 +1246,86 @@ def _memory_users_sentence(users) -> str:
             return f"The biggest memory user is {bits[0]}."
         listed = ", ".join(bits[:-1]) + " and " + bits[-1]
         return f"The biggest memory users are {listed}."
+    except Exception:
+        return ""
+
+
+def _short_cmd(name, argv) -> str:
+    """A short, secret-free command for the log: the image, plus for Python
+    the script / -m module it runs ('pythonw clone_tts_server.py',
+    'python -m unittest'); never the rest of the arguments (a command line
+    can carry tokens or private paths). Never raises."""
+    try:
+        image = _image_stem(name) or "?"
+        if not (argv and image in _PY_IMAGES):
+            return image
+        args = [str(a) for a in argv]
+        if "-m" in args[1:]:
+            j = args.index("-m", 1)
+            if j + 1 < len(args):
+                return f"{image} -m {args[j + 1][:60]}"
+        stem = _python_script(args)
+        if not stem:
+            return image
+        for a in args[1:]:
+            base = os.path.basename(a.replace("\\", "/"))
+            if base.lower().startswith(stem) and base.lower().endswith(
+                    (".py", ".pyw")):
+                return f"{image} {base[:60]}"
+        return f"{image} {stem[:60]}"
+    except Exception:
+        return "?"
+
+
+def _memory_hogs_line(ram_pct, procs=None, *, own_pid: int | None = None,
+                      cmdlines=None, top: int = MEM_HOGS_LOG_TOP) -> str:
+    """One log line naming the ``top`` single processes by working set -
+    pid, GB, spoken name and short command - so a 22 GB process the RAM
+    alert names can be found afterwards:
+    '[mem-users] RAM 91%: pid 58684 22.1 GB my voice server (pythonw
+    clone_tts_server.py); pid 9001 8.0 GB my local brain model
+    (llama-server); ...'. '' when there is nothing to say. Never raises."""
+    try:
+        rows = _read_process_memory() if procs is None else procs
+        own = os.getpid() if own_pid is None else int(own_pid)
+        if cmdlines is None:
+            cmdlines = _python_cmdlines(rows) if procs is None else {}
+        voice_server = _voice_server_stem() if cmdlines else ""
+        ranked = []
+        for row in rows or ():
+            try:
+                pid, name, wset = int(row[0]), str(row[1] or ""), float(row[2])
+            except Exception:
+                continue
+            if wset <= 0 or _image_stem(name) in _MEM_SKIP:
+                continue
+            ranked.append((wset, pid, name))
+        ranked.sort(reverse=True)
+        bits = []
+        for wset, pid, name in ranked[:max(0, int(top))]:
+            argv = cmdlines.get(pid)
+            label = (_MEM_SELF_NAME if pid == own else
+                     _mem_app_name(name, argv, voice_server)) or name
+            bits.append(f"pid {pid} {wset / (1024 ** 3):.1f} GB {label} "
+                        f"({_short_cmd(name, argv)})")
+        if not bits:
+            return ""
+        return (f"  [mem-users] RAM {float(ram_pct):.0f}%: "
+                + "; ".join(bits))
+    except Exception:
+        return ""
+
+
+def _log_memory_hogs(ram_pct) -> str:
+    """Print _memory_hogs_line for the live process table (the RAM alert
+    calls this when it fires, so the culprit's pid is on record even when
+    the spoken alert is held and dropped). Returns the line. Never
+    raises."""
+    try:
+        line = _memory_hogs_line(ram_pct)
+        if line:
+            print(line)
+        return line
     except Exception:
         return ""
 
@@ -1425,7 +1711,25 @@ def _gpu_busy_processes() -> list | None:
 def _read_pinned_gpus() -> set | None:
     """The indices of the GPUs at or over GPU_UTIL_ABNORMAL_PCT right now
     (`nvidia-smi --query-gpu=index,utilization.gpu`), or None when that
-    cannot be read. Never raises."""
+    cannot be read. Never raises. v3.0.26: from core.gpu_sampler's per-card
+    NVML reading first (NVML numbers the cards in PCI order, as nvidia-smi
+    and its pmon do); nvidia-smi only without NVML."""
+    shared = _shared_gpu_sample()
+    if shared is not None:
+        try:
+            pinned_nvml: set = set()
+            seen_nvml = False
+            for g in shared.get("gpus") or ():
+                util = g.get("util_pct")
+                if util is None or g.get("index") is None:
+                    continue
+                seen_nvml = True
+                if float(util) >= GPU_UTIL_ABNORMAL_PCT:
+                    pinned_nvml.add(int(g["index"]))
+            if seen_nvml:
+                return pinned_nvml
+        except Exception:
+            pass
     try:
         exe = shutil.which("nvidia-smi")
         if not exe:

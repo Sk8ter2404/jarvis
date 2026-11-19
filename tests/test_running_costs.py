@@ -77,6 +77,16 @@ class PowerQueryTests(unittest.TestCase):
         self.assertLessEqual(kwargs["timeout"], 5)
         self.assertEqual(kwargs["creationflags"], rc._NO_WINDOW)
 
+    def test_the_shared_nvml_reading_starts_no_process(self):
+        # v3.0.26 (reliability-05): core.gpu_sampler's power reading first.
+        from core import gpu_sampler
+        fake = _Run(stdout="999")
+        with mock.patch.object(rc.subprocess, "run", fake), \
+                mock.patch.object(gpu_sampler, "sample",
+                                  return_value={"power_w": 123.4}):
+            self.assertAlmostEqual(rc.gpu_watts(), 123.4)
+        self.assertEqual(fake.calls, [])
+
     def test_missing_binary_is_none(self):
         fake = _Run(exc=FileNotFoundError("nvidia-smi"))
         with mock.patch.object(rc.subprocess, "run", fake):

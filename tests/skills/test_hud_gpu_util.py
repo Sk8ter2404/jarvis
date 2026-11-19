@@ -220,6 +220,51 @@ class _HudParseBase(unittest.TestCase):
             self.assertEqual(self.cls._read_gpu_util(s), 63.0)
         which.assert_not_called()
 
+    # ── v3.0.26 (reliability-05): one shared NVML reading, no spawn ────────
+    def _drive_sample(self, s, now, *, shared=None, smi_out="55\n"):
+        """Run the worker body (_sample_gpu_util) once at wall time ``now``
+        with core.gpu_sampler answering ``shared``; returns (value, run)."""
+        proc = types.SimpleNamespace(stdout=smi_out)
+        with mock.patch.object(self.mod, "_shared_gpu_util",
+                               return_value=shared), \
+                mock.patch.object(self.mod.time, "time", return_value=now), \
+                mock.patch.object(self.mod.shutil, "which",
+                                  return_value="nvidia-smi"), \
+                mock.patch.object(self.mod.subprocess, "run",
+                                  return_value=proc) as run:
+            value = s._sample_gpu_util()
+        setattr(s, self.UTIL_FIELD, value)
+        return value, run
+
+    def test_the_shared_nvml_reading_starts_no_process(self):
+        s = self._fake_self()
+        value, run = self._drive_sample(s, 10_000.0, shared=42.0)
+        self.assertEqual(value, 42.0)
+        run.assert_not_called()
+
+    def test_without_nvml_nvidia_smi_runs_at_most_every_fallback_interval(self):
+        # Was once per GPU_CACHE_SECONDS (1 s), all day.
+        self.assertGreaterEqual(self.mod.GPU_SMI_FALLBACK_S, 5.0)
+        s = self._fake_self()
+        t0 = 10_000.0
+        runs = 0
+        for dt in (0.0, 1.0, 2.0, 3.0, 4.0):
+            value, run = self._drive_sample(s, t0 + dt)
+            runs += run.call_count
+            self.assertEqual(value, 55.0)       # the last reading stands
+        self.assertEqual(runs, 1)
+        value, run = self._drive_sample(s, t0 + self.mod.GPU_SMI_FALLBACK_S,
+                                        smi_out="60\n")
+        self.assertEqual((value, run.call_count), (60.0, 1))
+
+    def test_the_real_sampler_is_asked_first(self):
+        # _shared_gpu_util reads core.gpu_sampler (not a stub of it).
+        from core import gpu_sampler
+        with mock.patch.object(gpu_sampler, "util_pct",
+                               return_value=17.0) as up:
+            self.assertEqual(self.mod._shared_gpu_util(1.0), 17.0)
+        up.assert_called_once_with(1.0)
+
     # ── colour-scale + threshold contract ───────────────────────────────────
     def test_gpu_cache_is_short_for_fast_utilization(self):
         # Utilization swings fast; the cache must be ≤ ~1 s (was 4 s for temp).
@@ -236,6 +281,23 @@ class UnifiedHudGpuUtilTests(_HudParseBase):
         # WARN 70 / CRIT 90 on a 0-100 load scale (was 70/82 °C). A 0-100 value
         # must never hit a 30-95 temp band — crit at 90 is the guard.
         self.assertEqual((self.mod.GPU_WARN, self.mod.GPU_CRIT), (70.0, 90.0))
+
+    def test_a_hidden_hud_samples_nothing(self):
+        # v3.0.26: _on_tick refreshes before its visibility check, so the GPU
+        # was sampled all day with the HUD hidden. Hidden: no sample thread.
+        s = self._fake_self()
+        s.isVisible = lambda: False
+        with mock.patch.object(self.mod.time, "time", return_value=10_000.0), \
+                mock.patch.object(self.mod.threading, "Thread",
+                                  side_effect=_NoStartThread) as thread:
+            self.assertIsNone(self.cls._read_gpu_util(s))
+        thread.assert_not_called()
+        s.isVisible = lambda: True
+        with mock.patch.object(self.mod.time, "time", return_value=10_001.0), \
+                mock.patch.object(self.mod.threading, "Thread",
+                                  side_effect=_NoStartThread) as thread:
+            self.cls._read_gpu_util(s)
+        thread.assert_called_once()
 
 
 class ArcReactorGpuUtilTests(_HudParseBase):

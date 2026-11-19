@@ -88,7 +88,16 @@ def parse_power_draw(text: Optional[str]) -> Optional[float]:
 
 
 def gpu_watts() -> Optional[float]:
-    """Live draw of all NVIDIA GPUs in watts, or None with no reading."""
+    """Live draw of all NVIDIA GPUs in watts, or None with no reading.
+    v3.0.26 (reliability-05): core.gpu_sampler's in-process NVML reading
+    first (no nvidia-smi start); nvidia-smi only without NVML."""
+    try:
+        from core import gpu_sampler
+        s = gpu_sampler.sample(5.0)
+        if s and s.get("power_w") is not None:
+            return float(s["power_w"])
+    except Exception:
+        pass
     return parse_power_draw(_run_power_query())
 
 
