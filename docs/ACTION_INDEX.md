@@ -509,7 +509,7 @@ One row per action, sorted by name; aliases share their handler's location.
 | `printer_camera` | `skills/holographic_overlay/__init__.py:1019` | neither | — | no |
 | `printer_online` | `skills/network_deco.py:699` | **VERBATIM** | — | yes |
 | `proactive_announcer_status` | `skills/bambu_print_announcer.py:533` | **VERBATIM** | — | yes |
-| `project_status` | `skills/project_status.py:215` | **VERBATIM** | yes | yes |
+| `project_status` | `skills/project_status.py:276` | **VERBATIM** | yes | yes |
 | `pull_up_dossier` | `skills/dossier.py:666` | neither | — | yes |
 | `pull_up_file` | `skills/dossier.py:666` | neither | — | yes |
 | `pulse_hud` | `skills/holographic_overlay/__init__.py:1674` | neither | — | yes |

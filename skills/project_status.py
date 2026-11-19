@@ -30,7 +30,10 @@ and edit it.
 
 Rules:
   * No file, an empty list, or no named projects -> say there is no project
-    list yet. NEVER invent one and never fall back to the learned topics.
+    list yet. NEVER invent one. Only a general "what am I working on" may add
+    up to 3 projects learned from past conversations, said to be unconfirmed
+    (PROJECT_STATUS_LEARNED_FALLBACK, default on; garbled labels skipped);
+    a question naming a project never uses them.
   * A file that is not valid JSON / not the schema -> say it could not be read.
   * Finished projects are not read out as current work.
   * ``project_status, <name>`` reports just that project.
@@ -43,6 +46,7 @@ import datetime
 import json
 import os
 import re
+import sys
 
 # Finished sentence -> spoken as-is (load_skills folds this into the monolith's
 # SPEAK_RESULT_VERBATIM_ACTIONS). Without it the answer is computed and dropped.
@@ -212,13 +216,72 @@ def _count(n: int) -> str:
             7: "seven", 8: "eight", 9: "nine", 10: "ten"}.get(n, str(n))
 
 
+# When there is no list of his own, a general "what am I working on" may name
+# up to this many of the projects JARVIS picked up from past conversations,
+# said plainly as unconfirmed (live 2026-11-16 23:58:01: "I don't have a
+# project list yet" while 12 learned projects sat in memory). Never for a
+# question that names a project, and never a label the hygiene filter calls
+# garbled (core/topic_hygiene: the 2026-09-29 TV-audio "projects").
+LEARNED_FALLBACK_MAX = 3
+LEARNED_FALLBACK_DEFAULT = True
+
+
+def _learned_projects() -> list:
+    """Up to LEARNED_FALLBACK_MAX learned project labels, newest first, none
+    garbled. [] when the monolith is not loaded, the setting
+    PROJECT_STATUS_LEARNED_FALLBACK is off, or memory cannot be read. One
+    small local file read; never raises."""
+    try:
+        bc = sys.modules.get("bobert_companion")
+        if bc is None:
+            return []
+        on = getattr(bc, "PROJECT_STATUS_LEARNED_FALLBACK", None)
+        if not (on if isinstance(on, bool) else LEARNED_FALLBACK_DEFAULT):
+            return []
+        with bc._memory_lock:
+            mem = bc.load_memory()
+        raw = mem.get("projects") if isinstance(mem, dict) else None
+        if not isinstance(raw, list):
+            return []
+        try:
+            from core import topic_hygiene
+        except Exception:   # pragma: no cover - core is in-tree
+            topic_hygiene = None
+        out = []
+        for p in reversed(raw):
+            name = _text(p)
+            if not name or name.lower() in {o.lower() for o in out}:
+                continue
+            if topic_hygiene is not None and topic_hygiene.garbled_reason(name):
+                continue
+            out.append(name)
+            if len(out) >= LEARNED_FALLBACK_MAX:
+                break
+        return out
+    except Exception:
+        return []
+
+
+def _learned_answer() -> str:
+    names = _learned_projects()
+    if not names:
+        return NO_LIST
+    print(f"  [project_status] no project list; named {len(names)} learned "
+          "project(s) as unconfirmed")
+    return ("I don't have a project list of yours yet, sir. From past "
+            "conversations I picked up " + _join(names) + ", but I haven't "
+            "confirmed any of that, so treat it as a guess.")
+
+
 def project_status(arg: str = "") -> str:
     """Read back the owner's project list (or one project from it)."""
     projects, state = load_projects()
     if state == "unreadable":
         return UNREADABLE
     if state in ("absent", "empty"):
-        return NO_LIST
+        if (arg or "").strip() and _is_name_query(arg):
+            return NO_LIST
+        return _learned_answer()
     today = _today()
     query = (arg or "").strip()
 

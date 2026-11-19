@@ -19,6 +19,8 @@ import json
 import os
 import shutil
 import tempfile
+import threading
+import types
 import unittest
 from unittest import mock
 
@@ -42,6 +44,15 @@ class _Base(unittest.TestCase):
         today.start()
         self.addCleanup(today.stop)
         self.path = os.path.join(self.tmp, "projects_status.json")
+        # A stand-in monolith: never the real one (another test in the same
+        # process may have imported it) and never the real memory file.
+        self.memory = {"projects": []}
+        self.bc = types.SimpleNamespace(
+            _memory_lock=threading.RLock(),
+            load_memory=lambda: self.memory)
+        patch = mock.patch.dict("sys.modules", {"bobert_companion": self.bc})
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def _write(self, payload):
         with open(self.path, "w", encoding="utf-8") as fh:
@@ -90,6 +101,63 @@ class NeverInventsTests(_Base):
 
     def test_a_query_with_no_list_still_does_not_invent(self):
         self.assertEqual(self.ask("garden shed"), self.mod.NO_LIST)
+
+
+class LearnedFallbackTests(_Base):
+    """Live 2026-11-16 23:58: "I don't have a project list yet" while learned
+    projects sat in memory. The fallback says they are unconfirmed, names at
+    most three, and never answers a question that names a project."""
+
+    def test_names_learned_projects_as_unconfirmed(self):
+        self.memory["projects"] = ["Garden shed", "Bird feeder", "Kite build",
+                                   "Bookshelf"]
+        out = self.ask()
+        self.assertIn("I don't have a project list", out)
+        self.assertIn("Bookshelf, Kite build and Bird feeder", out)  # newest 3
+        self.assertNotIn("Garden shed", out)
+        self.assertIn("haven't confirmed", out)
+
+    def test_empty_list_file_falls_back_too(self):
+        self._write({"projects": []})
+        self.memory["projects"] = ["Garden shed"]
+        self.assertIn("Garden shed", self.ask("what am I working on lately"))
+
+    def test_a_named_project_never_uses_them(self):
+        self.memory["projects"] = ["Garden shed"]
+        self.assertEqual(self.ask("garden shed"), self.mod.NO_LIST)
+
+    def test_garbled_labels_are_skipped(self):
+        self.memory["projects"] = ["Garden shed", "Zzqxv blorptek mystery"]
+        out = self.ask()
+        self.assertIn("Garden shed", out)
+        self.assertNotIn("blorptek", out)
+
+    def test_only_garbled_or_none_is_no_list(self):
+        self.assertEqual(self.ask(), self.mod.NO_LIST)
+        self.memory["projects"] = ["Zzqxv blorptek mystery"]
+        self.assertEqual(self.ask(), self.mod.NO_LIST)
+
+    def test_flag_off_is_no_list(self):
+        self.memory["projects"] = ["Garden shed"]
+        self.bc.PROJECT_STATUS_LEARNED_FALLBACK = False
+        self.assertEqual(self.ask(), self.mod.NO_LIST)
+
+    def test_a_real_list_wins(self):
+        self._write({"projects": [{"name": "Bird feeder", "status": "going"}]})
+        self.memory["projects"] = ["Garden shed"]
+        out = self.ask()
+        self.assertIn("Bird feeder", out)
+        self.assertNotIn("Garden shed", out)
+
+    def test_unreadable_memory_is_no_list(self):
+        def boom():
+            raise OSError("locked")
+        self.bc.load_memory = boom
+        self.assertEqual(self.ask(), self.mod.NO_LIST)
+
+    def test_live_default_is_on(self):
+        from core import config
+        self.assertIs(config.PROJECT_STATUS_LEARNED_FALLBACK, True)
 
 
 class ReadBackTests(_Base):

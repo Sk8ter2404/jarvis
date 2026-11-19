@@ -1362,6 +1362,14 @@ ALARM_SET_FAST_PATH        = True
 # always works. False = any input stops it, the old way. Grep the log for
 # "[alarm] #N input not counted".
 ALARM_INPUT_NEEDS_WITNESS  = True
+# PROJECT_STATUS_LEARNED_FALLBACK (2026-11-17, skills/project_status.py):
+# with no data/projects_status.json, a general "what am I working on" names up
+# to 3 projects learned from past conversations and says they are unconfirmed
+# (live 11-16 23:58: "I don't have a project list yet" with 12 learned ones in
+# memory). Garbled labels are skipped; a question naming a project never uses
+# them. False = "no project list" only. Grep the log for "[project_status]
+# no project list; named".
+PROJECT_STATUS_LEARNED_FALLBACK = True
 STT_SHADOW                 = ""          # '' | 'parakeet'
 PARAKEET_MODEL_DIR         = r"C:\JARVIS-models\parakeet-tdt-0.6b-v2-onnx"
 PARAKEET_THREADS           = 8
