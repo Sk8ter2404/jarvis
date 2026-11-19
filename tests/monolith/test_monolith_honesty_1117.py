@@ -179,6 +179,28 @@ class DeclineWithReasonTurnTests(_HonestyBase):
         self._dispatch(DECLINE, ON_IT)
         self.assertEqual(self._followup_inputs()[0], ["_unverified_claim"])
 
+    def test_a_failure_report_after_a_check_in_is_the_old_path(self):
+        # review 2026-11-19: a check-in question is not an offer, and "No,
+        # it didn't work." reports a failure - the claim is held back and
+        # the follow-up round may still emit the token.
+        self._asked_first("Did that fix it, sir?")
+        self._dispatch("No, it didn't work.", ON_IT)
+        self.assertEqual(self._followup_inputs()[0], ["_unverified_claim"])
+        self.assertNotIn("sir declined with a reason", self.log)
+
+    def test_a_choice_after_an_either_or_question_is_the_old_path(self):
+        self._asked_first("The first track or the second, sir?")
+        self._dispatch("No, it's the second one.",
+                       "Playing the second one, sir.")
+        self.assertEqual(self._followup_inputs()[0], ["_unverified_claim"])
+        self.assertNotIn("sir declined with a reason", self.log)
+
+    def test_a_reason_decline_after_a_check_in_is_the_old_path(self):
+        # Only an OFFER before it counts, not any question.
+        self._asked_first("Is that better, sir?")
+        self._dispatch(DECLINE, ON_IT)
+        self.assertEqual(self._followup_inputs()[0], ["_unverified_claim"])
+
     def test_a_request_after_the_no_is_the_old_path(self):
         self._asked_first()
         self._dispatch("No. Play the next one.", ON_IT)

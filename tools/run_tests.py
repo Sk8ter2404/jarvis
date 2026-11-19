@@ -229,7 +229,10 @@ def main(argv: list[str]) -> int:
     if selectors:
         suite = unittest.TestSuite()
         for sel in selectors:
-            name = sel if sel.startswith("test_") else f"test_{sel}"
+            # "monolith.test_x" names tests/monolith/test_x.py (it used to
+            # become tests.test_monolith.test_x and fail to import).
+            name = (sel if sel.startswith(("test_", "monolith."))
+                    else f"test_{sel}")
             name = name[:-3] if name.endswith(".py") else name
             suite.addTests(loader.loadTestsFromName(f"tests.{name}"))
     else:

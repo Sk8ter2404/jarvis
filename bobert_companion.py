@@ -42307,9 +42307,9 @@ def _begin_turn_grounding(user_text: str):
                              # (v3 W11) reads the previous turn's actions as
                              # the replay history entries before it.
                              "t0": time.time(),
-                             # JARVIS's last line asked sir something
-                             # (v3.0.26, _turn_prev_reply_asked).
-                             "prev_asked": _last_assistant_asked()}
+                             # JARVIS's last line OFFERED sir something
+                             # (v3.0.26, _turn_prev_reply_offered).
+                             "prev_offered": _last_assistant_offered()}
     if prev is None:
         _turn_grounding.last_ran = frozenset()
     # "click that X" / "the one on screen": read the windows NOW (text only,
@@ -45025,7 +45025,10 @@ def _turn_is_bare_ack() -> bool:
     While an offer was open (_turn_offer_open) only a decline counts ("All
     right." may accept it). v3.0.26: a decline with a reason counts too
     (core.action_fit.is_decline_with_reason) - with no offer open, only
-    right after JARVIS asked him something. False outside an owner turn.
+    right after JARVIS's line ended with an offer question
+    (core.action_fit.is_offer_question), never after a check-in ("Did that
+    fix it?") or a choice ("The first or the second?"). False outside an
+    owner turn.
     Never raises."""
     try:
         user_text = _turn_user_text()
@@ -45034,43 +45037,46 @@ def _turn_is_bare_ack() -> bool:
         # v3.0.26: a decline WITH a reason ("Not right now. That'll take
         # forever.", live 2026-11-17 00:23:45) declines too - only here, for
         # the claim drop; rule 7 keeps the strict predicates. Without an open
-        # offer it counts only when JARVIS's last line asked him something
-        # (_turn_prev_reply_asked): that line was a fast-path "Want the full
-        # list, sir?", which the offer slot never records.
+        # offer it counts only when JARVIS's last line was an OFFER question
+        # (_turn_prev_reply_offered): that line was a fast-path "Want the
+        # full list, sir?", which the offer slot never records. Review
+        # 2026-11-19: any question was too wide - "Did that fix it, sir?" ->
+        # "No, it didn't work." is a report, not a decline.
         if _turn_offer_open():
             return (_action_fit.is_bare_decline(user_text)
                     or _action_fit.is_decline_with_reason(user_text))
         if _action_fit.is_bare_ack(user_text):
             return True
-        return (_turn_prev_reply_asked()
+        return (_turn_prev_reply_offered()
                 and _action_fit.is_decline_with_reason(user_text))
     except Exception:
         return False
 
 
-def _last_assistant_asked() -> bool:
-    """True when the newest assistant line in conversation_history asks the
-    owner something (a question or an offer: claim_validator.asks_owner).
-    Never raises (False)."""
+def _last_assistant_offered() -> bool:
+    """True when the newest assistant line in conversation_history ends with
+    an offer question (core.action_fit.is_offer_question: "Want the full
+    list, sir?"; not "Did that fix it?" or an either-or choice). Never
+    raises (False)."""
     try:
         for m in reversed(conversation_history):
             if isinstance(m, dict) and m.get("role") == "assistant":
                 content = m.get("content")
                 return (isinstance(content, str)
-                        and _claim_validator.asks_owner(content))
+                        and _action_fit.is_offer_question(content))
         return False
     except Exception:
         return False
 
 
-def _turn_prev_reply_asked() -> bool:
-    """True when JARVIS's last line before this owner turn asked him
-    something - snapshotted as the turn began (_begin_turn_grounding), so the
+def _turn_prev_reply_offered() -> bool:
+    """True when JARVIS's last line before this owner turn offered him
+    something (_last_assistant_offered) - snapshotted as the turn began (_begin_turn_grounding), so the
     turn's own replies never count. False outside an owner turn. Never
     raises."""
     try:
         frame = getattr(_turn_grounding, "frame", None)
-        return bool(frame and frame.get("prev_asked"))
+        return bool(frame and frame.get("prev_offered"))
     except Exception:
         return False
 

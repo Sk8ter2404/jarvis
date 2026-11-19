@@ -520,6 +520,12 @@ _REASON_NOT_RE = re.compile(
     r"'d\s+like|let'?s|please|can\s+you|could\s+you|would\s+you|will\s+you|"
     r"not\s+(?:that|this|the|what|it\b)|that'?s\s+not|isn'?t\s+(?:it|that|"
     r"right|working)|try|why|what|how|where|when|who|which|"
+    # a failure report or a choice (review 2026-11-19: "Did that fix it,
+    # sir?" -> "No, it didn't work." / "Nah. It keeps crashing." / "No,
+    # it's the second one." are not declines)
+    r"didn'?t|doesn'?t|don'?t\s+work|won'?t|work(?:s|ed|ing)?|broke|"
+    r"broken|fix(?:ed)?|crash\w*|worse|better|same|keeps?|happen(?:ed|s)?|"
+    r"chang(?:e|ed)|one|first|second|third|last|next|both|either|neither|"
     # things JARVIS acts on
     r"music|songs?|tracks?|playlist|volume|loud(?:er)?|quiet(?:er)?|"
     r"lights?|lamps?|timers?|alarms?|reminders?|weather|news|screens?|"
@@ -575,6 +581,47 @@ def is_decline_with_reason(user_text) -> bool:
         for s in sentences[1:]:
             rest.extend(p for p in _DECLINE_PART_RE.split(s) if p.strip())
         return bool(rest) and all(_is_reason_part(p) for p in rest)
+    except Exception:
+        return False
+
+
+# An OFFER question (review 2026-11-19): the monolith's decline-with-reason
+# claim drop counts with no open offer only when JARVIS's previous line was
+# an offer ("Want the full list, sir?", a fast-path line the offer slot never
+# records) - not any question. "Did that fix it, sir?", "Is that better?",
+# "The first track or the second, sir?" and wh-questions are not offers: a
+# "No, ..." after them is a report or a choice, not a decline.
+_OFFER_Q_TAG_RE = re.compile(r"\[[^\]\n]*\]")
+_OFFER_Q_SENTENCE_RE = re.compile(r"(?<=[.!?…])\s+")
+_OFFER_Q_FILLER_RE = re.compile(
+    r"^(?:(?:sir|so|well|also|then|now|oh|right|and|or\s+rather)\b[\s,]*)+")
+_OFFER_Q_LEAD_RE = re.compile(
+    r"^(?:(?:do|would)\s+you\s+(?:want|like|care|fancy)|"
+    r"you\s+(?:want|wanna)|want|wanna|would\s+you\s+like|"
+    r"(?:would\s+you\s+)?care\s+(?:to|for)|fancy|"
+    r"(?:shall|should|may|can|could)\s+(?:i|we)|"
+    r"how\s+about|like\s+me\s+to|need\s+me\s+to|interested\s+in)\b")
+_OFFER_Q_CHOICE_RE = re.compile(r"\bor\b")
+
+
+def is_offer_question(reply) -> bool:
+    """True when JARVIS's line ENDS with a yes/no offer question ("Want the
+    full list, sir?", "Shall I read them?", "Care to hear the rest?").
+    False for a check-in ("Did that fix it, sir?", "Is that better?"), an
+    either-or choice ("The first track or the second, sir?"), a wh-question
+    and a line that does not end with "?". Never raises."""
+    try:
+        prose = _norm(_OFFER_Q_TAG_RE.sub(" ", str(reply or ""))).replace(
+            "’", "'")
+        sentences = [s for s in _OFFER_Q_SENTENCE_RE.split(prose)
+                     if s.strip()]
+        if not sentences:
+            return False
+        last = sentences[-1].strip().lower()
+        if not last.endswith("?") or _OFFER_Q_CHOICE_RE.search(last):
+            return False
+        body = _OFFER_Q_FILLER_RE.sub("", last).strip()
+        return _OFFER_Q_LEAD_RE.match(body) is not None
     except Exception:
         return False
 

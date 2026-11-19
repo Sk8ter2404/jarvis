@@ -215,6 +215,38 @@ class DeclineWithReasonTests(unittest.TestCase):
         self.assertFalse(af.is_decline_with_reason(None))
         self.assertFalse(af.is_decline_with_reason(object()))
 
+    def test_failure_reports_and_choices_are_not(self):
+        # review 2026-11-19: after "Did that fix it, sir?" or "The first
+        # track or the second, sir?" these report or choose, not decline.
+        for text in ("No, it's the second one.", "No, it didn't work.",
+                     "Nah. It keeps crashing.", "No. It's getting worse.",
+                     "Nope, it's not fixed.", "No, nothing happened.",
+                     "No, it's the same.", "No, the first one."):
+            with self.subTest(text=text):
+                self.assertFalse(af.is_decline_with_reason(text))
+
+
+class OfferQuestionTests(unittest.TestCase):
+    def test_offers(self):
+        for line in ("Want the full list, sir?",
+                     "Here are three. Want the full list, sir?",
+                     "Shall I read them?", "Care to hear the rest, sir?",
+                     "Sir, want me to go on?",
+                     "Do you want the details, sir?",
+                     "Want the full list, sir? [intent:offer]"):
+            with self.subTest(line=line):
+                self.assertTrue(af.is_offer_question(line))
+
+    def test_check_ins_choices_and_statements_are_not(self):
+        for line in ("Did that fix it, sir?", "Is that better?",
+                     "The first track or the second, sir?",
+                     "Want the first track or the second, sir?",
+                     "What would you like, sir?", "Anything else?",
+                     "Your timer is set for ten minutes, sir.", "",
+                     None, object()):
+            with self.subTest(line=line):
+                self.assertFalse(af.is_offer_question(line))
+
 
 class SttAndConfigTests(unittest.TestCase):
     def fix(self, text):
