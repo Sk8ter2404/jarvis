@@ -70,6 +70,60 @@ class RingTests(unittest.TestCase):
         self.assertAlmostEqual(ref.rms_recent(0.5), 0.1, places=5)
 
 
+class SlipTests(unittest.TestCase):
+    """Timeline slips (SLIP_BUCKET_S, 3.0.26): the ring must hold one sample
+    per 1/16000 s of playback. Packets of 160 samples every 10 ms; a lost
+    or an added stretch moves the earliest-arrival base and is counted once
+    the next bucket confirms it."""
+
+    def _run(self, ref, seconds, t0, *, late=0.0, jitter=(0.0, 0.002)):
+        """``seconds`` of 10 ms packets from ``t0``; returns the next t."""
+        t = t0
+        for k in range(int(seconds * 100)):
+            t += 0.01
+            ref.write(np.zeros(160, np.float32),
+                      t=t + late + jitter[k % len(jitter)])
+        return t
+
+    def test_a_steady_reader_has_no_slips(self):
+        ref = lr.LoopbackReference(clock=lambda: 0.0)
+        self._run(ref, 6.0, 100.0)
+        self.assertEqual(ref.status()["slips"], 0)
+
+    def test_lost_samples_are_one_negative_slip(self):
+        ref = lr.LoopbackReference(clock=lambda: 0.0)
+        t = self._run(ref, 3.0, 100.0)
+        t += 0.03                      # 30 ms played but never written
+        self._run(ref, 4.0, t)
+        st = ref.status()
+        self.assertEqual(st["slips"], 1)
+        self.assertAlmostEqual(st["slip_ms_net"], -30.0, delta=2.5)
+        self.assertAlmostEqual(st["slip_ms_abs"], 30.0, delta=2.5)
+
+    def test_added_zeros_are_one_positive_slip(self):
+        ref = lr.LoopbackReference(clock=lambda: 0.0)
+        t = self._run(ref, 3.0, 100.0)
+        ref.write(np.zeros(320, np.float32), t=t + 0.0001)   # 20 ms extra
+        self._run(ref, 4.0, t)
+        st = ref.status()
+        self.assertEqual(st["slips"], 1)
+        self.assertAlmostEqual(st["slip_ms_net"], 20.0, delta=2.5)
+
+    def test_one_late_second_is_jitter_not_a_slip(self):
+        ref = lr.LoopbackReference(clock=lambda: 0.0)
+        t = self._run(ref, 3.0, 100.0)
+        t = self._run(ref, 1.0, t, late=0.05)    # a starved reader thread
+        self._run(ref, 3.0, t)
+        self.assertEqual(ref.status()["slips"], 0)
+
+    def test_a_gap_starts_the_level_afresh(self):
+        ref = lr.LoopbackReference(clock=lambda: 0.0)
+        t = self._run(ref, 3.0, 100.0)
+        ref.mark_gap()                 # flagged: the canceller re-anchors
+        self._run(ref, 3.0, t + 0.5)
+        self.assertEqual(ref.status()["slips"], 0)
+
+
 class ComOrderTests(unittest.TestCase):
 
     def test_soundcard_is_imported_before_com_is_initialised(self):

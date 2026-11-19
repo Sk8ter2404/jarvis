@@ -305,6 +305,30 @@ def refresh(token: int, at: Optional[float] = None) -> None:
         pass
 
 
+def recent_words(window_s: float = 4.0,
+                 at: Optional[float] = None) -> frozenset:
+    """Every word (normalised like ``match``) of the lines JARVIS is saying
+    now or finished saying within the last ``window_s`` seconds - what his
+    own voice can have put into a short mic cut. The voice barge-in's echo
+    test reads it (bobert_companion._bargein_echo_word, 3.0.26). Empty on
+    any error. Never raises."""
+    try:
+        t = now() if at is None else float(at)
+        window = max(0.0, float(window_s))
+        out: set = set()
+        with _lock:
+            for ts, variants, finished in _lines.values():
+                # A finished line counts from its end; one never marked
+                # finished (its speak died) stops counting after 2 min.
+                if t - ts > (window if finished else 120.0):
+                    continue
+                if variants:
+                    out.update(variants[0][0].split())
+        return frozenset(out)
+    except Exception:
+        return frozenset()
+
+
 def match(utterance: str, window_s: float = DEFAULT_WINDOW_S, protected=(),
           at: Optional[float] = None,
           clip_start: Optional[float] = None) -> Optional[tuple]:

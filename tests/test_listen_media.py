@@ -212,6 +212,25 @@ class PolicyTests(unittest.TestCase):
         self.assertEqual(lm.mode3("bogus"), "off")
         self.assertEqual(lm.mode2(True), "on")
         self.assertEqual(lm.mode2("shadow"), "off")
+        # D5 gained 'shadow' (3.0.26); an old True / False still reads.
+        self.assertEqual(lm.bargein_mode("shadow"), "shadow")
+        self.assertEqual(lm.bargein_mode(" On"), "on")
+        self.assertEqual(lm.bargein_mode(True), "on")
+        self.assertEqual(lm.bargein_mode(False), "off")
+        self.assertEqual(lm.bargein_mode("bogus"), "off")
+        self.assertEqual(lm.bargein_mode(None), "off")
+
+    def test_bargein_echo_is_the_word_his_own_line_says(self):
+        own = {"i", "will", "stop", "the", "music", "sir"}
+        self.assertEqual(lm.bargein_echo(["stop"], own), "stop")
+        self.assertEqual(lm.bargein_echo(["jarvis", "stop"], own), "stop")
+        self.assertEqual(lm.bargein_echo(["jarvis"], own), "")
+        self.assertEqual(lm.bargein_echo(["stop"], {"stopped"}), "stop")
+        self.assertEqual(lm.bargein_echo(["cancel"], {"cancelled"}), "cancel")
+        self.assertEqual(lm.bargein_echo(["stop"], set()), "")
+        self.assertEqual(lm.bargein_echo([], own), "")
+        # A fault reads as an echo: it can never cut him.
+        self.assertEqual(lm.bargein_echo(["stop"], 42), "?")
         self.assertEqual(lm.threshold_setting("x"), 0.15)
         self.assertEqual(lm.threshold_setting(0.01), 0.10)
         self.assertEqual(lm.threshold_setting(0.9), 0.50)

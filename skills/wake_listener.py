@@ -486,6 +486,37 @@ def _host_mic_bus_open() -> bool:
         return False
 
 
+def bargein_boot_line(cfg) -> str:
+    """The boot line for BARGE_IN_ENABLED when this skill's own detector
+    does not autostart: whether voice barge-in is really ARMED, and by which
+    setting (3.0.26 - the old line said "barge-in is enabled" in every
+    session while nothing could cut him: WAKE_BARGEIN_MODE was 'off').
+    ``cfg`` is core.config (or a stand-in). Never raises."""
+    try:
+        from core import listen_media as _lm
+        mode = _lm.bargein_mode(getattr(cfg, "WAKE_BARGEIN_MODE",
+                                        _lm.DEFAULTS["WAKE_BARGEIN_MODE"]))
+        bus = _lm.mode2(getattr(cfg, "MIC_BUS_MODE",
+                                _lm.DEFAULTS["MIC_BUS_MODE"])) == "on"
+    except Exception:
+        mode, bus = "off", False
+    if mode == "off":
+        return ("[wake-listener] voice barge-in is NOT armed: BARGE_IN_ENABLED "
+                "is on but WAKE_BARGEIN_MODE is 'off' - set it 'shadow' (logs "
+                "what it would cut) or 'on' (needs MIC_BUS_MODE 'on')")
+    if not bus:
+        return ("[wake-listener] voice barge-in is NOT armed: WAKE_BARGEIN_MODE "
+                f"is '{mode}' but MIC_BUS_MODE is 'off' (it runs on the "
+                "always-open mic) - or say 'start listening for the wake "
+                "word' to start this detector")
+    if mode == "shadow":
+        return ("[wake-listener] voice barge-in in SHADOW (WAKE_BARGEIN_MODE "
+                "'shadow', always-open mic): it logs what it would cut and "
+                "cuts nothing")
+    return ("[wake-listener] voice barge-in armed (WAKE_BARGEIN_MODE 'on', "
+            "always-open mic)")
+
+
 def wake_listener_start(_: str = "") -> str:
     """Start the wake-word detector. Idempotent."""
     if _host_mic_bus_open():
@@ -690,8 +721,6 @@ def register(actions: dict) -> None:
         try:
             from core import config as _core_cfg
             if getattr(_core_cfg, "BARGE_IN_ENABLED", False):
-                print("  [wake-listener] barge-in is enabled but the wake "
-                      "detector is not running — say 'start listening for "
-                      "the wake word' to arm voice barge-in")
+                print("  " + bargein_boot_line(_core_cfg))
         except Exception:
             pass

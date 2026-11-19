@@ -1041,6 +1041,16 @@ FOLLOWUP_UNSURE_NO_EXTEND = True
 # control) is dropped silently, unless JARVIS just asked a question or a
 # prompt waits for your answer. False = such lines are answered as before.
 FOLLOWUP_UNSURE_COMMANDS_ONLY = True
+# FOLLOWUP_WINDOW_FROM_REPLY_END (3.0.26) - the follow-up window runs
+# FOLLOWUP_WINDOW_S from the END of JARVIS's reply, not from the moment you
+# stopped talking (the wake gate, before the brain and the reply). Live
+# 11-16..11-17 the median voice turn ended 9.8 s after you stopped, so a 20 s
+# window often had 12 s or less left, and 5 of 55 had closed before JARVIS
+# finished speaking. Only a turn that opened the window (the wake word) or
+# extended it with a confirmed voice re-arms it; an extension the rules above
+# took back never does. Logs "[follow-up] window re-armed after the reply".
+# Nothing changes while FOLLOWUP_WINDOW_S is 0. False = the old clock.
+FOLLOWUP_WINDOW_FROM_REPLY_END = True
 
 # Owner speech vocabulary (core/stt_vocab.py). STT_HOTWORDS: comma-separated names
 # Whisper should expect (faster-whisper "hotwords"). STT_REPLACEMENTS: phrases Whisper
@@ -1444,6 +1454,16 @@ STT_REPLACEMENTS_PARAKEET: dict = {}
 #       is set to WARNING; they were 41% of the session log).
 #   Changes apply on the next start.
 BOOT_PARALLEL_LOAD         = False
+# BOOT_CHANGELOG_BACKGROUND (3.0.26, reliability-11): after a version bump the
+# boot summarises CHANGELOG.md with an LLM call and speaks it before the main
+# loop starts, so JARVIS was deaf for as long as the brain took (a busy GPU:
+# tens of seconds) on exactly the boots that follow a release. True (default)
+# = the summary is made on a daemon thread and queued through the proactive
+# speech queue (spoken at the next idle pass; focus mode, the presence hold
+# and standby apply as for any unprompted line; log line "[boot] changelog
+# summary runs in the background"). False = made and spoken on the boot
+# thread before "Listening", as before. Changes apply on the next start.
+BOOT_CHANGELOG_BACKGROUND  = True
 
 # ─── Where the listening models run (core/listen_devices.py, 2026-10-04) ──
 # PARAKEET_DEVICE / SMART_TURN_DEVICE / VOICE_ID_DEVICE: 'cpu' | 'listen' |
@@ -1521,7 +1541,13 @@ MUSIC_GATE_MODE            = "shadow"
 # WAKE_DUCK_MODE      'on' = after a confirmed wake, other apps duck to
 #   AUDIO_DUCKING_LEVEL for at most 8 s while he speaks.
 # WAKE_BARGEIN_MODE   'on' = saying "Jarvis" / "stop" over his own speech
-#   stops it (needs MIC_BUS_MODE and the pre-gate).
+#   stops it (needs MIC_BUS_MODE; it runs the pre-gate detector on the bus
+#   even with WAKE_PREGATE_MODE 'off'). 3.0.26: a heard name / stop word
+#   that his own recent line also says is his echo and never cuts him (the
+#   media canceller is not relied on). 'shadow' = the same listening and
+#   confirm, but it only logs "[barge-in] shadow: would cut JARVIS ..." (or
+#   "... his echo, not cut"); nothing is cut. Run 'shadow' for an evening
+#   before 'on' (OD-7). The legacy headset RMS barge-in is BARGE_IN_ENABLED.
 # MEDIA_AEC_DRM_FALLBACK  protected video (HBO / Netflix) is silent in the
 #   loopback, so the canceller has no reference ("reference MISSING" in the
 #   log) while the speakers play loud. When the reference is missing AND
@@ -1713,20 +1739,29 @@ PLAYBACK_PRIMED_STREAM = False
 # silence run, and SMART_TURN_MIN_SPEECH_S of Silero speech so far — and a p
 # of SMART_TURN_THRESHOLD or more ends the turn there. The 21 chunks stay the
 # ceiling; Silero or Smart Turn missing, failing or too slow = today's turn.
-#   SMART_TURN_MODE   'off'    (default) no models are loaded;
-#                     'shadow' the models run but nothing changes: each
-#                              owner turn JARVIS accepts gets an
-#                              [eot-shadow] line saying when Smart Turn
-#                              WOULD have ended it (resumed=1: a sound
-#                              above the RMS gate came after that point);
+#   SMART_TURN_MODE   'off'    no models are loaded;
+#                     'shadow' (default, 3.0.26) the models run but nothing
+#                              changes: each owner turn JARVIS accepts
+#                              gets an [eot-shadow] line saying when Smart
+#                              Turn WOULD have ended it (resumed=1: a
+#                              sound above the RMS gate came after that
+#                              point) and pause_ms, the longest pause
+#                              inside the turn;
 #                     'on'     Smart Turn ends turns.
 #                     Env JARVIS_SMART_TURN, or user_settings.json.
+#   NOT 'on' YET: the 10-02..10-12 shadow run (105 owner turns) would have
+#   ended 81 turns early, but 13 of those 81 were followed by more sound and
+#   8 by over a second of it - his mid-sentence pauses, at p 0.82-0.99, so
+#   no threshold separates them. Read a few days of the new pause_ms first:
+#   'on' is safe only with SMART_TURN_MIN_SILENCE_S above nearly all of his
+#   pauses, and the saving per turn is the 1,344 ms hangover minus that.
+#   Lower SILENCE_SECS only with 'on' (it is the backstop).
 #   SMART_TURN_MODEL  the ONNX file (smart-turn-v3.2-cpu.onnx), kept OUTSIDE
 #                     the repo: never commit a model. Missing = Smart Turn
 #                     latched off (one log line), i.e. 'rms' turns.
 # Set via user_settings.json; applies on the next start.
-SMART_TURN_MODE = (os.getenv("JARVIS_SMART_TURN", "off").strip().lower()
-                   or "off")
+SMART_TURN_MODE = (os.getenv("JARVIS_SMART_TURN", "shadow").strip().lower()
+                   or "shadow")
 SMART_TURN_THRESHOLD = 0.7
 SMART_TURN_MIN_SILENCE_S = 0.256
 SMART_TURN_MIN_SPEECH_S = 1.0

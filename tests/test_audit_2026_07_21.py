@@ -417,7 +417,7 @@ class BargeInBootHintTests(unittest.TestCase):
     log: BARGE_IN_ENABLED on + no autostart → one hint line; barge-in off →
     silence. Never a real thread either way."""
 
-    def _register(self, barge_in: bool):
+    def _register(self, barge_in: bool, mode: str = "off", bus: str = "on"):
         from tests._skill_harness import load_skill_isolated
         mod, _ = load_skill_isolated("wake_listener", register=False)
         self.assertFalse(mod.WAKE_WORD_AUTOSTART)   # the deliberate default
@@ -425,21 +425,40 @@ class BargeInBootHintTests(unittest.TestCase):
         buf = io.StringIO()
         with mock.patch.dict(sys.modules, {"bobert_companion": bc_stub}), \
                 mock.patch("core.config.BARGE_IN_ENABLED", barge_in), \
+                mock.patch("core.config.WAKE_BARGEIN_MODE", mode), \
+                mock.patch("core.config.MIC_BUS_MODE", bus), \
                 mock.patch.object(mod.threading, "Thread") as thread_cls, \
                 contextlib.redirect_stdout(buf):
             actions: dict = {}
             mod.register(actions)
         return buf.getvalue(), thread_cls, actions
 
-    def test_hint_printed_when_barge_in_on_but_no_autostart(self):
+    def test_hint_printed_when_barge_in_on_but_nothing_armed(self):
+        # The live 11-16 / 11-17 state: BARGE_IN_ENABLED on, MIC_BUS_MODE
+        # on, WAKE_BARGEIN_MODE at its 'off' default. The old line said
+        # "barge-in is enabled" every session while nothing could cut him.
         out, thread_cls, actions = self._register(barge_in=True)
-        self.assertIn("barge-in is enabled", out)
-        self.assertIn("start listening for the wake word", out)
+        self.assertIn("voice barge-in is NOT armed", out)
+        self.assertIn("WAKE_BARGEIN_MODE is 'off'", out)
+        self.assertNotIn("barge-in is enabled", out)
         # No autostart thread was spawned — the hint replaces silence, it
         # must NOT replace the deliberate no-autostart policy (the WASAPI
         # device-collision hazard documented at WAKE_WORD_AUTOSTART).
         thread_cls.assert_not_called()
         self.assertIn("wake_listener_start", actions)   # register still whole
+
+    def test_hint_names_the_armed_mode(self):
+        out, _, _ = self._register(barge_in=True, mode="on")
+        self.assertIn("voice barge-in armed (WAKE_BARGEIN_MODE 'on'", out)
+        out, _, _ = self._register(barge_in=True, mode="shadow")
+        self.assertIn("SHADOW", out)
+        self.assertIn("cuts nothing", out)
+
+    def test_hint_says_the_bus_is_missing(self):
+        out, _, _ = self._register(barge_in=True, mode="on", bus="off")
+        self.assertIn("NOT armed", out)
+        self.assertIn("MIC_BUS_MODE is 'off'", out)
+        self.assertIn("start listening for the wake word", out)
 
     def test_no_hint_when_barge_in_off(self):
         out, thread_cls, _ = self._register(barge_in=False)

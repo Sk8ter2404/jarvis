@@ -62,20 +62,23 @@ class EnvDrivenTests(unittest.TestCase):
         self.assertEqual(mod.BAMBU_ACCESS_CODE, "")
         self.assertEqual(mod.BAMBU_SERIAL, "")
 
-    def test_smart_turn_mode_reads_env_and_ships_off(self):
+    def test_smart_turn_mode_reads_env_and_ships_shadow(self):
         # Speed plan R7: JARVIS_SMART_TURN picks off / shadow / on (any case,
-        # stray spaces); unset or blank is the shipped 'off' (2026-10-12: nobody
-        # read the shadow log lines, so the diagnostic is opt-in).
+        # stray spaces); unset or blank is the shipped 'shadow' (3.0.26: the
+        # overhaul reads the [eot-shadow] lines and their new pause_ms to
+        # decide 'on'; 2026-10-12 had made it opt-in because nobody did).
+        # Never 'on' by default: the 10-02..10-12 shadow run would have cut
+        # 8 of 81 turns mid-sentence.
         mod = self._reload_with_env(JARVIS_SMART_TURN=" On ")
         self.assertEqual(mod.SMART_TURN_MODE, "on")
         mod = self._reload_with_env(JARVIS_SMART_TURN="")
-        self.assertEqual(mod.SMART_TURN_MODE, "off")
-        mod = self._reload_with_env(JARVIS_SMART_TURN="shadow")
         self.assertEqual(mod.SMART_TURN_MODE, "shadow")
+        mod = self._reload_with_env(JARVIS_SMART_TURN="off")
+        self.assertEqual(mod.SMART_TURN_MODE, "off")
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("JARVIS_SMART_TURN", None)
             mod = importlib.reload(config)
-        self.assertEqual(mod.SMART_TURN_MODE, "off")
+        self.assertEqual(mod.SMART_TURN_MODE, "shadow")
 
     def test_env_only_secrets_are_never_applied_from_settings(self):
         # user_settings.json must NOT be able to override the env-only BAMBU

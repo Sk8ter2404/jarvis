@@ -563,6 +563,126 @@ class PregateTests(_Base):
                              "confirmed")
         self.assertEqual(bc._listen_counter.snapshot().get("would_veto"), 1)
 
+    # ── D5 (WAKE_BARGEIN_MODE, 3.0.26): a hit while JARVIS speaks ────────
+    def _bargein_env(self, decoded, own_line, mode):
+        """The confirm of a hit heard while he says ``own_line``: the line
+        is remembered the way _speak remembers it (core.self_echo) and is
+        the sentence playing now; BARGE_IN_ENABLED on, as in his settings.
+        Returns (bus, the interrupt event)."""
+        bc = self.bc
+        bus = self._confirm_env(decoded)
+        bc._self_echo._reset_for_tests()
+        self.addCleanup(bc._self_echo._reset_for_tests)
+        bc._self_echo.remember(own_line)
+        self._p(bc, "WAKE_BARGEIN_MODE", mode, create=True)
+        self._p(bc, "_tts_current_text", [own_line.lower()])
+        self._p(bc, "_tts_playback_active", [True])
+        self._p(bc, "_barge_in_wake_enabled", lambda: True)
+        self.addCleanup(bc._tts_interrupt.clear)
+        bc._tts_interrupt.clear()
+        return bus, bc._tts_interrupt
+
+    def _bargein(self, decoded, own_line, mode):
+        bc = self.bc
+        bus, ev = self._bargein_env(decoded, own_line, mode)
+        lines = []
+        with mock.patch("builtins.print",
+                        side_effect=lambda *a, **k: lines.append(
+                            " ".join(map(str, a)))):
+            got = bc._pregate_confirm_one(bus.last_frame_time() - 1.5, 0.62,
+                                          True)
+        return got, ev.is_set(), "\n".join(lines)
+
+    def test_shadow_logs_the_cut_it_would_make_and_cuts_nothing(self):
+        got, cut, log = self._bargein("stop", "Here is the forecast for "
+                                      "the week ahead, sir.", "shadow")
+        self.assertEqual(got, "would-barge-in")
+        self.assertFalse(cut)
+        self.assertIn("[barge-in] shadow: would cut JARVIS - a stop word", log)
+        self.assertNotIn("forecast", log)              # never the words
+
+    def test_on_cuts_him_for_his_stop_word(self):
+        got, cut, _ = self._bargein("stop", "Here is the forecast for the "
+                                    "week ahead, sir.", "on")
+        self.assertEqual(got, "barge-in")
+        self.assertTrue(cut)
+
+    def test_his_own_stop_word_is_his_echo(self):
+        bc = self.bc
+        bus, ev = self._bargein_env("stop", "I will stop the music now, sir.",
+                                    "on")
+        for line, heard in (("I will stop the music now, sir.", "stop"),
+                            ("The timer has stopped, sir.", "stop"),
+                            ("Shall I cancel the order, sir?", "cancel")):
+            with self.subTest(line=line):
+                bc._self_echo._reset_for_tests()
+                bc._self_echo.remember(line)
+                bc._tts_current_text[0] = line.lower()
+                lines = []
+                with mock.patch.object(bc, "_wake_confirm_decode",
+                                       lambda a, h=heard: (h, {})), \
+                        mock.patch("builtins.print",
+                                   side_effect=lambda *a, **k: lines.append(
+                                       " ".join(map(str, a)))):
+                    got = bc._pregate_confirm_one(
+                        bus.last_frame_time() - 1.5, 0.62, True)
+                self.assertEqual(got, "echo")
+                self.assertFalse(ev.is_set(), "his own voice cut him")
+                self.assertIn("his echo, not cut", "\n".join(lines))
+
+    def test_his_own_name_is_his_echo(self):
+        got, cut, _ = self._bargein("Jarvis, stop.", "Jarvis at your "
+                                    "service, sir.", "on")
+        self.assertEqual(got, "echo")
+        self.assertFalse(cut)
+
+    def test_a_line_he_just_finished_still_counts(self):
+        bc = self.bc
+        bus, ev = self._bargein_env("stop", "Here is the next one, sir.", "on")
+        # The sentence before the one playing, finished a moment ago: the
+        # 2.5 s cut reaches back 1.5 s before the hit.
+        tok = bc._self_echo.remember("Do you want me to stop here?")
+        bc._self_echo.refresh(tok)
+        with mock.patch("builtins.print"):
+            got = bc._pregate_confirm_one(bus.last_frame_time() - 1.5, 0.62,
+                                          True)
+        self.assertEqual(got, "echo")
+        self.assertFalse(ev.is_set())
+
+    def test_a_cut_without_the_name_or_a_stop_word_does_nothing(self):
+        got, cut, _ = self._bargein("and the weather today", "And the "
+                                    "weather today is fine.", "on")
+        self.assertEqual(got, "no-barge-in")
+        self.assertFalse(cut)
+
+    def test_off_never_queues_a_confirm_over_his_speech(self):
+        bc = self.bc
+        q = mock.Mock()
+        self._p(bc, "_pregate_confirm_q", q)
+        self._p(bc, "_pregate_confirm_thread", [mock.Mock(is_alive=lambda: True)])
+        self._p(bc, "_tts_playback_active", [True])
+        self._p(bc, "_mic_bus_obj", [mock.Mock(is_open=lambda: True)])
+        for mode, score, queued in (("off", 0.95, False),
+                                    ("shadow", 0.45, False),
+                                    ("shadow", 0.62, True),
+                                    ("on", 0.62, True)):
+            with self.subTest(mode=mode, score=score):
+                q.reset_mock()
+                with mock.patch.object(bc, "WAKE_BARGEIN_MODE", mode,
+                                       create=True):
+                    bc._pregate_on_trigger(time.monotonic(), score)
+                self.assertEqual(q.put_nowait.called, queued)
+
+    def test_the_boot_line_names_the_mode(self):
+        bc = self.bc
+        self._p(bc, "WAKE_BARGEIN_MODE", "shadow", create=True)
+        self._p(bc, "_pregate_get", lambda: None)
+        self._p(bc, "_media_aec_get", lambda: None)
+        with mock.patch("builtins.print") as pr:
+            bc._listen_media_boot()
+        self.assertIn("barge-in shadow", " ".join(
+            str(c.args[0]) for c in pr.call_args_list))
+
     def test_a_loudness_capture_led_by_the_video_s_name_is_dropped(self):
         bc = self.bc
         loop = bc._lm.ScoreTrack()
@@ -778,6 +898,87 @@ class MediaTestAndLogTests(_Base):
         lines = [str(c.args[0]) for c in p.call_args_list]
         self.assertTrue(any("[listen-media] 61 s with media" in s
                             and "captures 2" in s for s in lines), lines)
+
+    def _aec_fakes(self, endpoint="Speakers (Desk)"):
+        bc = self.bc
+        lb = mock.Mock(n_written=16000, endpoint=endpoint, running=False)
+        lb.age_s.return_value = 0.05
+        lb.status.return_value = {"slips": 3, "slip_ms_net": -42.0,
+                                  "capture_gaps": 1}
+        bus = mock.Mock()
+        bus.status.return_value = {"input_overflows": 5,
+                                   "callback_dropped": 0}
+        bus.take_closed_s.return_value = 0.0
+        self._p(bc, "_loopback_obj", [lb])
+        self._p(bc, "_mic_bus_obj", [bus])
+        self._p(bc, "_aec_ref_missing", [False])
+        self._p(bc, "_aec_minute_prev", [{
+            "sessions": 1, "ref_late": 10, "resets": 0, "realigns": 4,
+            "realign_rejected": 0, "slips": 1, "slip_ms_net": -12.0,
+            "capture_gaps": 1, "mic_overflows": 2, "mic_drops": 0}])
+        return lb
+
+    def test_the_canceller_minute_line_says_why_and_counts(self):
+        # speech-aec-ineffective (3.0.26): a minute with nothing to judge
+        # says why, and the timeline movers are counted per minute.
+        bc = self.bc
+        lb = self._aec_fakes()
+        st = {"sessions": 3, "ref_late": 40, "resets": 1, "realigns": 10,
+              "realign_rejected": 0}
+        tail = bc._media_aec_minute_extra(st, {"n": 100, "raw": 40, "sup": 30})
+        self.assertIn("; scoreable; per minute: ", tail)
+        self.assertIn("re-anchors 2, realigns/min 6, ref late 30, resets 1", tail)
+        self.assertIn("ref slips 2 (net -30 ms, gaps 0)", tail)
+        self.assertIn("mic overflows 3, drops 0", tail)
+        self.assertIn("; why quiet", bc._media_aec_minute_extra(
+            st, {"n": 100, "raw": 2, "sup": 2}))
+        self.assertIn("; why no frames", bc._media_aec_minute_extra(
+            st, {"n": 0, "raw": 0, "sup": 0}))
+        bc._aec_ref_missing[0] = True
+        self.assertIn("; why reference missing", bc._media_aec_minute_extra(
+            st, {"n": 100, "raw": 40, "sup": 30}))
+        lb.endpoint = "Headset Earphone (Synthetic)"
+        self.assertIn("; why headset", bc._media_aec_minute_extra(
+            st, {"n": 100, "raw": 40, "sup": 30}))
+
+    def test_the_minute_line_carries_the_diagnostics(self):
+        bc = self.bc
+        self._aec_fakes()
+        now = [1000.0]
+        bc._listen_counter = bc._lm.MinuteCounter(clock=lambda: now[0])
+        aec = mock.Mock()
+        aec.erle_db.return_value = 2.0
+        aec.status.return_value = {
+            "erle_db": 2.0, "delay_ms": -120.0, "drift_ppm": -50.0,
+            "converging": False, "sessions": 3, "ref_late": 40, "resets": 1,
+            "realigns": 10, "realign_rejected": 0, "delay_clamped": 0}
+        self._p(bc, "_media_aec_obj", [aec])
+        self._p(bc, "MEDIA_AEC_MODE", "on", create=True)
+        self._p(bc, "_pc_media_playing", lambda refresh=True: True)
+        self._p(bc, "_media_aec_check_reference", lambda *a, **k: None)
+        self._p(bc, "_listen_aec_frames", {"raw": 30, "sup": 25, "n": 100})
+        with mock.patch("builtins.print") as p:
+            bc._listen_tick()
+            now[0] = 1061.0
+            bc._listen_tick()
+        lines = [str(c.args[0]) for c in p.call_args_list
+                 if "[media-aec]" in str(c.args[0])]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("NOT converging", lines[0])
+        self.assertIn("; scoreable; per minute: re-anchors 2", lines[0])
+        # Not converging: the mic passes through, so no 'cancelled' share.
+        self.assertIn("/ cancelled -", lines[0])
+        self.assertNotIn("cancelled 25.0", lines[0])
+        # Converging: the share is real again.
+        aec.status.return_value["converging"] = True
+        self._p(bc, "_listen_aec_frames", {"raw": 30, "sup": 25, "n": 100})
+        now[0] = 1122.0
+        with mock.patch("builtins.print") as p:
+            bc._listen_tick()
+        lines = [str(c.args[0]) for c in p.call_args_list
+                 if "[media-aec]" in str(c.args[0])]
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("/ cancelled 25.0 %", lines[0])
 
     def test_the_shadow_turn_peak(self):
         bc = self.bc

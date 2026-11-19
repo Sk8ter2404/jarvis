@@ -73,7 +73,10 @@ _FIRE_MS = (_PRE + 30 + 4) * _MS                       # 2,944
 _TURN_MS = (_PRE + 30 + 21) * _MS                      # 4,032
 _PAUSED_MS = (_PRE + 30 + 8 + 20 + 21) * _MS           # 5,824
 _SHADOW_LINE = re.compile(r"\[eot-shadow\] fire_ms=(?:\d+|-) "
-                          r"p=(?:[01]\.\d{3}|-) resumed=[01] actual_ms=\d+")
+                          r"p=(?:[01]\.\d{3}|-) resumed=[01] actual_ms=\d+ "
+                          r"pause_ms=\d+")
+# The 8-chunk mid-sentence pause of _PAUSED (EotRecord.pause_ms, 3.0.26).
+_PAUSED_PAUSE_MS = 8 * _MS
 
 
 class _RecTurn(_ept.ep.SmartTurn):
@@ -257,7 +260,7 @@ class ShadowCaptureTests(_Base):
         audio, log = self._capture(_TURN)
         lines = self._shadow_lines(log)
         self.assertEqual(lines, [f"[eot-shadow] fire_ms={_FIRE_MS} p=0.990 "
-                                 f"resumed=0 actual_ms={_TURN_MS}"])
+                                 f"resumed=0 actual_ms={_TURN_MS} pause_ms=0"])
         # actual_ms is the returned clip, pre-roll included.
         self.assertEqual(len(audio) * 1000 // 16000, _TURN_MS)
         d = self._turn_fields(since)
@@ -289,7 +292,7 @@ class ShadowCaptureTests(_Base):
         self.assertTrue(np.array_equal(audio, off))   # the words after it
         self.assertEqual(self._shadow_lines(log), [
             f"[eot-shadow] fire_ms={_FIRE_MS} p=0.990 resumed=1 "
-            f"actual_ms={_PAUSED_MS}"])
+            f"actual_ms={_PAUSED_MS} pause_ms={_PAUSED_PAUSE_MS}"])
 
     def test_below_the_threshold_it_keeps_checking_and_never_fires(self):
         self._warm()
@@ -297,7 +300,7 @@ class ShadowCaptureTests(_Base):
         since = self.timing.now()
         _audio, log = self._capture(_TURN)
         self.assertEqual(self._shadow_lines(log), [
-            f"[eot-shadow] fire_ms=- p=0.500 resumed=0 actual_ms={_TURN_MS}"])
+            f"[eot-shadow] fire_ms=- p=0.500 resumed=0 actual_ms={_TURN_MS} pause_ms=0"])
         d = self._turn_fields(since)
         # Checks at silent chunks 4, 9, 14 and 19 (five apart).
         self.assertEqual((d["eot"], d["st_p"], d["st_n"]), ("rms", "0.5", "4"))
@@ -353,7 +356,7 @@ class ShadowCaptureTests(_Base):
         fire = (_PRE + 30 + 4) * _CHUNK        # pre-roll, voice, 4 silent
         self.assertEqual(self._shadow_lines(log), [
             f"[eot-shadow] fire_ms={fire * 1000 // 16000} p=0.990 resumed=0 "
-            f"actual_ms={len(audio) * 1000 // 16000}"])
+            f"actual_ms={len(audio) * 1000 // 16000} pause_ms=0"])
         self.assertEqual(len(self.heard_by_turn), 1)
         heard = self.heard_by_turn[0]
         self.assertEqual(len(heard), fire)
@@ -393,7 +396,7 @@ class ShadowCaptureTests(_Base):
         n = (_PRE + 1) * _MS                  # pre-roll + the tripping chunk
         self.assertEqual(len(audio) * 1000 // 16000, n)
         self.assertEqual(self._shadow_lines(log), [
-            f"[eot-shadow] fire_ms=- p=- resumed=0 actual_ms={n}"])
+            f"[eot-shadow] fire_ms=- p=- resumed=0 actual_ms={n} pause_ms=0"])
         self.assertEqual(self._turn_fields(since)["eot"], "max")
 
     def test_a_capture_with_no_speech_prints_nothing(self):
@@ -426,7 +429,7 @@ class OwnerTurnLineTests(_Base):
         self.assertEqual(self._shadow_lines(log), [])
         self.assertEqual(self._shadow_lines(self._flush()), [
             f"[eot-shadow] fire_ms={_FIRE_MS} p=0.990 resumed=0 "
-            f"actual_ms={_TURN_MS}"])
+            f"actual_ms={_TURN_MS} pause_ms=0"])
         self.assertEqual(self._flush(), "")            # once per turn
 
     def test_the_next_loop_pass_drops_a_turn_that_was_never_accepted(self):
@@ -446,7 +449,7 @@ class OwnerTurnLineTests(_Base):
         self._capture(_TURN, accept=False)             # the newer turn
         self._capture(_TURN, smart=False, accept=False)  # an in-turn capture
         self.assertEqual(self._shadow_lines(self._flush()), [
-            f"[eot-shadow] fire_ms=- p=0.200 resumed=0 actual_ms={_TURN_MS}"])
+            f"[eot-shadow] fire_ms=- p=0.200 resumed=0 actual_ms={_TURN_MS} pause_ms=0"])
         # An owner listen that hears nothing (no line of its own) still
         # drops the line before it.
         self._capture(_TURN, accept=False)
@@ -514,7 +517,7 @@ class OwnerTurnLineTests(_Base):
         self.assertFalse(refused)
         self.assertEqual(self._shadow_lines(log), [
             f"[eot-shadow] fire_ms={_FIRE_MS} p=0.990 resumed=0 "
-            f"actual_ms={_TURN_MS}"])
+            f"actual_ms={_TURN_MS} pause_ms=0"])
         self.assertEqual(len(self.made), 2)            # both were measured
 
     def test_a_standby_capture_that_wakes_nothing_logs_no_line(self):
@@ -615,7 +618,7 @@ class ModeOffTests(_Base):
         self.assertNotIn("faster_whisper", tried)   # Smart Turn never asked
         self.assertTrue(np.array_equal(audio, off))
         self.assertEqual(self._shadow_lines(log), [
-            f"[eot-shadow] fire_ms=- p=- resumed=0 actual_ms={_TURN_MS}"])
+            f"[eot-shadow] fire_ms=- p=- resumed=0 actual_ms={_TURN_MS} pause_ms=0"])
         self.assertEqual(len(self._eot_lines(log)), 1)
         self.assertIn("smart turn off for this session (silero: load failed",
                       log)
@@ -785,7 +788,7 @@ class FaultTests(_Base):
              "RuntimeError: hook bug)"])
         self.assertEqual(len(self.made), 1)
         self.assertEqual(self._shadow_lines(logs[0]), [
-            f"[eot-shadow] fire_ms=- p=- resumed=0 actual_ms={_TURN_MS}"])
+            f"[eot-shadow] fire_ms=- p=- resumed=0 actual_ms={_TURN_MS} pause_ms=0"])
 
     def test_silero_failing_mid_session_changes_nothing_and_latches(self):
         np = self.np
@@ -797,7 +800,7 @@ class FaultTests(_Base):
         self.assertTrue(np.array_equal(audio, off))
         self.assertEqual(self.heard_by_turn, [])      # never asked
         self.assertEqual(self._shadow_lines(log), [
-            f"[eot-shadow] fire_ms=- p=- resumed=0 actual_ms={_TURN_MS}"])
+            f"[eot-shadow] fire_ms=- p=- resumed=0 actual_ms={_TURN_MS} pause_ms=0"])
         self.assertEqual(self._eot_lines(log), [
             "[eot] smart turn off for this session (silero: run failed: "
             "RuntimeError: ort)"])
@@ -815,7 +818,7 @@ class FaultTests(_Base):
         audio, log = self._capture(_TURN)
         self.assertTrue(np.array_equal(audio, off))
         self.assertEqual(self._shadow_lines(log), [
-            f"[eot-shadow] fire_ms=- p=- resumed=0 actual_ms={_TURN_MS}"])
+            f"[eot-shadow] fire_ms=- p=- resumed=0 actual_ms={_TURN_MS} pause_ms=0"])
         self.assertEqual(self._eot_lines(log), [
             "[eot] smart turn off for this session (smart turn: run failed: "
             "RuntimeError: ort)"])
@@ -845,14 +848,14 @@ class CaptureThreadCostTests(_Base):
         self.assertEqual(self._eot_lines(log), [])
         # That check's p is not used: no would-be end, no p.
         self.assertEqual(self._shadow_lines(log), [
-            f"[eot-shadow] fire_ms=- p=- resumed=0 actual_ms={_TURN_MS}"])
+            f"[eot-shadow] fire_ms=- p=- resumed=0 actual_ms={_TURN_MS} pause_ms=0"])
         self.assertEqual(self.bc._eot_turn.failed, "")   # 70 < its 150 ms
         # The next turn still gets Smart Turn, and its fast check counts.
         _a, log2 = self._capture(_TURN)
         self.assertEqual(len(self.made), 2)
         self.assertEqual(self._eot_lines(log2), [])
         self.assertEqual(self._shadow_lines(log2), [
-            f"[eot-shadow] fire_ms=- p=0.500 resumed=0 actual_ms={_TURN_MS}"])
+            f"[eot-shadow] fire_ms=- p=0.500 resumed=0 actual_ms={_TURN_MS} pause_ms=0"])
 
     def test_two_slow_checks_in_a_row_turn_smart_turn_off(self):
         np = self.np
@@ -888,7 +891,7 @@ class CaptureThreadCostTests(_Base):
         self.assertEqual(self._eot_lines(log + log2), [])
         self.assertEqual(len(self.made), 2)
         self.assertEqual(self._shadow_lines(log2), [
-            f"[eot-shadow] fire_ms=- p=0.500 resumed=0 actual_ms={_TURN_MS}"])
+            f"[eot-shadow] fire_ms=- p=0.500 resumed=0 actual_ms={_TURN_MS} pause_ms=0"])
 
     def test_the_speculative_snapshot_goes_before_a_check_on_its_chunk(self):
         # Speculative STT (off by default) snapshots at silent chunk 7; a
@@ -912,7 +915,7 @@ class CaptureThreadCostTests(_Base):
         self.assertEqual(events, [("spec", n), ("check", n)])
         self.assertEqual(self._shadow_lines(log), [
             f"[eot-shadow] fire_ms={n * _MS} p=0.990 resumed=0 "
-            f"actual_ms={_TURN_MS}"])
+            f"actual_ms={_TURN_MS} pause_ms=0"])
 
 
 class WarmerTests(_Base):

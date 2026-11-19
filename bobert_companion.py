@@ -17878,9 +17878,10 @@ if TURN_TAIL_PROBE:
 # record_speech(smart_endpoint=True) — stream what Whisper will hear into a
 # Silero detector and, in a real pause, ask Smart Turn v3.2 whether he has
 # finished (core/endpointing.EotDecider; the knobs are SMART_TURN_* in
-# core/config.py). This release ships SMART_TURN_MODE='off' (opt in to 'shadow' to log): nothing ends a
+# core/config.py). This release ships SMART_TURN_MODE='shadow' (3.0.26; see
+# core/config.py for why not 'on' yet): nothing ends a
 # turn early; each ACCEPTED owner turn logs one "[eot-shadow] fire_ms= p=
-# resumed= actual_ms=" line (right after its "You:" line) and its
+# resumed= actual_ms= pause_ms=" line (right after its "You:" line) and its
 # [turn-timing] line gets eot / st_p / st_n, and the owner promotes to 'on'
 # from that data. A capture the main loop drops — TV or another voice refused
 # in wake-word mode, a standby line with no wake word, self-echo, a filtered
@@ -18228,6 +18229,8 @@ _TURN_FLAG_KEYS = (
     "PROACTIVE_NO_ACTION_CLAIMS",
     "LEARN_PREFILTER",
     "BOOT_PARALLEL_LOAD",
+    "BOOT_CHANGELOG_BACKGROUND",
+    "FOLLOWUP_WINDOW_FROM_REPLY_END",
     "SPEECH_HYGIENE",
     "PROMPT_DIRECTIVE_V3",
     "PROMPT_ROUTED_V3",
@@ -22235,6 +22238,87 @@ def _quiet_faster_whisper_log() -> None:
         _logging.getLogger("faster_whisper").setLevel(_logging.WARNING)
     except Exception:
         pass
+
+
+# ── the release-notes line at boot (BOOT_CHANGELOG_BACKGROUND, 3.0.26) ─────
+def _changelog_background_on() -> bool:
+    """BOOT_CHANGELOG_BACKGROUND, read live. Never raises (True: the
+    default)."""
+    try:
+        v = globals().get("BOOT_CHANGELOG_BACKGROUND", True)
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "on", "yes")
+        return bool(v)
+    except Exception:
+        return True
+
+
+def _changelog_summary_text(last_ver, cur_ver, entry: str) -> str:
+    """One to three spoken sentences about the newest CHANGELOG entry via
+    the quick LLM helper; '' for an empty entry or any failure. Never
+    raises."""
+    if not entry:
+        return ""
+    system = (
+        "You are J.A.R.V.I.S. Summarise the following CHANGELOG.md "
+        "entry into ONE to THREE concise sentences spoken in your "
+        "own voice for the user (he/sir). Lead with phrasing like "
+        "'Sir, since we last spoke...'. Call out new capabilities "
+        "by name and the rough number of bug fixes if visible. "
+        "End with a brief pointer to the full changelog at "
+        "C:\\JARVIS\\CHANGELOG.md. Plain prose only — no markdown, "
+        "no bullets, no headers."
+    )
+    user = (
+        f"Previous announced version: {last_ver}\n"
+        f"Current version: {cur_ver}\n\n"
+        f"Latest changelog entry:\n\n{entry[:8000]}"
+    )
+    try:
+        return (_llm_quick(system, user, max_tokens=300,
+                           caller="boot_changelog_summary",
+                           background=True) or "").strip()
+    except Exception as e:
+        print(f"  [changelog] LLM summarise failed: {e}")
+        return ""
+
+
+def _changelog_announce(last_ver, cur_ver, entry: str,
+                        history: list) -> None:
+    """Summarise and speak the release notes. With BOOT_CHANGELOG_BACKGROUND
+    the summary is made on a daemon thread and queued through
+    proactive_announce (focus mode, presence hold and the standby rules
+    apply, as for any unprompted line; a '[boot] changelog ...' line says
+    so); off, it is made and spoken here, before the loop. Never raises."""
+    def work(background: bool) -> None:
+        summary = _changelog_summary_text(last_ver, cur_ver, entry)
+        if not summary:
+            print(f"  [changelog] no summary produced — skipping speech "
+                  f"(latest_entry_len={len(entry)})")
+            return
+        print(f"  [changelog] announcing v{last_ver}→v{cur_ver}: "
+              f"{summary}")
+        try:
+            if background:
+                proactive_announce(summary, source="changelog",
+                                   history_text=summary)
+            else:
+                _speak(summary)
+                history.append({"role": "assistant", "content": summary})
+        except Exception as e:
+            print(f"  [changelog] speak failed: {e}")
+
+    try:
+        if _changelog_background_on():
+            print("  [boot] changelog summary runs in the background "
+                  "(BOOT_CHANGELOG_BACKGROUND): the loop does not wait "
+                  "for the LLM")
+            threading.Thread(target=work, args=(True,), daemon=True,
+                             name="boot-changelog").start()
+        else:
+            work(False)
+    except Exception as e:
+        print(f"  [changelog] announcement failed: {e}")
 
 
 def _boot_whisper_worker() -> None:
@@ -27239,6 +27323,9 @@ def _note_first_owner_turn_of_day(test_inject: bool = False) -> bool:
 def _note_turn_boundary() -> None:
     """Main loop, top of every iteration: the previous turn (if any) is over,
     and any capture that did not become a turn was dropped."""
+    # The follow-up window runs from the end of the reply (3.0.26): the
+    # previous pass's reply (and any encore) has been played by now.
+    _followup_turn_over(bool(_turn_in_progress[0]))
     # Listening over media (2026-10-05): the minute line, and the wake duck
     # (D3) of the capture whose turn just ended goes back up.
     _listen_tick()
@@ -39779,6 +39866,57 @@ def _followup_keep_for_reply(why: str = "") -> None:
             _followup_window.forget_admit()
     except Exception:
         pass
+    _followup_note_cue()
+
+
+# ── the follow-up window runs from the END of the reply (3.0.26) ──────────
+# FOLLOWUP_WINDOW_FROM_REPLY_END (core/config.py; core/followup_window.py
+# "3.0.26"). The window used to open at the wake gate, before the brain and
+# the reply: live 11-16..11-17 the median voice turn ended 9.8 s after he
+# stopped talking, so a 20 s window often had 12 s or less left - and 5 of 55
+# had closed before JARVIS stopped speaking. _note_turn_boundary (the top of
+# every main-loop pass, i.e. after the reply and any encore have played)
+# calls _followup_turn_over: an answered turn that opened or kept-extended
+# the window re-arms it from now. A cue a drop gate spoke ("say it again")
+# or the standby greeting counts as a reply too (_followup_note_cue).
+_followup_cue_spoken = [False]
+
+
+def _followup_note_cue() -> None:
+    """JARVIS just spoke (or is about to speak) to the owner without a turn
+    being accepted - a drop gate's "say it again" cue or the standby
+    greeting: for the follow-up re-arm this pass counts as answered. Never
+    raises."""
+    try:
+        _followup_cue_spoken[0] = True
+    except Exception:
+        pass
+
+
+def _followup_turn_over(answered: bool) -> "float | None":
+    """The previous main-loop pass is over (_note_turn_boundary). When it
+    was answered (``answered``: its "You:" line was printed) or a cue was
+    spoken, and the window has a reply due (core.followup_window
+    rearm_after_reply), the window now runs FOLLOWUP_WINDOW_S from here.
+    Otherwise - or with FOLLOWUP_WINDOW_FROM_REPLY_END off - nothing is
+    re-armed. Logs one numbers-only line per re-arm. Returns the seconds
+    that were left before the re-arm, or None. Never raises."""
+    try:
+        cue, _followup_cue_spoken[0] = bool(_followup_cue_spoken[0]), False
+        win = _followup_window
+        if (not bool(globals().get("FOLLOWUP_WINDOW_FROM_REPLY_END", True))
+                or not (answered or cue)):
+            win.drop_reply_due()
+            return None
+        left = win.rearm_after_reply()
+        if left is not None:
+            print(f"  [follow-up] window re-armed after the reply "
+                  f"({left:.1f} s were left, now {win.window_s:.0f} s"
+                  f"{'; it had closed while JARVIS spoke' if left <= 0 else ''}"
+                  f")")
+        return left
+    except Exception:
+        return None
 
 
 def _followup_reply_expected(now: "float | None" = None) -> bool:
@@ -40231,9 +40369,27 @@ def _bus_mode_on() -> bool:
                                     _lm.DEFAULTS["MIC_BUS_MODE"])) == "on"
 
 
+def _bargein_mode() -> str:
+    """WAKE_BARGEIN_MODE: 'off' | 'shadow' | 'on' (3.0.26 added 'shadow':
+    the bus pre-gate listens over his speech and logs what 'on' would cut;
+    nothing is cut). Never raises."""
+    try:
+        return _lm.bargein_mode(globals().get("WAKE_BARGEIN_MODE",
+                                              _lm.DEFAULTS["WAKE_BARGEIN_MODE"]))
+    except Exception:
+        return "off"
+
+
 def _bargein_bus_on() -> bool:
-    return _lm.mode2(globals().get("WAKE_BARGEIN_MODE",
-                                    _lm.DEFAULTS["WAKE_BARGEIN_MODE"])) == "on"
+    """WAKE_BARGEIN_MODE 'on': a confirmed "Jarvis" / stop word over his own
+    speech stops it."""
+    return _bargein_mode() == "on"
+
+
+def _bargein_armed() -> bool:
+    """WAKE_BARGEIN_MODE 'shadow' or 'on': the pre-gate listens over his
+    speech and confirms each hit ('shadow' only logs the verdict)."""
+    return _bargein_mode() in ("shadow", "on")
 
 
 def _segment_s() -> float:
@@ -40330,16 +40486,86 @@ def _listen_tick() -> None:
                   f"drift {st.get('drift_ppm')} ppm, "
                   f"{'converging' if st.get('converging') else 'NOT converging'}"
                   f", frames over VAD raw {100.0 * fr['raw'] / n:.1f} % / "
-                  f"cancelled {100.0 * fr['sup'] / n:.1f} %"
+                  # Not converging = the canceller passes the mic through,
+                  # so 'cancelled' would be a share it did not cancel.
+                  + (f"cancelled {100.0 * fr['sup'] / n:.1f} %"
+                     if st.get('converging') else "cancelled -")
                   # MEDIA_AEC_DELAY_BOUNDS (v3.0.10): its counters, when on.
                   + (f", realigns {st.get('realigns')} "
                      f"({st.get('realign_rejected')} rejected, "
                      f"{st.get('delay_clamped')} clamped)"
                      if "realign_rejected" in st else "")
                   + ("" if not _aec_ref_missing[0]
-                     else " - reference MISSING (protected playback?)"))
+                     else " - reference MISSING (protected playback?)")
+                  + _media_aec_minute_extra(st, fr))
     except Exception:
         pass
+
+
+# ── the canceller's minute-line diagnostics (3.0.26, numbers only) ────────
+# speech-aec-ineffective: 85 % of the 11-16..11-17 [media-aec] minutes read
+# "NOT converging", but many of them had nothing to judge (a headset, the
+# reference missing, a quiet room), and the line could not say WHY the
+# others failed. This tail says whether the minute is scoreable and counts,
+# per minute, what moves the canceller's timeline: its re-anchors, blocks
+# cancelled against a late reference, filter resets, realigns, the
+# loopback's timeline slips (core/loopback_ref SLIP_*) and the bus's input
+# overflows / queue drops (core/mic_bus). Nothing here changes a frame.
+_aec_minute_prev: list = [None]
+_AEC_SCOREABLE_RAW = 0.05      # under this share of frames over VAD: quiet
+
+
+def _media_aec_minute_extra(st: dict, fr: dict) -> str:
+    """'; why <reason>' when the minute says nothing about the canceller
+    (headset / no loopback / reference missing / reference stale / no
+    frames / quiet), then '; per minute: ...' counters since the last line.
+    '' on any fault. Never raises."""
+    try:
+        why = _media_aec_bypass()
+        if not why and _aec_ref_missing[0]:
+            why = "reference missing"
+        if not why and _loopback_stale():
+            why = "reference stale"
+        n = int(fr.get("n", 0) or 0)
+        if not why and n <= 0:
+            why = "no frames"
+        if not why and float(fr.get("raw", 0)) / max(1, n) < _AEC_SCOREABLE_RAW:
+            why = "quiet"
+        cur = {k: float(st.get(k, 0) or 0)
+               for k in ("sessions", "ref_late", "resets", "realigns",
+                         "realign_rejected")}
+        lb = _loopback_obj[0]
+        if lb is not None:
+            ls = lb.status()
+            cur["slips"] = float(ls.get("slips", 0) or 0)
+            cur["slip_ms_net"] = float(ls.get("slip_ms_net", 0) or 0)
+            cur["capture_gaps"] = float(ls.get("capture_gaps", 0) or 0)
+        bus = _mic_bus_obj[0]
+        if bus is not None:
+            bs = bus.status()
+            cur["mic_overflows"] = float(bs.get("input_overflows", 0) or 0)
+            cur["mic_drops"] = float(bs.get("callback_dropped", 0) or 0)
+        prev, _aec_minute_prev[0] = _aec_minute_prev[0], cur
+        prev = prev or {}
+
+        def d(k):
+            return cur.get(k, 0.0) - prev.get(k, 0.0)
+
+        parts = [f"re-anchors {d('sessions'):.0f}",
+                 f"realigns/min {d('realigns'):.0f}",
+                 f"ref late {d('ref_late'):.0f}",
+                 f"resets {d('resets'):.0f}"]
+        if "slips" in cur:
+            parts.append(f"ref slips {d('slips'):.0f} "
+                         f"(net {d('slip_ms_net'):+.0f} ms, gaps "
+                         f"{d('capture_gaps'):.0f})")
+        if "mic_overflows" in cur:
+            parts.append(f"mic overflows {d('mic_overflows'):.0f}, "
+                         f"drops {d('mic_drops'):.0f}")
+        return ((f"; why {why}" if why else "; scoreable")
+                + "; per minute: " + ", ".join(parts))
+    except Exception:
+        return ""
 
 
 def _listen_ambient_wake_hit() -> None:
@@ -40842,7 +41068,7 @@ def _pregate_get():
     """The mic pre-gate worker while WAKE_PREGATE_MODE is not 'off' (built
     and attached on first use); None otherwise. Never raises."""
     try:
-        if _pregate_mode() == "off" and not _bargein_bus_on():
+        if _pregate_mode() == "off" and not _bargein_armed():
             return None
         pg = _pregate_obj[0]
         if pg is None:
@@ -40855,7 +41081,7 @@ def _pregate_get():
                             _pregate_threshold(), strict=_drm_strict_bump),
                         on_trigger=_pregate_on_trigger,
                         active=lambda: (_pregate_mode() != "off"
-                                        or _bargein_bus_on()))
+                                        or _bargein_armed()))
                     _pregate_obj[0] = pg
                     pg.start()
                     _pregate_attach()
@@ -40993,7 +41219,8 @@ def _pregate_on_trigger(t_hit: float, score: float) -> None:
         _listen_note("pregate_hits")
         bus = _mic_bus_obj[0]
         speaking = bool(_tts_playback_active[0] or _tts_reply_active[0])
-        if speaking and not (_bargein_bus_on() and score >= 0.5):
+        if speaking and not (_bargein_armed()
+                             and score >= _lm.BARGEIN_SCORE_MIN):
             return
         if not speaking and _pregate_mode() != "on":
             return
@@ -41074,11 +41301,7 @@ def _pregate_confirm_one(t_hit: float, score: float, speaking: bool) -> str:
         text, _conf = _wake_confirm_decode(audio)
         ok = _text_has_wake_prefix(text)
         if speaking:
-            if (ok or _wake_confirm_stop_word(text)) and request_tts_interrupt(
-                    "bus-wake", acoustic=True):
-                _listen_note("bargeins")
-                return "barge-in"
-            return "no-barge-in"
+            return _bargein_confirm(text, ok, score)
         if not ok:
             _listen_note("pregate_drops")
             return "dropped"
@@ -41124,6 +41347,62 @@ def _wake_confirm_stop_word(text: str) -> bool:
         return bool(_dsf.has_stop_word(text))
     except Exception:
         return False
+
+
+def _bargein_echo_word(text: str, wake: bool) -> str:
+    """The word that would cut JARVIS in the confirm cut ``text`` ("jarvis"
+    when ``wake``, any stop word) that his OWN recent lines also say (core.
+    listen_media.bargein_echo over core.self_echo.recent_words and the line
+    playing now), else ''. Never raises: a fault reads as an echo ("?")."""
+    try:
+        from core import device_speech_filter as _dsf
+        heard = _dsf.normalise(text).split()
+        keys = (["jarvis"] if wake else []) + [
+            w for w in heard if w in _dsf.STOP_WORDS]
+        own = set(_self_echo.recent_words(_lm.BARGEIN_OWN_WINDOW_S))
+        own.update(_dsf.normalise(_tts_current_text[0] or "").split())
+        return _lm.bargein_echo(keys, own)
+    except Exception:
+        return "?"
+
+
+def _bargein_confirm(text: str, wake: bool, score: float) -> str:
+    """D5 (WAKE_BARGEIN_MODE), the confirm of a pre-gate hit heard while
+    JARVIS speaks: ``text`` is the decoded cut, ``wake`` whether it starts
+    with the wake word. A cut with neither the wake word nor a stop word is
+    'no-barge-in'. One whose word his own recent lines also say is 'echo'
+    (the mic heard the speakers; the media canceller is not relied on).
+    Otherwise 'shadow' logs what 'on' would do ('would-barge-in') and 'on'
+    asks request_tts_interrupt (which keeps its own BARGE_IN_ENABLED and
+    "jarvis in this sentence" gates): 'barge-in' when it cut him. Logs the
+    kind of word and the score only, never the words. Never raises."""
+    try:
+        stop = _wake_confirm_stop_word(text)
+        if not (wake or stop):
+            _listen_note("bargein_none")
+            return "no-barge-in"
+        what = "the name" if wake else "a stop word"
+        mode = _bargein_mode()
+        echo = _bargein_echo_word(text, wake)
+        if echo:
+            _listen_note("bargein_echo")
+            print(f"  [barge-in] {mode}: heard {what} over his own speech "
+                  f"(pre-gate {float(score):.2f}) but his own line says "
+                  f"{'it' if echo != '?' else 'something unreadable'} - "
+                  f"his echo, not cut")
+            return "echo"
+        if mode != "on":
+            _listen_note("bargein_would")
+            print(f"  [barge-in] shadow: would cut JARVIS - {what} over his "
+                  f"speech, pre-gate {float(score):.2f} (BARGE_IN_ENABLED "
+                  f"{'on' if _barge_in_wake_enabled() else 'off'})")
+            return "would-barge-in"
+        if request_tts_interrupt("bus-wake", acoustic=True):
+            _listen_note("bargeins")
+            return "barge-in"
+        return "no-barge-in"
+    except Exception:
+        return "no-barge-in"
 
 
 def _pregate_take_hit(after_seq: int) -> "dict | None":
@@ -41671,7 +41950,7 @@ def _listen_media_boot() -> None:
                  f" @ {_pregate_threshold():.2f}, bus "
                  f"{'on' if _bus_mode_on() else 'off'}, aec {_aec_mode()}, "
                  f"veto {_veto_mode()}, wake duck {_duck_mode()}, "
-                 f"barge-in {'on' if _bargein_bus_on() else 'off'}")
+                 f"barge-in {_bargein_mode()}")
         print(f"  [listen-media] {modes}")
     except Exception:
         pass
@@ -54396,6 +54675,9 @@ def _handle_sleep_standby(injected_text: str | None):
             from_standby=_was_standby, wake_text=text)
         print(f"  [wake] greeting='{_greeting}' vol={_vol}")
         _speak(_greeting, volume_scale=_vol)
+        # The follow-up window the wake opened runs from the end of the
+        # greeting (3.0.26, _followup_turn_over at the next pass).
+        _followup_note_cue()
         # The greeting is a question ("Yes, sir?"): in wake-word mode admit
         # exactly ONE un-prefixed reply to it (see _should_refuse_background_
         # audio), even with FOLLOWUP_WINDOW_S at 0.
@@ -56649,41 +56931,12 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                     _latest_entry = (
                         _after_hdr[:_sep.start()] if _sep else _after_hdr
                     ).strip()
-                _summary = ""
-                if _latest_entry:
-                    _system = (
-                        "You are J.A.R.V.I.S. Summarise the following CHANGELOG.md "
-                        "entry into ONE to THREE concise sentences spoken in your "
-                        "own voice for the user (he/sir). Lead with phrasing like "
-                        "'Sir, since we last spoke...'. Call out new capabilities "
-                        "by name and the rough number of bug fixes if visible. "
-                        "End with a brief pointer to the full changelog at "
-                        "C:\\JARVIS\\CHANGELOG.md. Plain prose only — no markdown, "
-                        "no bullets, no headers."
-                    )
-                    _user = (
-                        f"Previous announced version: {_last_ver}\n"
-                        f"Current version: {_cur_ver}\n\n"
-                        f"Latest changelog entry:\n\n{_latest_entry[:8000]}"
-                    )
-                    try:
-                        _summary = (_llm_quick(_system, _user, max_tokens=300,
-                                               caller="boot_changelog_summary",
-                                               background=True) or "").strip()
-                    except Exception as _le:
-                        print(f"  [changelog] LLM summarise failed: {_le}")
-                if _summary:
-                    print(f"  [changelog] announcing v{_last_ver}→v{_cur_ver}: {_summary}")
-                    try:
-                        _speak(_summary)
-                        conversation_history.append(
-                            {"role": "assistant", "content": _summary}
-                        )
-                    except Exception as _spe:
-                        print(f"  [changelog] speak failed: {_spe}")
-                else:
-                    print(f"  [changelog] no summary produced — skipping speech "
-                          f"(latest_entry_len={len(_latest_entry)})")
+                # BOOT_CHANGELOG_BACKGROUND (3.0.26, reliability-11): the
+                # summary is an LLM call and every release boot made one on
+                # this thread BEFORE "Listening". On, it runs on a daemon
+                # thread and the line goes through the proactive queue.
+                _changelog_announce(_last_ver, _cur_ver, _latest_entry,
+                                    conversation_history)
                 # Stamp regardless of whether the summary spoke so a missing
                 # LLM backend or empty entry doesn't loop on every boot.
                 _stamp_version_announced(_vdata, _cur_ver, _ver_path)
@@ -56708,6 +56961,14 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         # Warm the local model's prompt cache for the first turn (the boot is
         # done: the system prompt has its final, post-skills shape).
         _main_loop_started_at[0] = time.monotonic()
+        # [boot] how long the process was deaf (3.0.26, reliability-11):
+        # the number that says whether a boot step is worth moving.
+        try:
+            import psutil as _ps_boot
+            print(f"  [boot] ready to listen {time.time() - _ps_boot.Process().create_time():.1f} s "
+                  f"after the process started")
+        except Exception:
+            pass
         _start_boot_reprime()
         # Arm the presence hold on queued proactive speech (starts the
         # physical-input watcher; see _presence_watch_start).

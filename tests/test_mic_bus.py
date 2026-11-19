@@ -258,6 +258,26 @@ class FrameTests(unittest.TestCase):
         h.bus._dsp_one(4096, 1.2, chunk(0.1))   # 2048 samples never arrived
         self.assertEqual(h.reopens[0], before + 1)
 
+    def test_input_overflows_are_counted_not_acted_on(self):
+        # PortAudio's input_overflow flag: samples lost before the callback,
+        # invisible in n_cb (3.0.26, the echo canceller's minute line).
+        class Flags:
+            def __init__(self, overflow):
+                self.input_overflow = overflow
+
+        h = Harness()
+        self.addCleanup(h.close)
+        h.bus.ensure(1)
+        st = h.stream()
+        x = chunk(0.1).reshape(-1, 1)
+        st.cb(x, len(x), None, Flags(True))
+        st.cb(x, len(x), None, Flags(False))
+        st.cb(x, len(x), None, None)
+        st.cb(x, len(x), None, Flags(True))
+        self.assertEqual(h.bus.status()["input_overflows"], 2)
+        self.assertTrue(h.wait(lambda: h.bus.n_written == 4 * 1024))
+        self.assertEqual(h.bus.status()["callback_dropped"], 0)
+
     def test_closed_time_is_counted(self):
         now = [100.0]
         h = Harness(clock=lambda: now[0])

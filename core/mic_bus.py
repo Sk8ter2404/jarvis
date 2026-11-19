@@ -226,6 +226,12 @@ class MicBus:
         self.n_written = 0            # samples written to the rings
         self._t_last_cb = None
         self.cb_dropped = 0
+        # PortAudio's own input overflows (the callback's status flag): the
+        # device dropped samples before the callback saw them, so the bus's
+        # sample count slipped behind the clock with no gap in n_cb - the
+        # echo canceller cannot see it (3.0.26, counted for its minute line;
+        # nothing changes).
+        self.cb_overflows = 0
         self.opens = 0
         self.closes = 0
         self.closed_s = 0.0           # wanted open, but closed
@@ -264,7 +270,11 @@ class MicBus:
             mono = (indata[:, 0].copy() if getattr(indata, "ndim", 1) > 1
                     else np.array(indata, dtype=np.float32, copy=True))
             t = self._clock()
+            overflow = bool(status is not None
+                            and getattr(status, "input_overflow", False))
             with self._cb_cv:
+                if overflow:
+                    self.cb_overflows += 1
                 self.n_cb += len(mono)
                 self._t_last_cb = t
                 if len(self._cbq) >= CALLBACK_QUEUE_MAX:
@@ -505,6 +515,7 @@ class MicBus:
                 "suspended": bool(sus),
                 "opens": self.opens, "closes": self.closes,
                 "n": self.n_written, "callback_dropped": self.cb_dropped,
+                "input_overflows": self.cb_overflows,
                 "subscribers": nsub, "subscriber_dropped": sub_dropped,
                 "closed_s": round(self.closed_s, 1)}
 

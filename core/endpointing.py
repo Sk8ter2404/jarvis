@@ -658,12 +658,22 @@ class EotRecord:
                It over-counts cut-offs: every re-trip counts, words or not.
     actual_ms  audio time from the first fed chunk to the last one: where the
                capture really ended. On a resumed=0 shadow turn, actual_ms -
-               fire_ms is what 'on' would have saved."""
+               fire_ms is what 'on' would have saved.
+    pause_ms   (3.0.26) the longest pause INSIDE the turn: a run of chunks
+               under the capture's RMS gate that more sound came after (the
+               final silence that ended the capture is not one), in ms. A
+               rule that may end a turn only after G ms of silence can cut
+               this turn only if pause_ms >= G, and saves at most the fixed
+               hangover minus G on a turn it does not cut, so the shadow
+               lines give the whole trade-off for any G (the 10-02..10-12
+               shadow run: 13 of 81 would-be ends at 256 ms were followed by
+               more sound, 8 of them by over a second of it)."""
 
     __slots__ = ("mode", "eot", "st_p", "st_n", "fire_ms", "resumed",
-                 "actual_ms")
+                 "actual_ms", "pause_ms")
 
-    def __init__(self, mode, eot, st_p, st_n, fire_ms, resumed, actual_ms):
+    def __init__(self, mode, eot, st_p, st_n, fire_ms, resumed, actual_ms,
+                 pause_ms=0):
         self.mode = mode
         self.eot = eot
         self.st_p = st_p
@@ -671,6 +681,7 @@ class EotRecord:
         self.fire_ms = fire_ms
         self.resumed = resumed
         self.actual_ms = actual_ms
+        self.pause_ms = pause_ms
 
     def stats(self) -> dict:
         """The [turn-timing] fields (TurnTiming.note_stat names)."""
@@ -679,15 +690,16 @@ class EotRecord:
                 "st_n": self.st_n}
 
     def shadow_line(self) -> "str | None":
-        """'[eot-shadow] fire_ms= p= resumed=0|1 actual_ms=' in shadow mode
-        (every turn, fired or not: '-' = never fired / never measured); None
-        in any other mode."""
+        """'[eot-shadow] fire_ms= p= resumed=0|1 actual_ms= pause_ms=' in
+        shadow mode (every turn, fired or not: '-' = never fired / never
+        measured); None in any other mode."""
         if self.mode != "shadow":
             return None
         fire = "-" if self.fire_ms is None else str(self.fire_ms)
         p = "-" if self.st_p is None else f"{self.st_p:.3f}"
         return (f"[eot-shadow] fire_ms={fire} p={p} "
-                f"resumed={self.resumed} actual_ms={self.actual_ms}")
+                f"resumed={self.resumed} actual_ms={self.actual_ms} "
+                f"pause_ms={self.pause_ms}")
 
 
 class EotDecider:
@@ -748,6 +760,8 @@ class EotDecider:
         self._p = None            # the latest p
         self._fire = None         # self._chunks when p >= threshold
         self._resumed = 0
+        self._prev_sil = 0        # the caller's silence count, last chunk
+        self._pause_max = 0       # the longest pause inside the turn, chunks
 
     def should_end(self) -> bool:
         """True once Smart Turn fired in mode 'on' (never in 'shadow')."""
@@ -760,6 +774,7 @@ class EotDecider:
             if self.mode == "off" or self.should_end():
                 return self.should_end()
             self._chunks += 1
+            self._note_pause(silence_n)
             if self._fire is not None:
                 if silence_n <= 0:
                     self._resumed = 1
@@ -771,6 +786,20 @@ class EotDecider:
         except Exception:
             self._vad_ok = False
         return self.should_end()
+
+    def _note_pause(self, silence_n) -> None:
+        """Track the pauses inside the turn (EotRecord.pause_ms): a silence
+        run that ends in a chunk over the gate (silence_n back to 0). The
+        caller feeds the pre-roll and every voiced chunk as silence 0, so a
+        run can only start after the owner was heard, and the run that ends
+        the capture is never closed. Never raises."""
+        try:
+            n = max(0, int(silence_n))
+            if n == 0 and self._prev_sil > self._pause_max:
+                self._pause_max = self._prev_sil
+            self._prev_sil = n
+        except Exception:
+            pass
 
     def _listen(self, chunk) -> None:
         try:
@@ -826,4 +855,5 @@ class EotDecider:
             self.mode, "st" if self.should_end() else eot, self._p, self._n,
             None if self._fire is None
             else int(round(self._fire * self._chunk_ms)),
-            self._resumed, int(round(self._chunks * self._chunk_ms)))
+            self._resumed, int(round(self._chunks * self._chunk_ms)),
+            int(round(self._pause_max * self._chunk_ms)))
