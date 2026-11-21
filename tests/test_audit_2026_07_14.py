@@ -185,6 +185,76 @@ class ReleaseNativeResourcesTests(unittest.TestCase):
         self.assertGreaterEqual(time.monotonic() - t0, 0.3)
         self.assertIn("did NOT all release", "\n".join(printed))
 
+    def test_teardown_suspends_the_mic_bus_through_its_owner_thread(self):
+        """TEAR-1 (2026-11-21): the always-open mic-bus stream was never
+        signalled, so every shutdown burned the whole 3 s budget and ended
+        with a stream open. suspend() is the owner-thread close; shutdown()
+        closes from the caller's thread (a cross-thread double close) and
+        must never be used here."""
+        import threading as _threading
+
+        class _Bus:
+            def __init__(self, bc):
+                self.bc = bc
+                self.suspend_timeouts = []
+                self.shutdown_called = False
+
+            def suspend(self, timeout=None):
+                self.suspend_timeouts.append(timeout)
+                # the owner thread closes its own stream a moment later
+                _threading.Timer(0.05, lambda: self.bc._active.__setitem__(
+                    0, False)).start()
+                return True
+
+            def shutdown(self):
+                self.shutdown_called = True
+
+        class _Bc:
+            _mic_lock = _threading.Lock()
+
+            def __init__(self):
+                self._active = [True]
+                self._watchdog_reset_signal = mock.Mock()
+                self._mic_bus_obj = [_Bus(self)]
+
+            def _pa_streams_live(self):
+                return self._active[0]
+
+        bc = _Bc()
+        printed = []
+        t0 = time.monotonic()
+        with mock.patch("builtins.print",
+                        side_effect=lambda *a, **k: printed.append(
+                            " ".join(str(x) for x in a))):
+            A._release_audio_streams(bc, budget_s=3.0)
+        self.assertLess(time.monotonic() - t0, 1.5,
+                        "teardown still waited out the audio-release budget")
+        text = "\n".join(printed)
+        self.assertIn("audio streams released", text)
+        self.assertIn("mic_bus", text)
+        self.assertNotIn("did NOT all release", text)
+        bus = bc._mic_bus_obj[0]
+        self.assertEqual(bus.suspend_timeouts, [1.0])
+        self.assertFalse(bus.shutdown_called,
+                         "closed the bus stream from the teardown thread")
+
+    def test_teardown_without_a_mic_bus_is_unchanged(self):
+        class _Bc:
+            import threading as _t
+            _mic_lock = _t.Lock()
+            _mic_bus_obj = [None]
+            _watchdog_reset_signal = mock.Mock()
+
+            def _pa_streams_live(self):
+                return False
+
+        printed = []
+        with mock.patch("builtins.print",
+                        side_effect=lambda *a, **k: printed.append(
+                            " ".join(str(x) for x in a))):
+            A._release_audio_streams(_Bc(), budget_s=0.5)
+        self.assertNotIn("mic_bus", "\n".join(printed))
+
     def test_release_waits_for_the_in_flight_gpu_worker(self):
         # 2026-07-14: unload() cannot release a model that is still LOADING.
         # A restart 83s into boot (chatterbox mid-warm) corpsed the process

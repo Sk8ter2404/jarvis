@@ -7913,6 +7913,27 @@ def _release_audio_streams(bc, budget_s: float = 3.0) -> None:
                     done[name] = True
         except Exception:
             pass
+        # (d) the always-open MIC BUS stream (MIC_BUS_MODE "on": one input
+        #     stream open for the whole session; part of _pa_streams_live via
+        #     _mic_bus_active). Nothing here used to signal it, so the wait
+        #     below ran out the whole budget on every shutdown (TEAR-1, 11-21
+        #     log: "did NOT all release in 3.0s") and TerminateProcess landed
+        #     with a stream open. LAST, so the wake-word and ambient readers
+        #     are already stopped and cannot fall back to a stream of their
+        #     own when the bus goes quiet. suspend() is the OWNER-THREAD close
+        #     path: the bus's own thread closes its own stream and the release
+        #     callback drops _mic_bus_active. NOT MicBus.shutdown(): that
+        #     closes from THIS thread while the owner may be closing or
+        #     reopening the same stream - a cross-thread double close of a
+        #     PortAudio stream, the H-3 / 0xc0000374 hazard this function
+        #     exists to prevent. Never resumed: the process is ending.
+        try:
+            bus = getattr(bc, "_mic_bus_obj", [None])[0]
+            if bus is not None:
+                bus.suspend(timeout=1.0)
+                done["mic_bus"] = True
+        except Exception:
+            pass
 
     try:
         import threading as _threading
