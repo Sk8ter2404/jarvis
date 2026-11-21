@@ -3944,6 +3944,11 @@ class EnsureWhisperOpenaiCudaFallbackTests(MonolithGlobalsTestCase):
                        self.bc._stt_model_name, self.bc._stt_engine)
         self.bc._stt = None
         _pin_whisper_load_state(self)
+        # v3.0.27: the CUDA-failure arm now releases VRAM through the real
+        # torch.cuda when torch is loaded (a real NVML probe): fake it here.
+        _rel = mock.patch.object(self.bc, "_whisper_release_vram")
+        self.release_vram = _rel.start()
+        self.addCleanup(_rel.stop)
 
     def tearDown(self):
         (self.bc._stt, self.bc._stt_device,
