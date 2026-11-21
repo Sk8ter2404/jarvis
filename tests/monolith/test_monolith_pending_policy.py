@@ -191,6 +191,24 @@ class QueuedSilentMicTests(_Base):
         self.assertIn("dropped stale announcement", log)
         self.assertEqual(self._read(), [])
 
+    def test_an_untagged_line_from_an_older_build_is_dropped(self):
+        # f27-a: restored from the queue file an older build wrote - no tag,
+        # so nothing can tell whether the mic recovered. Even while the latch
+        # is set in this run (a fresh, tagged copy covers that), never said.
+        self.bc._silent_mic_warned[0] = True
+        self._write([self._e(SILENT, "audio", 20.0)])
+        _, log = self._drain()
+        self.assertEqual(self.spoke, [])
+        self.assertIn("untagged silent-mic line left by an earlier run", log)
+        self.assertEqual(self._read(), [])
+
+    def test_a_tagged_line_from_before_a_restart_is_dropped(self):
+        # The latch is clear at every boot: a copy the last run left is stale.
+        self.bc._silent_mic_warned[0] = False
+        self._write([self._silent_line(age=60.0)])
+        self._drain()
+        self.assertEqual(self.spoke, [])
+
     def test_past_the_re_warn_limit_is_too_old(self):
         self.bc._silent_mic_warned[0] = True
         self._write([self._silent_line(age=self.bc.MIC_SILENT_REWARN_SECONDS
@@ -198,6 +216,67 @@ class QueuedSilentMicTests(_Base):
         _, log = self._drain()
         self.assertEqual(self.spoke, [])
         self.assertIn("mic_silent:", log)
+
+
+NEW_EP = "{0.0.1.00000000}.{synthetic-usb-mic}"
+NEW_MIC_ASK = ("Microphone (Synthetic USB Mic) appeared and Windows made it "
+               "the default, sir. I'm staying on the Desk Mic. Say 'use the "
+               "new microphone' to switch.")
+
+
+@requires_monolith
+class QueuedNewMicTests(_Base):
+    """f27-a: the queued new-microphone ask is said only while that mic is
+    still held back - not after he switched, the mic left, or a restart."""
+
+    def setUp(self):
+        super().setUp()
+        self.input_age[0] = 3.0
+        self._p(self.bc, "PENDING_SOURCE_POLICY", True, create=True)
+        state = dict(self.bc._NEW_MIC_STATE)
+        self._p(self.bc, "_NEW_MIC_STATE", state)
+        self.state = state
+
+    def _ask(self, age=10.0):
+        e = self._e(NEW_MIC_ASK, "audio", age)
+        e["still_valid"] = f"new_mic:{NEW_EP}"
+        e["supersede"] = "new-mic"
+        return e
+
+    def test_still_held_is_said(self):
+        self.state.update(held={"ep": NEW_EP, "prev": "desk", "since": 0.0},
+                          accepted="")
+        self._write([self._ask()])
+        self._drain()
+        self.assertEqual(self.spoke, [NEW_MIC_ASK])
+
+    def test_nothing_held_is_dropped(self):
+        self.state.update(held=None, accepted="")
+        self._write([self._ask()])
+        _, log = self._drain()
+        self.assertEqual(self.spoke, [])
+        self.assertIn("that new microphone is no longer waiting on sir", log)
+        self.assertEqual(self._read(), [])
+
+    def test_accepted_is_dropped(self):
+        self.state.update(held={"ep": NEW_EP, "prev": "desk", "since": 0.0},
+                          accepted=NEW_EP)
+        self._write([self._ask()])
+        self._drain()
+        self.assertEqual(self.spoke, [])
+
+    def test_the_skill_check_is_never_asked(self):
+        # The token is the monolith's: bambu_monitor's speech_still_valid
+        # would judge an unknown token on its own rules.
+        self.state.update(held={"ep": NEW_EP, "prev": "desk", "since": 0.0},
+                          accepted="")
+        import skills.bambu_monitor as bm
+        with mock.patch.object(bm, "speech_still_valid",
+                               return_value=False) as sv:
+            self._write([self._ask()])
+            self._drain()
+        sv.assert_not_called()
+        self.assertEqual(self.spoke, [NEW_MIC_ASK])
 
 
 @requires_monolith

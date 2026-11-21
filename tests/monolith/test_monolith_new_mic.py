@@ -150,6 +150,69 @@ class NewMicHoldTests(F._Base):
         self._passes(3)
         self.assertIsNone(self.bc._NEW_MIC_STATE["held"])
 
+    # f27-a: the queued ask carries a still_valid token the drain re-checks.
+    def _ask_token(self):
+        calls = [c for c in self.bc.proactive_announce.call_args_list
+                 if "appeared" in str(c.args[0] if c.args else "")]
+        self.assertEqual(len(calls), 1, calls)
+        kw = calls[0].kwargs
+        self.assertEqual(kw.get("supersede"), "new-mic")
+        token = kw.get("still_valid") or ""
+        self.assertEqual(token, f"new_mic:{STRANGER}")
+        return token
+
+    def test_the_queued_ask_is_true_while_the_mic_is_held(self):
+        self._plug_stranger()
+        self._passes(4)
+        self.assertTrue(self.bc._new_mic_still_valid(self._ask_token()))
+
+    def test_the_ask_is_stale_once_he_said_to_use_it(self):
+        self._plug_stranger()
+        self._passes(4)
+        token = self._ask_token()
+        self.bc._accept_held_new_mic()          # before the next pass, too
+        self.assertFalse(self.bc._new_mic_still_valid(token))
+        self._passes(4)
+        self.assertFalse(self.bc._new_mic_still_valid(token))
+
+    def test_the_ask_is_stale_once_the_mic_is_gone(self):
+        self._plug_stranger()
+        self._passes(4)
+        token = self._ask_token()
+        self.world.active.discard(STRANGER)      # unplugged ...
+        self.world.default_in = F.DESK           # ... default back
+        self._passes(3)
+        self.assertFalse(self.bc._new_mic_still_valid(token))
+
+    def test_a_replug_asks_again_when_the_drain_dropped_the_ask_unsaid(self):
+        # Plug, unplug before the queue drains (the drain drops the stale
+        # ask: he never heard it), replug inside the flap window: the once-
+        # per-window stamp must not keep the held mic a secret.
+        self._plug_stranger_once()
+        self._passes(3)
+        token = self._ask_token()
+        self.world.active.discard(STRANGER)
+        self.world.default_in = F.DESK
+        self._passes(3)
+        why = self.bc._queued_mic_line_stale(
+            {"message": "x appeared", "source": "audio",
+             "still_valid": token})
+        self.assertIn("no longer waiting", why)
+        self._plug_stranger_once()
+        self._passes(3)
+        asked = [m for m in self.spoken if "appeared" in m]
+        self.assertEqual(len(asked), 2, self.spoken)
+        self.assertIsNotNone(self.bc._NEW_MIC_STATE["held"])
+
+    def test_the_ask_is_stale_after_a_restart(self):
+        # A fresh run starts with nothing held.
+        self._plug_stranger()
+        self._passes(4)
+        token = self._ask_token()
+        self.bc._NEW_MIC_STATE.update(known=None, held=None, accepted="",
+                                      notified={})
+        self.assertFalse(self.bc._new_mic_still_valid(token))
+
 
 class NewMicActionTests(unittest.TestCase):
     def test_use_new_mic_and_its_alias_ask_the_monolith(self):

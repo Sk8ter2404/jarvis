@@ -65,6 +65,28 @@ class ClassTests(unittest.TestCase):
         # Only the audio source means it.
         self.assertEqual(pp.line_class(_e(silent, "voice_clone")), "other")
 
+    def test_only_an_untagged_silent_mic_line_is_untagged(self):
+        # f27-a: an older build's line cannot be re-checked at drain time.
+        silent = ("Sir, the Synthetic Desk Mic has been completely silent for "
+                  "30 seconds.")
+        self.assertTrue(pp.untagged_silent_mic(_e(silent, "audio")))
+        self.assertFalse(pp.untagged_silent_mic(_e(
+            silent, "audio",
+            still_valid=pp.MIC_SILENT_VALID_PREFIX + "Mic (Synthetic)")))
+        self.assertFalse(pp.untagged_silent_mic(_e(silent, "voice_clone")))
+        self.assertFalse(pp.untagged_silent_mic(_e("Switched to X, sir.",
+                                                   "audio")))
+        self.assertFalse(pp.untagged_silent_mic("not an entry"))
+
+    def test_the_new_mic_ask_is_a_mic_change_never_folded(self):
+        # f27-a: a folded recap fragment is never re-checked, so the ask is
+        # said whole while young enough, then dropped.
+        ask = _e("Microphone (Synthetic USB Mic) appeared and Windows made it "
+                 "the default, sir. Say 'use the new microphone' to switch.",
+                 "audio", still_valid=pp.NEW_MIC_VALID_PREFIX + "{ep}")
+        self.assertEqual(pp.line_class(ask), "mic_change")
+        self.assertTrue(pp.never_fold(ask))
+
     def test_a_merged_switch_line_is_still_a_mic_change(self):
         # 2026-11-17: one refresh pass, one sentence for both directions.
         self.assertEqual(pp.line_class(_e(
