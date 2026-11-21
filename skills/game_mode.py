@@ -900,6 +900,18 @@ class _State:
 
 
 _st = _State()
+
+
+def is_engaged() -> bool:
+    """Public read-only accessor: True while game mode is engaged. Other
+    skills read it through sys.modules (the loader registers this module as
+    'skill_game_mode') so asking never imports anything. Never raises."""
+    try:
+        return bool(_st.active)
+    except Exception:
+        return False
+
+
 _lock = threading.RLock()
 _stop = threading.Event()
 _thread = [None]
