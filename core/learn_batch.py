@@ -63,7 +63,11 @@ where the model starts writing. So:
 An in-flight HTTP request cannot be cancelled, so "abort when the owner
 starts talking" means: never START one then, keep a batch small
 (``max_jobs`` / ``max_chars``), and log it when the owner spoke during the
-call. ``enabled()`` False restores the old behaviour: ``submit`` returns
+call. v3.0.27 (core/bg_delivery.py): "spoke during the call" also counts an
+owner turn accepted while the call ran (``owner_mark()`` moved), and a job
+marked ``spoken`` (its answer ends in a line said aloud) is then answered ""
+instead of with its output when ``skip_spoken()`` (BG_SKIP_IF_OWNER_SPOKE)
+is on; data jobs (learning records) are always delivered. ``enabled()`` False restores the old behaviour: ``submit`` returns
 False and the caller runs its job the way it used to.
 
 Log lines (numbers and tags only, never prompt or speech text):
@@ -119,12 +123,13 @@ class Job:
     ``unbuild(ctx)``: gives a lazily built input back (optional).
     ``cap``: 0, or the most characters the next request carrying this job
     may hold (set when a packed request with it failed outright; SOLO_CAP =
-    it goes out alone)."""
+    it goes out alone). ``spoken``: its answer ends in a line said aloud, so
+    it is answered "" when the owner spoke during the call (v3.0.27)."""
 
     __slots__ = ("tag", "build", "apply", "unbuild", "queued_at", "attempts",
-                 "id", "cap")
+                 "id", "cap", "spoken")
 
-    def __init__(self, tag, build, apply, unbuild=None):
+    def __init__(self, tag, build, apply, unbuild=None, spoken=False):
         self.tag = _clean_tag(tag)
         self.build = build
         self.apply = apply
@@ -133,12 +138,14 @@ class Job:
         self.attempts = 0
         self.id = 0
         self.cap = 0
+        self.spoken = bool(spoken)
 
     @classmethod
-    def simple(cls, tag, system, user, max_tokens, apply):
+    def simple(cls, tag, system, user, max_tokens, apply, spoken=False):
         """A job whose prompt is fixed at submit time; ``apply(text)``."""
         spec = (str(system), str(user), int(max_tokens), None)
-        return cls(tag, lambda: spec, lambda text, _ctx: apply(text))
+        return cls(tag, lambda: spec, lambda text, _ctx: apply(text),
+                   spoken=spoken)
 
 
 def _clean_tag(tag) -> str:
@@ -319,12 +326,15 @@ def _reply_shape(text, limit: int = 160) -> str:
 class LearnBatcher:
     """See the module docstring. All collaborators are injected so the class
     is hermetic: ``llm(system, user, max_tokens) -> str``, ``quiet() -> bool``,
-    ``enabled()``, ``interval_s()``, ``max_jobs()``, ``clock()``, ``log(str)``.
+    ``enabled()``, ``interval_s()``, ``max_jobs()``, ``clock()``, ``log(str)``,
+    ``owner_mark() -> int`` (accepted owner turns so far; None = not
+    tracked) and ``skip_spoken() -> bool`` (BG_SKIP_IF_OWNER_SPOKE; None =
+    off, the v3.0.26 behaviour).
     """
 
     def __init__(self, llm, quiet, *, enabled=None, interval_s=None,
                  max_jobs=None, max_chars=None, clock=None, log=None,
-                 poll_s=DEFAULT_POLL_S):
+                 poll_s=DEFAULT_POLL_S, owner_mark=None, skip_spoken=None):
         self._llm = llm
         self._quiet = quiet
         self._enabled = enabled
@@ -334,6 +344,8 @@ class LearnBatcher:
         self._clock = clock or time.monotonic
         self._log = log or print
         self._poll_s = float(poll_s)
+        self._owner_mark = owner_mark
+        self._skip_spoken = skip_spoken
         self._lock = threading.Lock()
         self._queue: list = []
         self._seq = 0
@@ -341,7 +353,7 @@ class LearnBatcher:
         self._thread = None
         self._stop = threading.Event()
         self.stats = {"flushes": 0, "jobs": 0, "deferred": 0, "retried": 0,
-                      "solo": 0, "split": 0, "dropped": 0}
+                      "solo": 0, "split": 0, "dropped": 0, "skipped": 0}
         self._shape_logged_at = None     # clock() of the last shape line
         # "owner active" deferrals in a row (v3.0.26): logged once at the
         # start of a streak and once, with the count, when it ends - the
@@ -385,6 +397,23 @@ class LearnBatcher:
             self._log(msg)
         except Exception:
             pass
+
+    def _mark(self):
+        """owner_mark(), or None when not tracked / unreadable."""
+        if self._owner_mark is None:
+            return None
+        try:
+            return int(self._owner_mark())
+        except Exception:
+            return None
+
+    def _skip_spoken_on(self) -> bool:
+        if self._skip_spoken is None:
+            return False
+        try:
+            return bool(self._skip_spoken())
+        except Exception:
+            return False
 
     def _is_quiet(self) -> bool:
         try:
@@ -549,12 +578,16 @@ class LearnBatcher:
             packed = True
         chars = len(call[0]) + len(call[1])
         text = ""
+        mark = self._mark()
         try:
             text = self._llm(*call) or ""
         except Exception as e:
             self._say(f"  [learn-batch] call failed: {type(e).__name__}")
             text = ""
         owner_during = not self._is_quiet()
+        if not owner_during and mark is not None:
+            owner_during = self._mark() != mark
+        skip_spoken = owner_during and self._skip_spoken_on()
         results = ({built[0][0].id: text} if (not packed and text.strip())
                    else parse_results(text, [it[0].id for it in built]))
         if packed and text.strip() and not any(
@@ -565,11 +598,17 @@ class LearnBatcher:
             self._note_unreadable(text, len(built))
         else:
             split_cap = 0
-        ok = fail = dropped = 0
+        ok = fail = dropped = skipped = 0
         retry: list = []
         for job, _s, _u, _mt, ctx in built:
             out = results.get(job.id)
             if out is not None and (out.strip() or not packed):
+                if skip_spoken and getattr(job, "spoken", False):
+                    # v3.0.27: its line would land over / right after his
+                    # turn. Answered "" (the failure answer), never retried.
+                    skipped += 1
+                    self._give_up(job, ctx)
+                    continue
                 self._deliver(job, out, ctx)
                 ok += 1
                 continue
@@ -594,6 +633,7 @@ class LearnBatcher:
         if split_cap:
             self.stats["split"] += 1
         self.stats["dropped"] += dropped
+        self.stats["skipped"] += skipped
         elapsed = float(self._clock()) - float(started)
         self.stats["flushes"] += 1
         self.stats["jobs"] += ok
@@ -602,6 +642,7 @@ class LearnBatcher:
         extra = (f" retry={len(retry)}" if retry else "") \
             + (f" split<={split_cap}" if split_cap else "") \
             + (f" dropped={dropped}" if dropped else "") \
+            + (f" skipped-spoken={skipped}" if skipped else "") \
             + (" owner-spoke-during-call" if owner_during else "")
         self._say(f"  [learn-batch] sent {len(built)} job(s) ({mix}) "
                   f"packed={'yes' if packed else 'no'} ok={ok} fail={fail} "
@@ -609,7 +650,8 @@ class LearnBatcher:
         return {"jobs": len(built), "ok": ok, "failed": fail,
                 "retried": len(retry), "chars": chars, "elapsed_s": elapsed,
                 "packed": packed, "owner_during": owner_during,
-                "split_cap": split_cap, "dropped": dropped}
+                "split_cap": split_cap, "dropped": dropped,
+                "skipped": skipped}
 
     def _note_unreadable(self, text, n_jobs: int) -> None:
         """At most once per SHAPE_LOG_EVERY_S: the shape of a packed reply

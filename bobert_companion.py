@@ -3582,6 +3582,7 @@ def _learn_worker() -> None:
 # quiet check runs again right before the send, so a batch never starts in
 # front of an owner turn. Off, every caller runs exactly as before.
 from core import learn_batch as _learn_batch_mod  # noqa: E402
+from core import bg_delivery as _bg_delivery  # noqa: E402
 _learn_batcher_state = [None]
 _learn_batch_queued = {True: False, False: False}   # kind -> a job is waiting
 _LEARN_BATCH_TURNS_MAX = 12         # turns of one kind per extraction
@@ -3628,8 +3629,49 @@ def _learn_batcher() -> "_learn_batch_mod.LearnBatcher":
             _learn_batch_llm, _learn_batch_quiet,
             enabled=_learn_batch_on,
             interval_s=lambda: LEARN_BATCH_INTERVAL_S,
-            max_jobs=lambda: LEARN_BATCH_MAX_JOBS)
+            max_jobs=lambda: LEARN_BATCH_MAX_JOBS,
+            owner_mark=_bg_delivery.mark, skip_spoken=_bg_skip_on)
     return _learn_batcher_state[0]
+
+
+# ── Owner spoke during a background call (v3.0.27, core/bg_delivery.py) ──
+# v3.0.26 only kept a background call from STARTING while the owner talks.
+# One already running when he speaks now drops its spoken / queued line
+# (proactive remark, screen remark, boot changelog summary, a spoken learn
+# job) instead of saying it over or right after his turn. Data writes are
+# never skipped. BG_SKIP_IF_OWNER_SPOKE False = the v3.0.26 behaviour.
+def _bg_skip_on() -> bool:
+    """BG_SKIP_IF_OWNER_SPOKE, read live. Never raises."""
+    try:
+        return bool(globals().get("BG_SKIP_IF_OWNER_SPOKE", True))
+    except Exception:
+        return True
+
+
+def _bg_owner_active_now() -> bool:
+    """A turn of his is running, or a capture that is not the PC's music
+    (_capture_is_sustained_music) is in progress. Never raises (False)."""
+    try:
+        if _turn_in_progress[0]:
+            return True
+        return bool(_utterance_in_progress[0]
+                    and not _capture_is_sustained_music())
+    except Exception:
+        return False
+
+
+def _bg_skip_delivery(caller: str, mark, also_active: bool = False) -> bool:
+    """True (after one '[bg-skip]' log line) when the background result of
+    ``caller``, whose call began at ``mark`` (_bg_delivery.mark()), must not
+    be spoken or queued: the owner spoke during the call (an accepted turn
+    since the mark, a turn / capture of his in progress now, or
+    ``also_active``) and BG_SKIP_IF_OWNER_SPOKE is on. Never raises."""
+    try:
+        return _bg_delivery.should_skip(
+            caller, mark, active=bool(also_active) or _bg_owner_active_now(),
+            enabled=_bg_skip_on(), log=print)
+    except Exception:
+        return False
 
 
 def learn_batch_submit_text(tag: str, system: str, user: str,
@@ -18713,6 +18755,8 @@ _TURN_FLAG_KEYS = (
     "LEARN_PREFILTER",
     "BOOT_PARALLEL_LOAD",
     "BOOT_CHANGELOG_BACKGROUND",
+    # v3.0.27: a background line is dropped when he spoke during its call.
+    "BG_SKIP_IF_OWNER_SPOKE", "VOICE_SERVER_RSS_WARN_MB",
     "FOLLOWUP_WINDOW_FROM_REPLY_END",
     "SPEECH_HYGIENE",
     "PROMPT_DIRECTIVE_V3",
@@ -22868,10 +22912,15 @@ def _changelog_announce(last_ver, cur_ver, entry: str,
     apply, as for any unprompted line; a '[boot] changelog ...' line says
     so); off, it is made and spoken here, before the loop. Never raises."""
     def work(background: bool) -> None:
+        mark = _bg_delivery.mark()
         summary = _changelog_summary_text(last_ver, cur_ver, entry)
         if not summary:
             print(f"  [changelog] no summary produced — skipping speech "
                   f"(latest_entry_len={len(entry)})")
+            return
+        # v3.0.27: the background summary is not queued behind a turn he
+        # began while it was made (BG_SKIP_IF_OWNER_SPOKE).
+        if background and _bg_skip_delivery("boot_changelog_summary", mark):
             return
         print(f"  [changelog] announcing v{last_ver}→v{cur_ver}: "
               f"{summary}")
@@ -27950,6 +27999,9 @@ def _note_owner_turn() -> None:
     rebuild at the very start of this turn (a cold turn + a re-prime)."""
     _prev_owner_turn_at[0] = _last_owner_turn_at[0]
     _last_owner_turn_at[0] = time.monotonic()
+    # v3.0.27: a background call running now must not speak its line over
+    # or right after this turn (core/bg_delivery, BG_SKIP_IF_OWNER_SPOKE).
+    _bg_delivery.note_owner_turn()
     _note_conversation_activity()
     _turn_in_progress[0] = True
     _utterance_in_progress[0] = False
@@ -37126,10 +37178,16 @@ def _screen_remark_llm(addendum: str, user: str) -> str:
         base = _system_prompt
         if _llm_quick_goes_local():
             base = _local_stable_system_prompt(base) or base
+        mark = _bg_delivery.mark()
         with _lt.background_work("screen-remark"):
-            return _llm_quick(system=base + addendum, user=user,
-                              max_tokens=80, caller="screen_remark",
-                              background=True) or ""
+            out = _llm_quick(system=base + addendum, user=user,
+                             max_tokens=80, caller="screen_remark",
+                             background=True) or ""
+        # v3.0.27: he spoke while it was generated -> no remark (an empty
+        # answer is dropped by core/screen_remarks like any failed one).
+        if out and _bg_skip_delivery("screen_remark", mark):
+            return ""
+        return out
     except Exception as _e:
         print(f"  [screen-remark] generation failed: {type(_e).__name__}")
         return ""
@@ -51329,9 +51387,19 @@ def _do_proactive_turn(memory: dict):
     stop_evt = threading.Event()
     anim     = threading.Thread(target=_thinking_loop, args=(stop_evt,), daemon=True)
     anim.start()
+    # v3.0.27 (BG_SKIP_IF_OWNER_SPOKE): a turn of his, or a typed / injected
+    # command, that arrived while the remark was generated wins over it.
+    _bg_mark = _bg_delivery.mark()
+    try:
+        _bg_sig = _pending_work_signature()
+    except Exception:
+        _bg_sig = None
     text = generate_proactive_comment()
     stop_evt.set()
     anim.join()
+    if text and _bg_skip_delivery("proactive_remark", _bg_mark,
+                                  _inject_arrived_since(_bg_sig)):
+        text = ""
 
     if not text:
         set_state("idle")

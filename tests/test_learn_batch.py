@@ -570,6 +570,88 @@ class FailedPackTests(unittest.TestCase):
         self.assertTrue(any("owner-spoke-during-call" in l for l in logs))
 
 
+class OwnerSpokeSkipTests(unittest.TestCase):
+    """v3.0.27 (reliability-07, BG_SKIP_IF_OWNER_SPOKE): an owner turn
+    accepted while the call ran counts as "spoke during the call"; a
+    ``spoken`` job is then answered "" instead of its output, while a data
+    job (a learning record) is still delivered."""
+
+    def _batcher(self, skip_on=True):
+        b, clock, llm, state, logs = _make()
+        turns = [0]
+        b._owner_mark = lambda: turns[0]
+        b._skip_spoken = lambda: skip_on
+        return b, clock, llm, state, logs, turns
+
+    def _run(self, skip_on=True, spoken=True, he_spoke=True):
+        b, clock, llm, _state, logs, turns = self._batcher(skip_on)
+        got = []
+        b.submit(lb.Job.simple("judge", "SYS-A", "U1", 4, got.append,
+                               spoken=spoken))
+
+        def reply(*_a):
+            if he_spoke:
+                turns[0] += 1               # a turn of his was accepted
+            return "PERSON"
+        llm.reply = reply
+        clock.t += 400.0
+        return b.flush_once(), got, logs, b
+
+    def test_a_spoken_job_is_answered_empty_when_he_spoke(self):
+        res, got, logs, b = self._run()
+        self.assertEqual(got, [""])
+        self.assertEqual(res["skipped"], 1)
+        self.assertEqual(res["ok"], 0)
+        self.assertEqual(b.pending(), 0)        # never retried
+        self.assertTrue(res["owner_during"])
+        line = [l for l in logs if "[learn-batch] sent" in l][0]
+        self.assertIn("skipped-spoken=1", line)
+        self.assertIn("owner-spoke-during-call", line)
+        self.assertNotIn("SYS-A", line)
+
+    def test_a_data_job_is_still_delivered(self):
+        res, got, _logs, _b = self._run(spoken=False)
+        self.assertEqual(got, ["PERSON"])
+        self.assertEqual(res["skipped"], 0)
+        self.assertTrue(res["owner_during"])
+
+    def test_flag_off_delivers_the_spoken_job(self):
+        res, got, _logs, _b = self._run(skip_on=False)
+        self.assertEqual(got, ["PERSON"])
+        self.assertEqual(res["skipped"], 0)
+
+    def test_no_turn_during_the_call_delivers(self):
+        res, got, _logs, _b = self._run(he_spoke=False)
+        self.assertEqual(got, ["PERSON"])
+        self.assertFalse(res["owner_during"])
+
+    def test_without_the_hooks_behaviour_is_unchanged(self):
+        b, clock, llm, _state, _logs = _make()
+        got = []
+        b.submit(lb.Job.simple("judge", "S", "U", 4, got.append,
+                               spoken=True))
+        llm.reply = lambda *_a: "PERSON"
+        clock.t += 400.0
+        res = b.flush_once()
+        self.assertEqual(got, ["PERSON"])
+        self.assertEqual(res["skipped"], 0)
+
+    def test_a_raising_mark_never_breaks_the_flush(self):
+        b, clock, llm, _state, _logs = _make()
+
+        def boom():
+            raise RuntimeError("x")
+        b._owner_mark = boom
+        b._skip_spoken = lambda: True
+        got = []
+        b.submit(lb.Job.simple("judge", "S", "U", 4, got.append,
+                               spoken=True))
+        llm.reply = lambda *_a: "PERSON"
+        clock.t += 400.0
+        b.flush_once()
+        self.assertEqual(got, ["PERSON"])
+
+
 class QueueCapTests(unittest.TestCase):
     def test_queue_hard_cap_answers_the_oldest_empty(self):
         b, _c, _l, _s, logs = _make()
