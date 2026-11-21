@@ -1834,6 +1834,15 @@ SMART_TURN_SHADOW_SLOW_LIMIT = 5
 SHADOW_SUMMARY = True
 SHADOW_SUMMARY_EVERY_S = 1800.0
 
+# ─── Game mode: ambient decode pause (n20 GAME-2 / shadow F4, 2026-11-21) ──
+#   GAME_MODE_AMBIENT_DECODE_PAUSE  while game mode is engaged, skills/
+#                   ambient_listen hands no batch to Whisper / Parakeet /
+#                   voice-ID (the listener and its streams keep running; the
+#                   main loop's wake-word path is untouched), and the music
+#                   gate's ambient decision is 'skip' over music in 'shadow'
+#                   too. False = v3.0.26.
+GAME_MODE_AMBIENT_DECODE_PAUSE = True
+
 # ─── Turn checker (core/turn_checker.py, 2026-10-02) ──────────────────────
 # After every LLM turn (spoken or typed) the checker asks whether the reply
 # failed in a way a retry on Claude would fix: it claimed an action that never

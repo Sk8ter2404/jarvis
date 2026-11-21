@@ -623,6 +623,21 @@ class AmbientGateTests(_Base):
         self.assertEqual(self._counts()["skip_ambient"], 1)
         self.ident.assert_not_called()
 
+    def test_shadow_in_game_mode_skips_game_audio(self):
+        # n20 shadow F4 (2026-11-21): game audio is never transcribed while
+        # game mode is engaged; the flag off is v3.0.26 ('shadow').
+        self._mode("shadow")
+        self._music()
+        with mock.patch.object(self.bc, "_game_mode_active", lambda: True):
+            self.assertEqual(self.bc._music_gate_ambient(self.batch, 16000),
+                             {"verdict": "skip"})
+            with mock.patch.object(self.bc, "GAME_MODE_AMBIENT_DECODE_PAUSE",
+                                   False):
+                self.assertEqual(
+                    self.bc._music_gate_ambient(self.batch, 16000),
+                    {"verdict": "shadow"})
+        self.assertEqual(self._counts()["skip_ambient"], 1)
+
     def test_shadow_transcribes_and_counts_what_on_would_not(self):
         self._mode("shadow")
         self._music()

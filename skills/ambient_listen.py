@@ -318,6 +318,52 @@ def _identify_speaker_safe(audio: np.ndarray, sample_rate: int) -> tuple[Optiona
         return None, 0.0
 
 
+# ── Decode-only pause (n20 GAME-2 / shadow F4, 2026-11-21) ────────────────
+# Game mode stops ambient extraction but the listener kept running Whisper,
+# Parakeet and voice-ID over game audio (~16 decodes a minute on the CPU at
+# 91-98 % RAM). While this flag is set no mic batch (nor a main-loop
+# transcript) is handed to them; the streams, the worker and the main loop's
+# wake-word path stay exactly as they are. NEVER a stream close or a listener
+# stop here: tearing down PortAudio streams is the 0xc0000374 race
+# (skills/game_mode.py, "DELIBERATELY NOT TOUCHED").
+_decode_paused = threading.Event()
+_decode_pause_skipped = [0]          # batches not decoded while paused
+
+
+def pause_decode(_: str = "") -> str:
+    """Stop handing batches to Whisper / Parakeet / voice-ID (streams stay
+    open). Never raises."""
+    _decode_paused.set()
+    return "Ambient decoding paused."
+
+
+def resume_decode(_: str = "") -> str:
+    """Undo pause_decode. Never raises."""
+    if _decode_paused.is_set():
+        n = _decode_pause_skipped[0]
+        print(f"  [ambient-listen] decode resumed ({n} batch(es) skipped "
+              f"while paused)")
+    _decode_paused.clear()
+    _decode_pause_skipped[0] = 0
+    return "Ambient decoding resumed."
+
+
+def decode_paused() -> bool:
+    return _decode_paused.is_set()
+
+
+def _decode_pause_holds() -> bool:
+    """True when this batch must not be decoded (the pause is set). Counts
+    it. Never raises."""
+    try:
+        if _decode_paused.is_set():
+            _decode_pause_skipped[0] += 1
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _music_gate_check(b, audio: np.ndarray, sample_rate: int):
     """The host's music gate verdict for one mic batch
     (bobert_companion._music_gate_ambient, 2026-10-04): None = transcribe as
@@ -1363,7 +1409,10 @@ def _worker_loop() -> None:
         """One batch through the music gate (2026-10-04,
         bobert_companion._music_gate_ambient): over music with the gate 'on'
         a batch is never transcribed — no Whisper decode, nothing kept.
-        Otherwise _decode_batch, as always."""
+        Otherwise _decode_batch, as always. Nothing while the decode-only
+        pause is set (game mode)."""
+        if _decode_pause_holds():
+            return
         gate = _music_gate_check(b, audio, sample_rate)
         if isinstance(gate, dict) and gate.get("verdict") == "skip":
             return
@@ -1376,7 +1425,10 @@ def _worker_loop() -> None:
     def _keep_main(text, conf, peak, audio, sr, _span, ts):
         """AMBIENT_MAIN_DEDUPE: the main loop's transcript of a capture
         whose batches were not decoded here, through the music gate and
-        _keep_text exactly as a decoded batch (its capture time; no nudge)."""
+        _keep_text exactly as a decoded batch (its capture time; no nudge).
+        Nothing while the decode-only pause is set (no voice-ID either)."""
+        if _decode_pause_holds():
+            return
         sr = int(sr or sample_rate)
         gate = _music_gate_check(b, audio, sr)
         if isinstance(gate, dict) and gate.get("verdict") == "skip":
@@ -1735,8 +1787,11 @@ def _audio_worker_loop() -> None:
 
     def _keep_batch(audio, rms, cap_ts=None, ctx=None):
         """Transcribe one batch and log it. cap_ts / ctx are set only for a
-        batch the STT yield parked: it keeps its capture time and window."""
+        batch the STT yield parked: it keeps its capture time and window.
+        Nothing while the decode-only pause is set (game mode)."""
         global _audio_last_error, _audio_entries_total
+        if _decode_pause_holds():
+            return
         try:
             text, conf = transcribe(audio)
         except Exception as e:

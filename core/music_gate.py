@@ -169,9 +169,12 @@ def shadow_lost(line_passes, voice_fn) -> bool:
         return False
 
 
-def ambient_decision(mode, music) -> str:
+def ambient_decision(mode, music, game_mode=False) -> str:
     """One ambient batch: '' = transcribe as today, 'skip' (mode 'on'),
-    'shadow' (would skip). Over music no ambient batch is transcribed: an
+    'shadow' (would skip). `game_mode` (n20 shadow F4, 2026-11-21): while
+    game mode is engaged, music/game audio is 'skip' in 'shadow' too (mode
+    'off' stays ''); the main loop's wake-word path is untouched. Over music no
+    ambient batch is transcribed: an
     ambient line makes no turn (the main loop hears the owner's wake word
     and checks his voice on its own captures), and voice-ID cannot pick the
     owner out of music — on 10-04 (13:53-17:00, 1,917 ambient lines over
@@ -182,6 +185,8 @@ def ambient_decision(mode, music) -> str:
         mode = mode_setting(mode)
         if mode == "off" or not music:
             return ""
+        if game_mode:
+            return "skip"
         return _gated(mode)
     except Exception:
         return ""

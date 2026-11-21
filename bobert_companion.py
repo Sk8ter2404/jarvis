@@ -41139,7 +41139,11 @@ def _music_gate_ambient(audio, sample_rate) -> "dict | None":
             return None
         music = _music_now()
         _music_tick()
-        v = _music_gate.ambient_decision(mode, music)
+        # n20 shadow F4: game audio is never transcribed while game mode is
+        # engaged, in 'shadow' too (GAME_MODE_AMBIENT_DECODE_PAUSE).
+        game = (bool(globals().get("GAME_MODE_AMBIENT_DECODE_PAUSE", True))
+                and _game_mode_active())
+        v = _music_gate.ambient_decision(mode, music, game_mode=game)
         if v == "skip":
             _music_note("skip_ambient")
             return {"verdict": "skip"}
