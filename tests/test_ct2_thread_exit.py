@@ -265,17 +265,22 @@ class MonolithShapeTests(unittest.TestCase):
         self.assertEqual(hosted, 3)     # VAD decode, no-VAD retry, echo re-decode
 
     def test_a_cuda_model_is_only_built_through_run_for(self):
-        fn = _func(self.tree, "_ensure_whisper_locked")
-        for n in ast.walk(fn):
-            if isinstance(n, ast.Call) and _call_name(n) == "_FWM":
-                dev = [k.value for k in n.keywords if k.arg == "device"]
-                self.assertEqual(len(dev), 1)
-                self.assertIsInstance(dev[0], ast.Constant,
-                                      f"line {n.lineno}: a non-CPU _FWM build "
-                                      "outside _ct2_host.run_for")
-                self.assertEqual(dev[0].value, "cpu")
-        runs = [n for n in ast.walk(fn) if isinstance(n, ast.Call)
-                and _call_name(n) == "run_for"]
+        # Engine 1 lives in its own function since the 11-20 import-deadlock
+        # retry (_ensure_whisper_engine1); the loader is both.
+        fns = [_func(self.tree, "_ensure_whisper_locked"),
+               _func(self.tree, "_ensure_whisper_engine1")]
+        runs = []
+        for fn in fns:
+            for n in ast.walk(fn):
+                if isinstance(n, ast.Call) and _call_name(n) == "_FWM":
+                    dev = [k.value for k in n.keywords if k.arg == "device"]
+                    self.assertEqual(len(dev), 1)
+                    self.assertIsInstance(dev[0], ast.Constant,
+                                          f"line {n.lineno}: a non-CPU _FWM "
+                                          "build outside _ct2_host.run_for")
+                    self.assertEqual(dev[0].value, "cpu")
+            runs += [n for n in ast.walk(fn) if isinstance(n, ast.Call)
+                     and _call_name(n) == "run_for"]
         self.assertEqual(len(runs), 1)
 
     def test_boot_starts_the_driver_before_the_preflight(self):

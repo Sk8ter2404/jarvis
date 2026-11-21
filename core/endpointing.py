@@ -449,10 +449,14 @@ def whisper_features():
     padding=0: the input is already exactly 8 s (the default pads 160 more
     samples, one frame too many). Imports faster_whisper — call it lazily.
     The faster_whisper package imports ctranslate2, so the CUDA driver starts
-    first (core/cuda_preinit.py, v2.0.180 - a no-op once the boot did it)."""
+    first (core/cuda_preinit.py, v2.0.180 - a no-op once the boot did it).
+    The import goes through core/fw_import.py: parent package first, under
+    the lock the Whisper load shares (the 11-20 boot import deadlock)."""
     from core import cuda_preinit as _cuda_preinit
     _cuda_preinit.before_ctranslate2()
-    from faster_whisper.feature_extractor import FeatureExtractor
+    from core import fw_import as _fw_import
+    FeatureExtractor = _fw_import.import_faster_whisper(
+        "feature_extractor").FeatureExtractor
     fe = FeatureExtractor(feature_size=ST_MELS, sampling_rate=SAMPLE_RATE,
                           hop_length=160, chunk_length=ST_SECONDS, n_fft=400)
     return lambda x: fe(x, padding=0)

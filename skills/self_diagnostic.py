@@ -2922,6 +2922,8 @@ def _probe_stt() -> dict:
                 # core/cuda_preinit.py - a no-op once the boot did it).
                 from core import cuda_preinit as _cuda_preinit
                 _cuda_preinit.before_ctranslate2()
+                from core import fw_import as _fw_import
+                _fw_import.import_faster_whisper()    # shared import lock
                 from faster_whisper import WhisperModel as _FWM  # type: ignore
                 cpu_model = _FWM("tiny", device="cpu", compute_type="int8")
                 _do_transcribe(cpu_model)
