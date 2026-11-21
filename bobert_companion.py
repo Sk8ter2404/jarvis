@@ -18884,6 +18884,8 @@ _TURN_FLAG_KEYS = (
     # question's route, idle remarks across restarts.
     "CLAP_ACK_PASS_HOLDS_S", "ARRIVAL_PASS_HOLDS_S", "PENDING_DEFER_GAP_S",
     "AWAY_RECAP_ROUTE", "PROACTIVE_RECENT_KEEP_S", "PROACTIVE_DROP_STREAK",
+    # 2026-11-21: one automatic mic-stream reopen before the silent-mic warning.
+    "MIC_SILENT_REOPEN_FIRST", "MIC_SILENT_REOPEN_GRACE_S",
 )
 
 
@@ -20026,6 +20028,104 @@ def _report_silent_mic(silent_age: float, now: float) -> bool:
     except Exception as e:
         print(f"  [vad] silent-mic announcement failed: {e}")
     return True
+
+
+# 2026-11-21 (overhaul speech-mic-silent-rearm, point d): ONE automatic stream
+# reopen before the silent-mic warning is spoken. A stream that opens but
+# hands back zeros is sometimes cured by a fresh open, and then the warning
+# was a false alarm about a mic that works. When the detector would fire,
+# _silent_mic_gate asks for the reopen (the mic bus reopens on the same
+# device; a per-capture stream ends this idle listen, so the next capture
+# opens a new one), notes the silence clock and the last audible chunk then,
+# and lets the warning through only if NO audible chunk has arrived and
+# MIC_SILENT_REOPEN_GRACE_S more of LISTENED silence has passed. Rules:
+#   * never while JARVIS is speaking or while a capture is recording (it
+#     holds, and asks on a later idle chunk);
+#   * at most ONE automatic reopen per device per MIC_SILENT_REWARN_SECONDS:
+#     if sound came back after the reopen and then went silent again inside
+#     that window, the next fire warns straight away (a dead mic that clicks
+#     on every reopen must not be reopened forever and never reported);
+#   * a reopen that cannot be asked (no open bus, a suspended bus, an open
+#     already in flight), flag MIC_SILENT_REOPEN_FIRST off, or ANY error here
+#     = the v3.0.26 path: _report_silent_mic at once.
+# State: [reopen wall ts, silence age then, device, last audible ts then].
+_silent_mic_reopen = [0.0, 0.0, "", 0.0]
+
+
+def _silent_mic_reopen_reset() -> None:
+    _silent_mic_reopen[:] = [0.0, 0.0, "", 0.0]
+
+
+def _silent_mic_request_reopen(bus_cap) -> str:
+    """Ask for the one automatic reopen. 'bus' (the bus reopens itself on
+    its owner thread), 'stream' (the caller ends this idle listen; its
+    finally closes the per-capture stream) or '' (could not be asked).
+    Never raises."""
+    try:
+        if bus_cap:
+            bus = bus_cap.get("bus") if isinstance(bus_cap, dict) else None
+            if bus is not None and bus.request_reopen():
+                return "bus"
+            return ""
+        return "stream"
+    except Exception:
+        return ""
+
+
+def _silent_mic_gate(silent_age: float, now: float, *, recording: bool,
+                     tts_playing: bool, bus_cap=None) -> str:
+    """The detector would fire: 'warn' (call _report_silent_mic, the old
+    path), 'hold' (not yet) or 'exit' (a per-capture stream reopen was
+    asked: end this idle listen now). Never raises - an error is 'warn'."""
+    try:
+        if not bool(globals().get("MIC_SILENT_REOPEN_FIRST", False)):
+            return "warn"
+        try:
+            device = _device_cache.get("last_in_name") or ""
+        except Exception:
+            device = ""
+        # Inside the re-warn throttle _report_silent_mic is a no-op: leave it
+        # exactly as it was (and never reopen while it holds).
+        since_warn = now - _silent_mic_warned_at[0]
+        if (device == _silent_mic_warned_device[0]
+                and _silent_mic_warned_at[0] > 0.0
+                and 0.0 <= since_warn < MIC_SILENT_REWARN_SECONDS):
+            return "warn"
+        from core import audio_processor as _ap_ro
+        audible_ts = float(_ap_ro.get_vad_state().get(
+            "last_audible_chunk_ts") or 0.0)
+        at, age_then, dev_then, audible_then = _silent_mic_reopen
+        since_reopen = now - at
+        if (at > 0.0 and dev_then == device
+                and 0.0 <= since_reopen < MIC_SILENT_REWARN_SECONDS):
+            # The one reopen of this window was already tried.
+            if audible_ts != audible_then:
+                _silent_mic_reopen_reset()
+                return "warn"            # sound came back, then went again
+            grace = max(0.0, float(globals().get(
+                "MIC_SILENT_REOPEN_GRACE_S", 20.0)))
+            if float(silent_age) - float(age_then) >= grace:
+                _silent_mic_reopen_reset()
+                _after = float(silent_age) - float(age_then)
+                print(f"  [vad] still silent {_after:.0f}s after the "
+                      f"automatic reopen - warning")
+                return "warn"
+            return "hold"
+        if tts_playing or recording:
+            return "hold"
+        how = _silent_mic_request_reopen(bus_cap)
+        if not how:
+            return "warn"
+        _silent_mic_reopen[:] = [float(now), float(silent_age), device,
+                                 audible_ts]
+        print(f"  [vad] raw mic RMS ≈0 for {float(silent_age):.0f}s on "
+              f"{device or 'the default input'} - reopening the "
+              f"{'mic bus stream' if how == 'bus' else 'capture stream'} "
+              f"once before warning (MIC_SILENT_REOPEN_GRACE_S="
+              f"{globals().get('MIC_SILENT_REOPEN_GRACE_S', 20.0)})")
+        return "exit" if how == "stream" else "hold"
+    except Exception:
+        return "warn"
 
 # ── Main-loop watchdog (bug-5) ────────────────────────────────────────────
 # Guards against record_speech() (or anything else on the main thread)
@@ -21832,8 +21932,20 @@ def record_speech(timeout: float | None = None, *,
                         and silent_age > float(MIC_SILENT_WARN_SECONDS)
                         and not _tts_playback_active[0]):
                     # _report_silent_mic owns the latch, the re-warn throttle
-                    # and the spoken escalation.
-                    _report_silent_mic(silent_age, now_ts)
+                    # and the spoken escalation. _silent_mic_gate first asks
+                    # for ONE automatic stream reopen (2026-11-21,
+                    # MIC_SILENT_REOPEN_FIRST; 'warn' = the old path).
+                    _sg = _silent_mic_gate(
+                        silent_age, now_ts, recording=recording,
+                        tts_playing=bool(_tts_playback_active[0]),
+                        bus_cap=_bus_cap)
+                    if _sg == "exit":
+                        # A per-capture stream: end this idle listen; the
+                        # finally closes the stream, the next one is fresh.
+                        _utterance_in_progress[0] = False
+                        return None
+                    if _sg == "warn":
+                        _report_silent_mic(silent_age, now_ts)
                 elif _silent_mic_warned[0]:
                     # Clears the "believed silent" latch only on a SUSTAINED
                     # recovery, never on one chunk at the noise floor, and

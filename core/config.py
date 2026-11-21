@@ -3015,6 +3015,17 @@ AGC_FLATNESS_MAX = 0.80
 # mic warning. Distinguishes "user is silent" from "mic is hardware-dead".
 MIC_SILENT_WARN_SECONDS = 30.0
 
+# MIC_SILENT_REOPEN_FIRST (2026-11-21, overhaul speech-mic-silent-rearm point
+# d): before the silent-mic warning is spoken, record_speech asks for ONE
+# automatic reopen of the microphone stream (the mic bus reopens on the same
+# device; a per-capture stream ends the idle listen so the next one opens
+# fresh) and warns only if the mic is still silent for
+# MIC_SILENT_REOPEN_GRACE_S of LISTENED time after it. Never while JARVIS is
+# speaking or during a capture; at most one automatic reopen per device per
+# re-warn window. False = the v3.0.26 behaviour exactly (warn at once).
+MIC_SILENT_REOPEN_FIRST = True
+MIC_SILENT_REOPEN_GRACE_S = 20.0
+
 
 # ─── Cameras (multi-camera attention tracking) ─────────────────────────
 # "primary" camera tracks face position precisely (eyes follow you).

@@ -58,6 +58,9 @@ class _SilentBase(_ListenBase):
         # _edges stubs the reporter; these tests are ABOUT it.
         self._p(bc, "_report_silent_mic", real_report)
         self._p(bc, "MIC_BUS_MODE", "off", create=True)
+        # These tests pin the v3.0.26 path (warn at once); the one automatic
+        # reopen first (2026-11-21) is test_monolith_silent_mic_reopen's.
+        self._p(bc, "MIC_SILENT_REOPEN_FIRST", False, create=True)
         self._p(bc, "_safe_close_stream", lambda *a, **k: None)
         self._p(bc, "_tts_playback_active", [False])
         self.cache = dict(bc._device_cache)

@@ -501,6 +501,28 @@ class MicBus:
         with self._cv:
             self._cv.notify_all()
 
+    def request_reopen(self) -> bool:
+        """Close and reopen the open stream on the SAME device, on the owner
+        thread, without waiting (2026-11-21, the silent-mic warning's one
+        automatic reopen: a stream that opens but hands back only zeros is
+        sometimes cured by a fresh open). It rides the owner's existing
+        'device' close + reopen path (the fallback retry's flag). True when
+        it was asked; False (nothing changed) when no stream is open, the bus
+        is suspended or an open is already wanted / in flight. Never raises."""
+        try:
+            with self._cv:
+                if (self.stream is None or self._suspended
+                        or self._opening_since is not None
+                        or self._want_seq != self._done_seq):
+                    return False
+                self._retry_asked = True
+                self._want = (self.device_open,)
+                self._want_seq += 1
+                self._cv.notify_all()
+                return True
+        except Exception:
+            return False
+
     def status(self) -> dict:
         with self._cv:
             open_ = self.stream is not None
