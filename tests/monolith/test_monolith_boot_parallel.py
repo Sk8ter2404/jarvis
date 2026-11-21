@@ -22,6 +22,7 @@ import inspect
 import io
 import logging
 
+import sys
 import textwrap
 import threading
 import unittest
@@ -443,6 +444,101 @@ class BootOrderStaticTests(_Base):
             r"(?:        #[^\n]*\n)*"
             r"        _listen_media_boot\(\)\n"
             r"        while True:")
+
+
+@requires_monolith
+class BootImportRaceTests(_Base):
+    """The 11-20 boot (n20-F1, DL-1): the boot Whisper thread and the Smart
+    Turn warmer import faster_whisper at once. A real stub package on disk
+    (tests/test_fw_import.py) whose __init__ blocks on an Event makes the
+    race the real one: both threads are inside the import together."""
+
+    def setUp(self):
+        super().setUp()
+        bc = self.bc
+        self._saved_stt = (bc._stt, bc._stt_device, bc._stt_model_name,
+                           bc._stt_engine)
+        bc._stt = None
+        from tests.test_fw_import import StubFasterWhisper
+        self.stub = StubFasterWhisper(self)
+        self.wlib = mock.Mock()
+        self.wlib.load_model.return_value = "openai-model"
+        self.out = []
+        patches = [
+            mock.patch.dict(sys.modules, {"whisper": self.wlib}),
+            mock.patch.object(bc, "_cuda_driver_first"),
+            mock.patch.object(bc._cuda_preinit, "before_ctranslate2"),
+            mock.patch.object(bc, "_register_cuda_dll_dirs"),
+            mock.patch.object(bc, "_resolve_whisper_device",
+                              return_value="cpu"),
+            mock.patch.object(bc, "_force_whisper_cpu_int8", False),
+            mock.patch.object(bc._fw_import, "_DEADLOCK_RETRY_WAIT_S", 0.3),
+            mock.patch("builtins.print", side_effect=lambda *a, **k:
+                       self.out.append(" ".join(str(x) for x in a))),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        bc = self.bc
+        (bc._stt, bc._stt_device, bc._stt_model_name,
+         bc._stt_engine) = self._saved_stt
+        super().tearDown()
+
+    def _race(self, warmer):
+        bc = self.bc
+        box = {}
+
+        def _warm():
+            try:
+                box["warm"] = ("ok", warmer())
+            except BaseException as e:      # noqa: BLE001 - recorded
+                box["warm"] = ("err", e)
+        bc._whisper_bg["loading"] = True
+        ta = threading.Thread(target=bc._boot_whisper_worker,
+                              name="boot-whisper", daemon=True)
+        ta.start()
+        self.assertTrue(self.stub.ctl.entered.wait(5))
+        tb = threading.Thread(target=_warm, name="boot-warmers", daemon=True)
+        tb.start()
+        threading.Event().wait(0.4)       # the warmer is inside its import
+        self.stub.ctl.gate.set()
+        ta.join(15)
+        tb.join(15)
+        self.assertFalse(ta.is_alive() or tb.is_alive(), "boot import hung")
+        return box
+
+    def test_whisper_load_and_smart_turn_warm_together_reach_faster_whisper(self):
+        bc = self.bc
+        box = self._race(bc._endpointing.whisper_features)
+        self.assertEqual(box["warm"][0], "ok", box["warm"])
+        self.assertTrue(callable(box["warm"][1]))
+        self.assertEqual(bc._stt_engine, "faster_whisper")
+        self.assertEqual(bc._stt_device, "cpu")
+        self.wlib.load_model.assert_not_called()
+        self.assertEqual(self.stub.ctl.inits, ["boot-whisper"])
+        said = " | ".join(self.out)
+        self.assertNotIn("deadlock", said)
+        self.assertIn("whisper ready in the background", said)
+        self.assertFalse(bc._whisper_bg["loading"])
+
+    def test_a_real_import_deadlock_is_retried_not_sent_to_openai_whisper(self):
+        # The pre-fix Smart Turn import (submodule first, no shared lock):
+        # Python raises _DeadlockError in the Whisper thread, which must
+        # retry faster-whisper rather than switch engines.
+        bc = self.bc
+
+        def _old_child_first_import():
+            from faster_whisper.feature_extractor import FeatureExtractor
+            return FeatureExtractor
+        box = self._race(_old_child_first_import)
+        self.assertEqual(box["warm"][0], "ok", box["warm"])
+        said = " | ".join(self.out)
+        self.assertIn("import deadlock", said)
+        self.assertEqual(bc._stt_engine, "faster_whisper")
+        self.wlib.load_model.assert_not_called()
+        self.assertNotIn("falling back to openai-whisper", said)
 
 
 if __name__ == "__main__":

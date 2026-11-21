@@ -22432,6 +22432,7 @@ def _resolve_whisper_device() -> str:
 #   2. core/ct2_host: every CTranslate2 call on a CUDA model (load, decode +
 #      generator drain, release) runs on ONE thread that never exits.
 from core import cuda_preinit as _cuda_preinit  # noqa: E402
+from core import fw_import as _fw_import  # noqa: E402
 from core import ct2_host as _ct2_host  # noqa: E402
 
 _cuda_init_said = [False]
@@ -22686,88 +22687,166 @@ def _ensure_whisper_locked():
     dev_label = f"{base_dev}:{dev_index}" if base_dev == "cuda" else base_dev
 
     # ── Engine 1: faster-whisper (preferred for GPU speed + Py 3.14 CUDA) ──
-    try:
-        from faster_whisper import WhisperModel as _FWM
-        compute_type = cuda_compute if base_dev == "cuda" else "int8"
-        print(f"Loading faster-whisper '{model}' on {dev_label} "
-              f"(compute_type={compute_type})…")
+    # An import DEADLOCK is a race, not a broken install (11-20: the boot
+    # Whisper thread and the Smart Turn warmer imported faster_whisper at
+    # once and Whisper ran on the CPU all session). core/fw_import.py
+    # serialises every faster_whisper import and retries one deadlock; one
+    # that still gets here (from the model build, or a second race) runs
+    # Engine 1 once more instead of switching engines.
+    for _fw_attempt in (1, 2):
         try:
-            # A CUDA model is BUILT on the ct2-host thread (its per-thread
-            # CUDA state must never live on a thread that exits); a CPU
-            # model inline, as before.
-            _stt = _ct2_host.run_for(base_dev, _FWM, model, device=base_dev,
-                                     device_index=dev_index,
-                                     compute_type=compute_type)
-            _stt_engine = "faster_whisper"
-            _stt_device = dev_label
-            _stt_model_name = model
-            print(f"faster-whisper '{model}' ready on {dev_label}.\n")
-            if base_dev == "cuda":
-                _log_cuda_load_order()
+            _ensure_whisper_engine1(base_dev, dev_index, model, dev_label,
+                                    cuda_compute)
             return
-        except Exception as e:
-            if base_dev == "cuda":
-                if _is_cuda_dll_error(e):
-                    note = _cuda_dll_remediation_note()
-                    print(f"  [whisper] faster-whisper CUDA load failed (CUDA DLL "
-                          f"missing): {e}")
-                    print(f"  [whisper] {note}")
-                else:
-                    print(f"  [whisper] faster-whisper CUDA load failed: {e}")
-                # DOWNGRADE the model for the CPU retry: the CUDA path picked
-                # WHISPER_MODEL_CUDA (large-v3-turbo), which on CPU int8 runs at
-                # a small fraction of realtime and makes STT effectively
-                # unusable. Mirror the openai-whisper fallback below (which sets
-                # model = WHISPER_MODEL_CPU) and load the small CPU model. 2026-07-08.
-                model = WHISPER_MODEL_CPU
-                print(f"  [whisper] retrying on CPU with int8 using '{model}'…")
-                _stt = _FWM(model, device="cpu", compute_type="int8")
-                _stt_engine = "faster_whisper"
-                _stt_device = "cpu"
-                _stt_model_name = model
-                print(f"faster-whisper '{model}' ready on cpu (fallback).\n")
-                return
-            raise
-    except ImportError:
-        pass  # faster-whisper not installed — fall through to openai-whisper
-    except Exception as _fw_err:
-        # faster-whisper IS installed but its model LOAD failed (non-ImportError):
-        # first-run HF Hub download failure (network/disk), a corrupt CTranslate2
-        # cache, a CPU-feature mismatch, or a CUDA error whose CPU retry above also
-        # raised. The outer handler used to catch ONLY ImportError, so such a
-        # failure escaped _ensure_whisper() entirely and — since it's called at
-        # boot with no surrounding guard — aborted boot, WITHOUT ever attempting
-        # the openai-whisper engine. Fall through to Engine 2 instead so a cached
-        # or alternately-installed model can still bring STT up. 2026-07-08.
-        _stt = None
-        print(f"  [whisper] faster-whisper load failed "
-              f"({type(_fw_err).__name__}: {_fw_err}); falling back to "
-              f"openai-whisper.")
+        except ImportError:
+            break     # faster-whisper not installed — fall through to openai-whisper
+        except Exception as _fw_err:
+            _stt = None
+            if _fw_import.is_import_deadlock(_fw_err) and _fw_attempt == 1:
+                print(f"  [whisper] faster-whisper load hit an import "
+                      f"deadlock ({_fw_err}); retrying faster-whisper once")
+                time.sleep(0.5)
+                continue
+            # faster-whisper IS installed but its model LOAD failed
+            # (non-ImportError): first-run HF Hub download failure
+            # (network/disk), a corrupt CTranslate2 cache, a CPU-feature
+            # mismatch, or a CUDA error whose CPU retry also raised. Fall
+            # through to Engine 2 so a cached or alternately-installed model
+            # can still bring STT up (2026-07-08) — on the CPU with the CPU
+            # model: openai-whisper is fp16/fp32 torch, far bigger than the
+            # int8 plan this card was cleared for (11-20: large-v3-turbo on
+            # cuda:1 ran the 4 GB card out of memory and stranded 3.3 GB).
+            print(f"  [whisper] faster-whisper load failed "
+                  f"({type(_fw_err).__name__}: {_fw_err}); falling back to "
+                  f"openai-whisper on the CPU.")
+            base_dev, dev_index = "cpu", 0
+            model = WHISPER_MODEL_CPU
+            break
 
     # ── Engine 2: openai-whisper (legacy fallback) ─────────────────────────
+    # The device follows the VRAM plan (base_dev), never the raw setting.
+    device = device if base_dev == "cuda" else "cpu"
     print(f"Loading openai-whisper '{model}' on {device}… "
           f"(faster-whisper unavailable — install with: pip install faster-whisper)")
-    import whisper as _wlib
+    for _w_attempt in (1, 2):
+        try:
+            import whisper as _wlib
+            break
+        except Exception as _w_err:
+            if _w_attempt == 1 and _fw_import.is_import_deadlock(_w_err):
+                time.sleep(0.5)
+                continue
+            raise
+    _cuda_fail = None
     try:
         _stt = _wlib.load_model(model, device=device)
     except Exception as e:
-        if device == "cuda":
-            if _is_cuda_dll_error(e):
-                print(f"  [whisper] CUDA load of '{model}' failed (CUDA DLL "
-                      f"missing): {e}")
-                print(f"  [whisper] {_cuda_dll_remediation_note()}")
-            else:
-                print(f"  [whisper] CUDA load of '{model}' failed: {e}")
-            print(f"  [whisper] falling back to CPU model '{WHISPER_MODEL_CPU}'.")
-            device = "cpu"
-            model = WHISPER_MODEL_CPU
-            _stt = _wlib.load_model(model, device=device)
-        else:
+        # 'cuda' AND 'cuda:N' (11-20: the old `device == "cuda"` test missed
+        # 'cuda:1', so the OOM re-raised and the CPU model never loaded).
+        if not device.startswith("cuda"):
             raise
+        _cuda_fail = (str(e), _is_cuda_dll_error(e))
+    if _cuda_fail is not None:
+        # Outside the except block on purpose: the exception's traceback
+        # holds the half-built model, so the VRAM can only be released once
+        # it is gone.
+        _stt = None
+        if _cuda_fail[1]:
+            print(f"  [whisper] CUDA load of '{model}' failed (CUDA DLL "
+                  f"missing): {_cuda_fail[0]}")
+            print(f"  [whisper] {_cuda_dll_remediation_note()}")
+        else:
+            print(f"  [whisper] CUDA load of '{model}' failed: {_cuda_fail[0]}")
+        _whisper_release_vram(dev_index)
+        print(f"  [whisper] falling back to CPU model '{WHISPER_MODEL_CPU}'.")
+        device = "cpu"
+        model = WHISPER_MODEL_CPU
+        _stt = _wlib.load_model(model, device=device)
     _stt_engine = "openai_whisper"
     _stt_device = device
     _stt_model_name = model
     print(f"openai-whisper '{model}' ready on {device}.\n")
+
+
+def _whisper_release_vram(dev_index: int = 0) -> None:
+    """After a failed CUDA Whisper load (the caller has dropped its model
+    reference): collect the half-built model and hand torch's cached blocks
+    back to the driver, so the card is usable again (11-20: an openai-whisper
+    OOM left 3.3 GB on the 1650 for the whole session). Never raises."""
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        _torch = sys.modules.get("torch")
+        if _torch is None or not _torch.cuda.is_available():
+            return
+        _torch.cuda.empty_cache()
+        try:
+            free_b, total_b = _torch.cuda.mem_get_info(dev_index)
+            print(f"  [whisper] released the failed CUDA load: cuda:{dev_index} "
+                  f"{int(free_b) // (1024 * 1024)} MB free / "
+                  f"{int(total_b) // (1024 * 1024)} MB")
+        except Exception:
+            print("  [whisper] released the failed CUDA load (empty_cache)")
+    except Exception as e:
+        print(f"  [whisper] could not release VRAM after the failed load: {e}")
+
+
+def _ensure_whisper_engine1(base_dev, dev_index, model, dev_label,
+                            cuda_compute) -> None:
+    """Engine 1 of _ensure_whisper_locked (with _stt_lock held): load
+    faster-whisper, CUDA on the ct2-host thread, with the CPU-model retry
+    when the CUDA build fails. Returns with _stt set, or raises
+    (ImportError = not installed; an import deadlock is re-raised as is so
+    the caller can retry)."""
+    global _stt, _stt_device, _stt_model_name, _stt_engine
+    _cuda_driver_first()        # before ANY ctranslate2 import (idempotent)
+    _fw_import.import_faster_whisper()       # shared lock (11-20 deadlock)
+    from faster_whisper import WhisperModel as _FWM
+    compute_type = cuda_compute if base_dev == "cuda" else "int8"
+    print(f"Loading faster-whisper '{model}' on {dev_label} "
+          f"(compute_type={compute_type})…")
+    try:
+        # A CUDA model is BUILT on the ct2-host thread (its per-thread
+        # CUDA state must never live on a thread that exits); a CPU
+        # model inline, as before.
+        _stt = _ct2_host.run_for(base_dev, _FWM, model, device=base_dev,
+                                 device_index=dev_index,
+                                 compute_type=compute_type)
+        _stt_engine = "faster_whisper"
+        _stt_device = dev_label
+        _stt_model_name = model
+        print(f"faster-whisper '{model}' ready on {dev_label}.\n")
+        if base_dev == "cuda":
+            _log_cuda_load_order()
+        return
+    except Exception as e:
+        if _fw_import.is_import_deadlock(e):
+            raise     # a race, not a CUDA failure: the caller retries
+        if base_dev == "cuda":
+            if _is_cuda_dll_error(e):
+                note = _cuda_dll_remediation_note()
+                print(f"  [whisper] faster-whisper CUDA load failed (CUDA DLL "
+                      f"missing): {e}")
+                print(f"  [whisper] {note}")
+            else:
+                print(f"  [whisper] faster-whisper CUDA load failed: {e}")
+            # DOWNGRADE the model for the CPU retry: the CUDA path picked
+            # WHISPER_MODEL_CUDA (large-v3-turbo), which on CPU int8 runs at
+            # a small fraction of realtime and makes STT effectively
+            # unusable. Mirror the openai-whisper fallback below (which sets
+            # model = WHISPER_MODEL_CPU) and load the small CPU model. 2026-07-08.
+            model = WHISPER_MODEL_CPU
+            print(f"  [whisper] retrying on CPU with int8 using '{model}'…")
+            _stt = _FWM(model, device="cpu", compute_type="int8")
+            _stt_engine = "faster_whisper"
+            _stt_device = "cpu"
+            _stt_model_name = model
+            print(f"faster-whisper '{model}' ready on cpu (fallback).\n")
+            return
+        raise
 
 
 # ── BOOT_PARALLEL_LOAD (v3 W10): Whisper off the boot thread ──────────────
