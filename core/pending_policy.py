@@ -96,6 +96,12 @@ _MIC_CHANGE_RE = re.compile(r"^(?:switched to\b|headset (?:on|off)\b)",
 MIC_SILENT_VALID_PREFIX = "mic_silent:"
 _MIC_SILENT_RE = re.compile(r"\bhas been completely silent for\b",
                             re.IGNORECASE)
+# The "<mic> appeared and Windows made it the default ... say 'use the new
+# microphone'" ask (bobert_companion._apply_new_mic_hold): still_valid
+# "new_mic:<endpoint>", true only while that mic is still held back
+# (_new_mic_still_valid). A mic_change line: news for a moment, never a recap
+# fragment (a folded fragment is never re-checked).
+NEW_MIC_VALID_PREFIX = "new_mic:"
 _RAM_RE = re.compile(r"\bmemory usage is at\b", re.IGNORECASE)
 # self_diagnostic's "<the microphone> appears to be down" alert.
 _MIC_DOWN_RE = re.compile(r"\b(?:microphone|mic)\b[^.]{0,40}\bappears to be "
@@ -131,7 +137,10 @@ def line_class(entry) -> str:
                     MIC_SILENT_VALID_PREFIX)
                 or _MIC_SILENT_RE.search(text)):
             return "mic_silent"
-        if root == "audio" and _MIC_CHANGE_RE.match(text):
+        if root == "audio" and (
+                str(entry.get("still_valid") or "").startswith(
+                    NEW_MIC_VALID_PREFIX)
+                or _MIC_CHANGE_RE.match(text)):
             return "mic_change"
         if root == "self_diagnostic" and _MIC_DOWN_RE.search(text):
             return "mic_health"
@@ -146,6 +155,20 @@ def line_class(entry) -> str:
         return "other"
     except Exception:
         return ""
+
+
+def untagged_silent_mic(entry) -> bool:
+    """A silent-mic warning with no still_valid tag: only a build before
+    2026-11-17 queued one (the current one always tags it), so it was left by
+    an earlier run and cannot be re-checked against the mic it named. The
+    drain drops it whatever its age (f27-a: the 900 s limit alone let one be
+    said after a restart onto a working mic)."""
+    try:
+        return (line_class(entry) == "mic_silent"
+                and not str(entry.get("still_valid") or "").startswith(
+                    MIC_SILENT_VALID_PREFIX))
+    except Exception:
+        return False
 
 
 def never_fold(entry) -> bool:

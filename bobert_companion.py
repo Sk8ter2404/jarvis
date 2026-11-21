@@ -15782,6 +15782,11 @@ def _announce_device_changes(switches) -> None:
 _NEW_MIC_STATE: dict = {"known": None, "held": None, "accepted": "",
                         "notified": {}}
 _new_mic_lock = threading.Lock()
+# The queued ask's supersede family and still_valid prefix (the prefix is
+# core/pending_policy's, which classes the queued line by it: mic_change).
+_NEW_MIC_SUPERSEDE = "new-mic"
+from core.pending_policy import (  # noqa: E402
+    NEW_MIC_VALID_PREFIX as _NEW_MIC_VALID_PREFIX)
 
 
 def _fragment_matches_endpoint(endpoint_id, fragments) -> bool:
@@ -15876,7 +15881,11 @@ def _apply_new_mic_hold(now_eps, prev_eps, act, now: float):
                     f"{new_name[0].upper()}{new_name[1:]} appeared and "
                     f"Windows made it the default, sir. I'm staying on "
                     f"{cur_name}. Say 'use the new microphone' to switch.",
-                    source="audio", dedupe_key="audio:new_mic")
+                    source="audio", dedupe_key="audio:new_mic",
+                    # f27-a: one queued copy, re-checked at drain time - said
+                    # only while this mic is still held (_new_mic_still_valid).
+                    supersede=_NEW_MIC_SUPERSEDE,
+                    still_valid=f"{_NEW_MIC_VALID_PREFIX}{new_ep}")
             except Exception as e:
                 print(f"  [audio] new-microphone notice failed: {e}")
         return (now_eps[0], prev_ep)
@@ -15901,6 +15910,25 @@ def _accept_held_new_mic() -> str:
     except Exception:
         pass
     return _audio_endpoint_label(ep)
+
+
+def _new_mic_still_valid(token: str) -> bool:
+    """Drain-time check for a queued new-microphone ask ("new_mic:<endpoint>"):
+    still worth saying only while that mic is the one held back and he has
+    not already said to use it. The hold ends when the default moves back,
+    the mic in use goes, or he accepts (_apply_new_mic_hold), and a restart
+    starts with nothing held - each makes the ask false: "Say 'use the new
+    microphone'" with no new microphone waiting. Never raises; unreadable
+    state keeps the line."""
+    try:
+        ep = str(token)[len(_NEW_MIC_VALID_PREFIX):]
+        with _new_mic_lock:
+            held = _NEW_MIC_STATE.get("held")
+            accepted = _NEW_MIC_STATE.get("accepted") or ""
+        return bool(ep) and bool(held) and held.get("ep") == ep \
+            and accepted != ep
+    except Exception:
+        return True
 
 
 def _refresh_devices(force: bool = False):
@@ -19837,6 +19865,34 @@ def _silent_mic_still_valid(token: str) -> bool:
         return cur == dev
     except Exception:
         return True
+
+
+def _queued_mic_line_stale(item):
+    """The speech-queue drain's check for a queued microphone line. None = not
+    a line this judges (the caller goes on as before); "" = still true, say
+    it; otherwise why it is stale (logged with the drop).
+
+    * "mic_silent:<device>" - _silent_mic_still_valid (the latch is clear at
+      every boot, so a copy restored from the run before is dropped too);
+    * "new_mic:<endpoint>" - _new_mic_still_valid;
+    * a silent-mic warning with NO tag (core/pending_policy.
+      untagged_silent_mic): only a build before 2026-11-17 queued one, so it
+      is from an earlier run and nothing can re-check it - dropped, whatever
+      its age (it had only the 900 s limit).
+    Never raises (None on a fault: the line is said as before)."""
+    try:
+        sv = str((item or {}).get("still_valid") or "")
+        if sv.startswith(_MIC_SILENT_VALID_PREFIX):
+            return ("" if _silent_mic_still_valid(sv) else
+                    "the mic has been heard since, or JARVIS moved off it")
+        if sv.startswith(_NEW_MIC_VALID_PREFIX):
+            return ("" if _new_mic_still_valid(sv) else
+                    "that new microphone is no longer waiting on sir")
+        if _pending_policy_mod.untagged_silent_mic(item):
+            return "an untagged silent-mic line left by an earlier run"
+        return None
+    except Exception:
+        return None
 
 
 def _report_silent_mic(silent_age: float, now: float) -> bool:
@@ -53003,12 +53059,14 @@ def _speak_pending(only_sources=None, *, asked: bool = False):
         if not msg:
             continue
         _sv = item.get("still_valid")
-        if _sv and str(_sv).startswith(_MIC_SILENT_VALID_PREFIX):
-            # A queued silent-mic warning (2026-11-17): said only while the
-            # mic is still believed silent on the same device.
-            if not _silent_mic_still_valid(str(_sv)):
-                print(f"  [pending] dropped stale announcement (the mic has "
-                      f"been heard since, or JARVIS moved off it): {msg[:80]}")
+        _mic_stale = _queued_mic_line_stale(item)
+        if _mic_stale is not None:
+            # A queued microphone line (a silent-mic warning, 2026-11-17; a
+            # new-microphone ask, f27-a): said only while what it says is
+            # still true. Judged here, never by a skill's speech_still_valid.
+            if _mic_stale:
+                print(f"  [pending] dropped stale announcement ({_mic_stale})"
+                      f": {msg[:80]}")
                 _rewrite_queue_snapshot(consume_path, back + items[_pos + 1:])
                 continue
             _sv = None
