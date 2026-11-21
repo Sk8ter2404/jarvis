@@ -184,6 +184,26 @@ class NewMicHoldTests(F._Base):
         self._passes(3)
         self.assertFalse(self.bc._new_mic_still_valid(token))
 
+    def test_a_replug_asks_again_when_the_drain_dropped_the_ask_unsaid(self):
+        # Plug, unplug before the queue drains (the drain drops the stale
+        # ask: he never heard it), replug inside the flap window: the once-
+        # per-window stamp must not keep the held mic a secret.
+        self._plug_stranger_once()
+        self._passes(3)
+        token = self._ask_token()
+        self.world.active.discard(STRANGER)
+        self.world.default_in = F.DESK
+        self._passes(3)
+        why = self.bc._queued_mic_line_stale(
+            {"message": "x appeared", "source": "audio",
+             "still_valid": token})
+        self.assertIn("no longer waiting", why)
+        self._plug_stranger_once()
+        self._passes(3)
+        asked = [m for m in self.spoken if "appeared" in m]
+        self.assertEqual(len(asked), 2, self.spoken)
+        self.assertIsNotNone(self.bc._NEW_MIC_STATE["held"])
+
     def test_the_ask_is_stale_after_a_restart(self):
         # A fresh run starts with nothing held.
         self._plug_stranger()

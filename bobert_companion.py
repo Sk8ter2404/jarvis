@@ -15931,6 +15931,22 @@ def _new_mic_still_valid(token: str) -> bool:
         return True
 
 
+def _new_mic_ask_unsaid(token: str) -> None:
+    """The drain dropped a queued new-microphone ask unsaid: forget its
+    once-per-flap-window stamp, so a replug inside AUDIO_FLAP_WINDOW_S asks
+    again instead of logging "already told sir" about a line he never heard
+    (plug, unplug before the drain, replug: the mic would be held in
+    silence). Never raises."""
+    try:
+        ep = str(token)[len(_NEW_MIC_VALID_PREFIX):]
+        if not ep:
+            return
+        with _new_mic_lock:
+            (_NEW_MIC_STATE.get("notified") or {}).pop(ep, None)
+    except Exception:
+        pass
+
+
 def _refresh_devices(force: bool = False):
     """Re-check preferred devices if enough time has passed.
     Logs a message when the active device changes.
@@ -19886,8 +19902,10 @@ def _queued_mic_line_stale(item):
             return ("" if _silent_mic_still_valid(sv) else
                     "the mic has been heard since, or JARVIS moved off it")
         if sv.startswith(_NEW_MIC_VALID_PREFIX):
-            return ("" if _new_mic_still_valid(sv) else
-                    "that new microphone is no longer waiting on sir")
+            if _new_mic_still_valid(sv):
+                return ""
+            _new_mic_ask_unsaid(sv)     # never heard: a replug asks again
+            return "that new microphone is no longer waiting on sir"
         if _pending_policy_mod.untagged_silent_mic(item):
             return "an untagged silent-mic line left by an earlier run"
         return None
