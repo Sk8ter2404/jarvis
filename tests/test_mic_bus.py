@@ -114,6 +114,31 @@ class OpenCloseTests(unittest.TestCase):
         self.assertEqual([s.device for s in h.opened], [3, 5])
         self.assertTrue(h.opened[0].closed)
 
+    def test_request_reopen_reopens_on_the_same_device(self):
+        """The silent-mic warning's one automatic reopen (2026-11-21)."""
+        h = Harness()
+        self.addCleanup(h.close)
+        h.bus.ensure(3)
+        self.assertTrue(h.bus.request_reopen())
+        self.assertTrue(h.wait(lambda: len(h.opened) == 2 and h.bus.is_open()))
+        self.assertEqual([s.device for s in h.opened], [3, 3])
+        self.assertTrue(h.opened[0].closed)
+        self.assertTrue(h.owner[0])
+        self.assertEqual(h.reopens[0], 2)      # the canceller re-anchors
+        ok, _ = h.bus.ensure(3)                # no further reopen
+        self.assertTrue(ok)
+        self.assertEqual(len(h.opened), 2)
+
+    def test_request_reopen_refused_when_closed_or_suspended(self):
+        h = Harness()
+        self.addCleanup(h.close)
+        self.assertFalse(h.bus.request_reopen(), "nothing open")
+        h.bus.ensure(3)
+        self.assertTrue(h.bus.suspend())
+        self.assertFalse(h.bus.request_reopen(), "suspended")
+        h.bus.resume()
+        self.assertEqual(len(h.opened), 1)
+
     def test_mute_closes_the_stream_and_releases_the_owner(self):
         h = Harness()
         self.addCleanup(h.close)
