@@ -1576,6 +1576,14 @@ class ResetProfileActionTests(_BrowserAgentTestBase):
 
 
 class RegisterTests(_BrowserAgentTestBase):
+    # These pin the BROWSER_AGENT_LAZY_IMPORT=False path (the v3.0.26 full
+    # import); LazyRegisterTests below covers the default.
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(self.mod, "_lazy_import_on", return_value=False)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_registers_all_actions(self):
         acts: dict = {}
         with mock.patch.object(self.mod, "_bu_imports", return_value={}):
@@ -1621,6 +1629,44 @@ class RegisterTests(_BrowserAgentTestBase):
         mk.assert_called_once()  # profile dir ensured
         printed = " ".join(str(c) for c in pr.call_args_list)
         self.assertIn("ready", printed)
+
+
+class LazyRegisterTests(_BrowserAgentTestBase):
+    """BROWSER_AGENT_LAZY_IMPORT on (default): register() never imports
+    browser-use; it only asks whether the package is installed."""
+
+    def test_default_on(self):
+        import core.config as cfg
+        self.assertIs(cfg.BROWSER_AGENT_LAZY_IMPORT, True)
+        self.assertTrue(self.mod._lazy_import_on())
+        with mock.patch.object(cfg, "BROWSER_AGENT_LAZY_IMPORT", "off"):
+            self.assertFalse(self.mod._lazy_import_on())
+
+    def test_register_does_not_import_browser_use(self):
+        boom = mock.MagicMock(side_effect=AssertionError("imported at register"))
+        spec = mock.MagicMock(return_value=object())
+        with mock.patch.object(self.mod, "_bu_imports", boom),                 mock.patch("importlib.util.find_spec", spec),                 mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-x"}),                 mock.patch.object(self.mod, "_model_name", return_value="m"),                 mock.patch.object(self.mod.os, "makedirs") as mk,                 mock.patch("builtins.print") as pr:
+            acts: dict = {}
+            self.mod.register(acts)
+        boom.assert_not_called()
+        spec.assert_called_once_with("browser_use")
+        mk.assert_called_once()
+        self.assertIn("browser_task", acts)
+        self.assertIn("ready", " ".join(str(c) for c in pr.call_args_list))
+
+    def test_register_quiet_when_not_installed(self):
+        with mock.patch.object(self.mod, "_bu_imports",
+                               side_effect=AssertionError("imported")),                 mock.patch("importlib.util.find_spec", return_value=None),                 mock.patch.object(self.mod.os, "makedirs") as mk:
+            acts: dict = {}
+            self.mod.register(acts)
+        mk.assert_not_called()
+        self.assertIn("browser_task", acts)
+
+    def test_find_spec_error_is_treated_as_absent(self):
+        with mock.patch("importlib.util.find_spec",
+                        side_effect=ValueError("bad spec")),                 mock.patch.object(self.mod.os, "makedirs") as mk:
+            self.mod.register({})
+        mk.assert_not_called()
 
 
 class StartLoopThreadTests(_BrowserAgentTestBase):

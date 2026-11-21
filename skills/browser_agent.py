@@ -1298,6 +1298,40 @@ def _action_browser_reset_profile(_: str = "") -> str:
     return "Sandboxed Chromium profile wiped, sir."
 
 
+# ── BROWSER_AGENT_LAZY_IMPORT (reliability-11, 2026-11-21) ─────────
+# register() used to import browser-use (pydantic models, its LLM wrappers:
+# 1.25 s warm in isolation, inside the 6 s skill-load gap at browser_agent
+# on the 11-20 boot) only to decide whether to print its "ready" line. Every
+# action imports it anyway when it runs (_bu_imports in the task/open paths).
+# On (default): register() only asks importlib whether the package is
+# installed (no import). Off: the full import at register, as in v3.0.26.
+def _lazy_import_on() -> bool:
+    """core.config.BROWSER_AGENT_LAZY_IMPORT, read live (default True).
+    Never raises."""
+    try:
+        import core.config as _cfg
+        v = getattr(_cfg, "BROWSER_AGENT_LAZY_IMPORT", True)
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "on", "yes")
+        return bool(v)
+    except Exception:
+        return True
+
+
+def _bu_installed_for_register() -> bool:
+    """Whether register() should treat browser-use as present. Lazy: an
+    installed-package check that imports nothing (an install whose Agent
+    class is missing is then reported by the action that needs it, with the
+    same install hint). Off: the full _bu_imports() check. Never raises."""
+    try:
+        if _lazy_import_on():
+            import importlib.util as _iu
+            return _iu.find_spec("browser_use") is not None
+        return bool(_bu_imports().get("Agent"))
+    except Exception:
+        return False
+
+
 # ── skill entry point ──────────────────────────────────────────────
 def register(actions: dict) -> None:
     handlers: dict[str, Callable[[str], str]] = {
@@ -1318,7 +1352,7 @@ def register(actions: dict) -> None:
         if name not in actions:
             actions[name] = fn
 
-    if not _bu_imports().get("Agent"):
+    if not _bu_installed_for_register():
         # browser-use not installed — stay quiet on the boot log.
         # Actions are still registered and will return the install hint.
         return

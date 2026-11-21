@@ -1520,6 +1520,13 @@ BOOT_CHANGELOG_BACKGROUND  = True
 # on the boot thread just before the face tracker, as in v3.0.26.
 # Changes apply on the next start.
 BOOT_AUDIO_PROC_PREWARM    = True
+# BROWSER_AGENT_LAZY_IMPORT (2026-11-21, reliability-11): skills/browser_agent
+# register() imported browser-use (about 1.3 s warm, more under boot
+# contention) only to decide whether to print its "ready" line. True
+# (default) = register() checks that the package is installed without
+# importing it; the actions import it when they run, as they always did.
+# False = the full import at register, as in v3.0.26. Next start.
+BROWSER_AGENT_LAZY_IMPORT  = True
 
 # ─── Where the listening models run (core/listen_devices.py, 2026-10-04) ──
 # PARAKEET_DEVICE / SMART_TURN_DEVICE / VOICE_ID_DEVICE: 'cpu' | 'listen' |
