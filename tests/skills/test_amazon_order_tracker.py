@@ -1184,7 +1184,12 @@ class MonitorLifecycleTests(AmazonTestBase):
     def test_deferred_start_does_not_check_backend(self):
         started = []
         boom = mock.MagicMock(side_effect=AssertionError("checked on boot"))
-        with mock.patch.object(self.mod, "_read_feature_flag", return_value=True),              mock.patch.object(self.mod, "_defer_backend_check", return_value=True),              mock.patch.object(self.mod, "_any_backend", boom),              mock.patch.object(self.mod, "_gmail_configured", boom),              mock.patch.object(self.mod, "_backend_problem", boom),              mock.patch.object(self.mod.threading.Thread, "start",
+        with mock.patch.object(self.mod, "_read_feature_flag", return_value=True), \
+                mock.patch.object(self.mod, "_defer_backend_check", return_value=True), \
+                mock.patch.object(self.mod, "_any_backend", boom), \
+                mock.patch.object(self.mod, "_gmail_configured", boom), \
+                mock.patch.object(self.mod, "_backend_problem", boom), \
+                mock.patch.object(self.mod.threading.Thread, "start",
                                lambda self_t: started.append(self_t)):
             self.assertTrue(self.mod.start_monitor())
         self.assertEqual(len(started), 1)
@@ -1195,14 +1200,20 @@ class MonitorLifecycleTests(AmazonTestBase):
         et = types.SimpleNamespace(
             is_gmail_available=mock.MagicMock(side_effect=AssertionError("probe")),
             _outlook_configured=mock.MagicMock(side_effect=AssertionError("probe")))
-        with mock.patch.object(self.mod, "_read_feature_flag", return_value=True),              mock.patch.object(self.mod, "_defer_backend_check", return_value=True),              mock.patch.object(self.mod, "_email_triage", return_value=et),              mock.patch.object(self.mod.threading.Thread, "start", lambda self_t: None):
+        with mock.patch.object(self.mod, "_read_feature_flag", return_value=True), \
+                mock.patch.object(self.mod, "_defer_backend_check", return_value=True), \
+                mock.patch.object(self.mod, "_email_triage", return_value=et), \
+                mock.patch.object(self.mod.threading.Thread, "start", lambda self_t: None):
             self.mod.register({})
         et.is_gmail_available.assert_not_called()
         et._outlook_configured.assert_not_called()
 
     def test_flag_off_checks_backend_on_the_calling_thread(self):
         started = []
-        with mock.patch.object(self.mod, "_read_feature_flag", return_value=True),              mock.patch.object(self.mod, "_defer_backend_check", return_value=False),              mock.patch.object(self.mod, "_any_backend", return_value=True) as ab,              mock.patch.object(self.mod.threading.Thread, "start",
+        with mock.patch.object(self.mod, "_read_feature_flag", return_value=True), \
+                mock.patch.object(self.mod, "_defer_backend_check", return_value=False), \
+                mock.patch.object(self.mod, "_any_backend", return_value=True) as ab, \
+                mock.patch.object(self.mod.threading.Thread, "start",
                                lambda self_t: started.append(self_t)):
             self.assertTrue(self.mod.start_monitor())
         ab.assert_called_once()
@@ -1213,19 +1224,42 @@ class MonitorLifecycleTests(AmazonTestBase):
         evt.wait.side_effect = [False, True]
         evt.is_set.return_value = False
         out = io.StringIO()
-        with mock.patch.object(self.mod, "_any_backend", return_value=False),              mock.patch.object(self.mod, "_backend_problem", return_value="no sign-in"),              contextlib.redirect_stdout(out):
+        with mock.patch.object(self.mod, "_any_backend", return_value=False), \
+                mock.patch.object(self.mod, "_backend_problem", return_value="no sign-in"), \
+                contextlib.redirect_stdout(out):
             self.mod._poll_loop(evt, report_status=True)
         text = out.getvalue()
         self.assertIn("order tracker idle: no sign-in", text)
         # The idle line stands in for the "waiting" line (not printed twice).
         self.assertNotIn("waiting for a Google sign-in", text)
 
+    def test_deferred_idle_then_sign_in_announces_tracking(self):
+        # The deferred idle line sets logged_missing, so a later sign-in
+        # still logs "tracking now" exactly once and polls.
+        evt = mock.MagicMock()
+        evt.wait.side_effect = [False, False, True]
+        evt.is_set.return_value = False
+        out = io.StringIO()
+        with mock.patch.object(self.mod, "_any_backend",
+                               side_effect=[False, False, True]), \
+                mock.patch.object(self.mod, "_backend_problem", return_value="no sign-in"), \
+                mock.patch.object(self.mod, "_poll_once") as once, \
+                contextlib.redirect_stdout(out):
+            self.mod._poll_loop(evt, report_status=True)
+        text = out.getvalue()
+        self.assertEqual(text.count("order tracker idle"), 1)
+        self.assertNotIn("waiting for a Google sign-in", text)
+        self.assertEqual(text.count("tracking now"), 1)
+        once.assert_called_once()
+
     def test_poll_loop_status_crash_does_not_kill_loop(self):
         evt = mock.MagicMock()
         evt.wait.side_effect = [False, True]
         evt.is_set.return_value = False
         with mock.patch.object(self.mod, "_print_backend_status",
-                               side_effect=RuntimeError("boom")),              mock.patch.object(self.mod, "_any_backend", return_value=True),              mock.patch.object(self.mod, "_poll_once") as once:
+                               side_effect=RuntimeError("boom")), \
+                mock.patch.object(self.mod, "_any_backend", return_value=True), \
+                mock.patch.object(self.mod, "_poll_once") as once:
             self.mod._poll_loop(evt, report_status=True)
         once.assert_called_once()
 

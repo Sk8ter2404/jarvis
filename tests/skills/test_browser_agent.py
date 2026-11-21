@@ -1645,7 +1645,12 @@ class LazyRegisterTests(_BrowserAgentTestBase):
     def test_register_does_not_import_browser_use(self):
         boom = mock.MagicMock(side_effect=AssertionError("imported at register"))
         spec = mock.MagicMock(return_value=object())
-        with mock.patch.object(self.mod, "_bu_imports", boom),                 mock.patch("importlib.util.find_spec", spec),                 mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-x"}),                 mock.patch.object(self.mod, "_model_name", return_value="m"),                 mock.patch.object(self.mod.os, "makedirs") as mk,                 mock.patch("builtins.print") as pr:
+        with mock.patch.object(self.mod, "_bu_imports", boom), \
+                mock.patch("importlib.util.find_spec", spec), \
+                mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-x"}), \
+                mock.patch.object(self.mod, "_model_name", return_value="m"), \
+                mock.patch.object(self.mod.os, "makedirs") as mk, \
+                mock.patch("builtins.print") as pr:
             acts: dict = {}
             self.mod.register(acts)
         boom.assert_not_called()
@@ -1656,7 +1661,9 @@ class LazyRegisterTests(_BrowserAgentTestBase):
 
     def test_register_quiet_when_not_installed(self):
         with mock.patch.object(self.mod, "_bu_imports",
-                               side_effect=AssertionError("imported")),                 mock.patch("importlib.util.find_spec", return_value=None),                 mock.patch.object(self.mod.os, "makedirs") as mk:
+                               side_effect=AssertionError("imported")), \
+                mock.patch("importlib.util.find_spec", return_value=None), \
+                mock.patch.object(self.mod.os, "makedirs") as mk:
             acts: dict = {}
             self.mod.register(acts)
         mk.assert_not_called()
@@ -1664,7 +1671,8 @@ class LazyRegisterTests(_BrowserAgentTestBase):
 
     def test_find_spec_error_is_treated_as_absent(self):
         with mock.patch("importlib.util.find_spec",
-                        side_effect=ValueError("bad spec")),                 mock.patch.object(self.mod.os, "makedirs") as mk:
+                        side_effect=ValueError("bad spec")), \
+                mock.patch.object(self.mod.os, "makedirs") as mk:
             self.mod.register({})
         mk.assert_not_called()
 
