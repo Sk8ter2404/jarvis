@@ -1509,6 +1509,17 @@ BOOT_PARALLEL_LOAD         = False
 # summary runs in the background"). False = made and spoken on the boot
 # thread before "Listening", as before. Changes apply on the next start.
 BOOT_CHANGELOG_BACKGROUND  = True
+# BOOT_AUDIO_PROC_PREWARM (2026-11-21, reliability-11 BOOT-3): the audio
+# processor (noisereduce -> torch + scipy; 7.4 s on the 11-20 boot thread) is
+# built before the face tracker so scipy's DLL load never overlaps a camera's
+# first open (the 11-16 Dell freeze). True (default) = it builds on a daemon
+# thread while the skills load and the boot joins it right after
+# load_skills(), before the camera probe or the face tracker can open a
+# camera; a failed thread falls back to the old synchronous build. Log line
+# "[boot] audio processor ready ... (built on a thread ...)". False = built
+# on the boot thread just before the face tracker, as in v3.0.26.
+# Changes apply on the next start.
+BOOT_AUDIO_PROC_PREWARM    = True
 
 # ─── Where the listening models run (core/listen_devices.py, 2026-10-04) ──
 # PARAKEET_DEVICE / SMART_TURN_DEVICE / VOICE_ID_DEVICE: 'cpu' | 'listen' |
