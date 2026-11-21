@@ -1166,6 +1166,27 @@ def _translate_camera_index(cfg_idx, name: str, backend: str):
         return None
 
 
+# name -> (error text, time WARNed) for the once-per-hour UNVERIFIED log rule.
+_UNVERIFIED_LOGGED: dict[str, tuple] = {}
+_UNVERIFIED_REWARN_S = 3600.0
+
+
+def _camera_gate_says_absent(bc, cam) -> bool:
+    """True when the monolith's camera gate has ``cam`` recorded as ABSENT -
+    off the device list, so nothing can be holding it. False on any doubt
+    (no gate, no record, any error): the caller then keeps fencing the camera
+    off, which is the safe side. NEVER raises."""
+    try:
+        gate = getattr(bc, "_camera_gate", None)
+        key_fn = getattr(bc, "_camera_gate_key", None)
+        if gate is None or key_fn is None:
+            return False
+        devs = (gate.snapshot() or {}).get("devices") or {}
+        return bool((devs.get(key_fn(cam)) or {}).get("absent"))
+    except Exception:
+        return False
+
+
 def _producer_camera_ownership(backend: str) -> dict:
     """Which capture targets the face-tracking producer OWNS right now, in
     ``backend``'s index space, plus what its own telemetry says about each.
@@ -1284,9 +1305,20 @@ def _producer_camera_ownership(backend: str) -> dict:
             "benched_free":     benched,
             "last_read_error":  h.get("last_read_error"),
         }
+        # AN UNPLUGGED CAMERA IS NOT OWNED (2026-11-21, n20-F5 / DIAG-1). The
+        # left webcam sat off the device list for the whole 11-17 session;
+        # it translated to no probe index, landed in ``unresolved`` and the
+        # fail-closed branch below logged "webcam UNVERIFIED" 18 times while
+        # the right webcam was streaming fine. Free ONLY when the camera gate
+        # says the device is absent AND the producer holds no handle on it
+        # (held False alone could be a reopen in progress); the gate settles a
+        # return for 15 s before any reopen, which covers the probe window.
+        absent = ((not rec["held"]) and (not benched)
+                  and _camera_gate_says_absent(bc, cam))
+        rec["absent"] = absent
         probe_idx = _translate_camera_index(cfg_idx, name, backend)
         rec["probe_index"] = probe_idx
-        if benched:
+        if benched or absent:
             pass                       # free: neither fenced nor unresolvable
         elif probe_idx is None:
             out["unresolved"].append(label)
@@ -3740,13 +3772,25 @@ def _run_all_probes() -> dict:
             r["severity"] = SUBSYSTEM_SEVERITY.get(name, SEVERITY_MED)
         probes_out[name] = r
         if r.get("ok", False):
+            _UNVERIFIED_LOGGED.pop(name, None)
             continue
         # .get(..., True) so any result built outside _result() (older shape,
         # a test double) is treated as a real, tested failure — fail loud.
         if not r.get("tested", True):
             unverified.append(name)
-            _log.warning("self-diagnostic: %s UNVERIFIED — %s (this is NOT a "
-                         "pass: the check did not run)", name, r.get("error"))
+            # Identical UNVERIFIED lines repeat every sweep for as long as the
+            # cause stands (18 times in one 11-17 session). WARN on a change,
+            # and again once an hour; the same text in between goes to DEBUG.
+            _last = _UNVERIFIED_LOGGED.get(name)
+            _err = str(r.get("error"))
+            _lvl = (_log.debug if (_last and _last[0] == _err
+                                   and (sweep_start - _last[1])
+                                   < _UNVERIFIED_REWARN_S)
+                    else _log.warning)
+            if _lvl is _log.warning:
+                _UNVERIFIED_LOGGED[name] = (_err, sweep_start)
+            _lvl("self-diagnostic: %s UNVERIFIED — %s (this is NOT a "
+                 "pass: the check did not run)", name, r.get("error"))
             continue
         failed.append(name)
         sev_failed[name] = r["severity"]

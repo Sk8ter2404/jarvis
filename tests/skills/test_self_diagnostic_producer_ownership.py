@@ -490,6 +490,75 @@ class ProducerOwnershipTests(unittest.TestCase):
         self.assertGreater(self.mod._PRODUCER_FRAME_FRESH_S, 5.0)
         self.assertLess(self.mod._PRODUCER_FRAME_FRESH_S, 30.0)
 
+    # ── an unplugged camera is not an owned one (n20-F5 / DIAG-1) ───────
+    def _gate_bc(self, absent_keys, **kw):
+        """A _FakeBC that also carries the camera gate's public surface."""
+        bc = _FakeBC(**kw)
+        bc._camera_gate_key = lambda cam: "name:" + cam["name"]
+        gate = types.SimpleNamespace(snapshot=lambda: {"devices": {
+            "name:" + n: {"absent": True} for n in absent_keys}})
+        bc._camera_gate = gate
+        return bc
+
+    def test_an_absent_unheld_camera_does_not_fail_the_probe_closed(self):
+        """The 11-17 log: the left webcam was off the device list all session,
+        the right one streamed. The fail-closed branch fired 18 times and the
+        working camera was never verified."""
+        self._install(self._gate_bc(("emeet c960",), held=(0,),
+                                    frame_ages={0: 0.4}))
+        own = self.mod._producer_camera_ownership("msmf")
+        self.assertEqual(own["unresolved"], [])
+        self.assertEqual(len(own["fresh"]), 1)
+        left = [c for c in own["cameras"] if c["config_index"] == 2][0]
+        self.assertTrue(left["absent"])
+        res, opened = self._run_probe(answers=())
+        self.assertTrue(res["ok"], res["error"])
+        self.assertEqual(res["details"]["verified_via"],
+                         "face-track producer telemetry")
+        self.assertEqual(opened, [], "opened a device it did not need to")
+
+    def test_an_absent_camera_is_never_fenced_by_a_guessed_index(self):
+        self._install(self._gate_bc(("emeet c960",), held=(0,),
+                                    frame_ages={0: 0.4}))
+        own = self.mod._producer_camera_ownership("msmf")
+        self.assertEqual(own["indices"], {1})
+
+    def test_a_held_camera_is_owned_even_if_the_gate_says_absent(self):
+        """held False alone, or a stale gate flag, must not free a camera the
+        producer holds a handle on."""
+        self._install(self._gate_bc(("emeet c960",), held=(0, 2),
+                                    frame_ages={0: 0.4, 2: 0.4}))
+        own = self.mod._producer_camera_ownership("msmf")
+        left = [c for c in own["cameras"] if c["config_index"] == 2][0]
+        self.assertFalse(left["absent"])
+        self.assertIn(2, own["indices"])
+
+    def test_an_unheld_camera_the_gate_does_not_call_absent_still_fails_closed(self):
+        """A reopen in progress looks like held False too. Only the gate's
+        absent verdict frees a camera."""
+        nameless = [{"index": 0, "label": "Right webcam", "name": ""}]
+        self._install(self._gate_bc((), held=(), frame_ages={0: 300.0},
+                                    cameras=nameless))
+        own = self.mod._producer_camera_ownership("msmf")
+        self.assertEqual(own["unresolved"], ["Right webcam"])
+
+    def test_identical_unverified_warnings_log_once_an_hour(self):
+        probe = {"ok": False, "tested": False, "error": "UNVERIFIED - x"}
+        self.mod._UNVERIFIED_LOGGED.clear()
+        with mock.patch.dict(self.mod.PROBES, {"webcam": lambda: dict(probe)},
+                             clear=True),                 mock.patch.object(self.mod, "_run_with_timeout",
+                                  side_effect=lambda fn, t, name: fn()),                 mock.patch.object(self.mod._log, "warning") as warn,                 mock.patch.object(self.mod._log, "debug") as dbg:
+            clock = [1000.0]
+            with mock.patch.object(self.mod, "_now", lambda: clock[0]):
+                self.mod._run_all_probes()
+                clock[0] += 300.0
+                self.mod._run_all_probes()
+                self.assertEqual(warn.call_count, 1)
+                self.assertGreaterEqual(dbg.call_count, 1)
+                clock[0] += 3700.0
+                self.mod._run_all_probes()
+                self.assertEqual(warn.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
