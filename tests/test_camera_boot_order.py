@@ -192,11 +192,25 @@ class SourceTests(unittest.TestCase):
         self.assertNotIn("threading.Thread(target=_face_tracking_thread, daemon=True)", src)
 
     def test_the_audio_dsp_loads_before_the_face_thread_starts(self):
+        # reliability-11 (2026-11-21, BOOT_AUDIO_PROC_PREWARM): main() calls
+        # _audio_proc_boot_ready() right before the face thread starts; that
+        # helper reports the build done on a thread during load_skills (joined
+        # before the camera probe) or, off / failed, builds it synchronously.
         src = _source()
-        warm = src.index("_ap_boot.get_processor()")
-        start = src.index("threading.Thread(target=_face_tracking_thread_after_boot,")
+        main_at = src.index("\ndef main(")
+        warm = src.index("_audio_proc_boot_ready()", main_at)
+        start = src.index("threading.Thread(target=_face_tracking_thread_after_boot,",
+                          main_at)
         self.assertLess(warm, start)
         self.assertLess(start - warm, 800)
+        helper_at = src.index("\ndef _audio_proc_boot_ready(")
+        helper = src[helper_at:src.index("\ndef ", helper_at + 1)]
+        self.assertIn("_ap_boot.get_processor()", helper)
+        # The background build is joined before the camera probe can open
+        # a camera.
+        join = src.index("_audio_proc_prewarm_join()", main_at)
+        probe = src.index("probe_cameras_and_update_config()", main_at)
+        self.assertLess(join, probe)
 
     def test_both_listening_lines_set_the_event(self):
         src = _source()

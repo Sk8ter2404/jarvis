@@ -18815,6 +18815,9 @@ _TURN_FLAG_KEYS = (
     "BOOT_CHANGELOG_BACKGROUND",
     # v3.0.27: a background line is dropped when he spoke during its call.
     "BG_SKIP_IF_OWNER_SPOKE", "VOICE_SERVER_RSS_WARN_MB",
+    "BOOT_AUDIO_PROC_PREWARM",
+    "AMAZON_TRACKER_DEFER_BACKEND_CHECK",
+    "BROWSER_AGENT_LAZY_IMPORT",
     "FOLLOWUP_WINDOW_FROM_REPLY_END",
     "SPEECH_HYGIENE",
     "PROMPT_DIRECTIVE_V3",
@@ -40135,6 +40138,7 @@ def load_skills():
         # `import skill_x` can't trick us into skipping x before we load it.
         if name in _loaded_skill_names:
             continue
+        _t_skill = time.monotonic()
         try:
             spec = importlib.util.spec_from_file_location(
                 f"skill_{name}", path,
@@ -40179,6 +40183,150 @@ def load_skills():
             # semantics: a module that fails to import is removed.
             sys.modules.pop(f"skill_{name}", None)
             print(f"  [skill] {name}: failed to load — {e}")
+        finally:
+            _skill_load_note(name, time.monotonic() - _t_skill)
+    _skill_load_summary()
+
+
+# ── per-skill load timing (reliability-11, 2026-11-21) ──────────────────────
+# The 11-20 boot spent 28 s in load_skills with no per-skill numbers (a 16 s
+# hole was found only by elimination). Log only: a skill over the threshold
+# gets one '[skill-load] slow: <name> <secs> s' line, and the pass ends with
+# one summary line naming the slowest three. No behaviour change.
+SKILL_LOAD_SLOW_S = 1.0
+_skill_load_times: list = []     # [(name, secs)] for the last load_skills pass
+
+
+def _skill_load_note(name: str, secs: float) -> None:
+    """Record one skill's import+register time; print it when slow. Never
+    raises."""
+    try:
+        _skill_load_times.append((name, float(secs)))
+        if secs >= SKILL_LOAD_SLOW_S:
+            print(f"  [skill-load] slow: {name} {secs:.1f} s")
+    except Exception:
+        pass
+
+
+def _skill_load_summary() -> None:
+    """One '[skill-load] N skill(s) in T s; slowest: ...' line for the pass
+    just finished, then reset. Never raises."""
+    try:
+        if not _skill_load_times:
+            return
+        total = sum(t for _, t in _skill_load_times)
+        top = sorted(_skill_load_times, key=lambda x: -x[1])[:3]
+        print(f"  [skill-load] {len(_skill_load_times)} skill(s) in "
+              f"{total:.1f} s; slowest: "
+              + ", ".join(f"{n} {t:.1f} s" for n, t in top))
+        _skill_load_times.clear()
+    except Exception:
+        pass
+
+
+# ── BOOT_AUDIO_PROC_PREWARM (reliability-11 BOOT-3, 2026-11-21) ────────────
+# The 11-16 boot-order fix builds core.audio_processor (noisereduce -> torch +
+# scipy.signal: 2.7 s warm, 6.3 s cold in isolation, 7.4 s on the 11-20 boot)
+# on the boot thread just before the face tracker starts, so scipy's DLL load
+# can never overlap a camera's first open. With the flag on (default) the
+# build starts on a daemon thread just before load_skills() (preflight's
+# camera probe is over by then; no skill opens a camera while loading) and is
+# JOINED right after load_skills(), before the cam-probe or the face tracker
+# can open a camera, so the ordering guarantee is unchanged. If the thread
+# failed, the old synchronous build runs at the old place. Off = v3.0.26.
+_audio_proc_prewarm = {"thread": None, "ok": False, "ms": 0.0,
+                       "err": "", "waited_ms": 0.0}
+
+
+def _audio_proc_prewarm_on() -> bool:
+    """BOOT_AUDIO_PROC_PREWARM, read live. Never raises (True: the
+    default)."""
+    try:
+        v = globals().get("BOOT_AUDIO_PROC_PREWARM", True)
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "on", "yes")
+        return bool(v)
+    except Exception:
+        return True
+
+
+def _audio_proc_prewarm_work() -> None:
+    """Thread body: build the audio processor once. One retry when the first
+    attempt lost an import-lock race (_DeadlockError: the other importer has
+    finished by then). Never raises."""
+    st = _audio_proc_prewarm
+    t0 = time.monotonic()
+    for attempt in (1, 2):
+        try:
+            from core import audio_processor as _ap_pre
+            _ap_pre.get_processor()
+            st["ok"] = True
+            st["err"] = ""
+            break
+        except Exception as e:
+            st["err"] = f"{type(e).__name__}: {e}"
+            if attempt == 1 and "deadlock" in type(e).__name__.lower():
+                time.sleep(0.5)
+                continue
+            break
+    st["ms"] = (time.monotonic() - t0) * 1000.0
+
+
+def _audio_proc_prewarm_start() -> bool:
+    """Start the background build (flag on, not staging). True when a thread
+    was started. Never raises."""
+    try:
+        if not _audio_proc_prewarm_on() or _is_staging():
+            return False
+        t = threading.Thread(target=_audio_proc_prewarm_work, daemon=True,
+                             name="boot-audio-proc")
+        _audio_proc_prewarm["thread"] = t
+        t.start()
+        return True
+    except Exception as e:
+        print(f"  [boot] audio processor prewarm did not start: {e}")
+        _audio_proc_prewarm["thread"] = None
+        return False
+
+
+def _audio_proc_prewarm_join() -> None:
+    """Wait for the background build (the camera ordering guarantee: no
+    camera opens while scipy's DLLs load). The wait is as long as the build,
+    never shorter, exactly like the old synchronous call. Never raises."""
+    st = _audio_proc_prewarm
+    t = st.get("thread")
+    if t is None:
+        return
+    t0 = time.monotonic()
+    try:
+        t.join()
+    except Exception:
+        pass
+    st["waited_ms"] = (time.monotonic() - t0) * 1000.0
+
+
+def _audio_proc_boot_ready() -> None:
+    """main()'s audio-processor step before the face tracker starts: report
+    the background build, or (flag off / thread failed) build it here as in
+    v3.0.26. Never raises."""
+    st = _audio_proc_prewarm
+    if st.get("thread") is not None and st.get("ok"):
+        print(f"  [boot] audio processor ready before the camera opens "
+              f"(built on a thread in {st['ms']:.0f} ms during skill "
+              f"loading; boot waited {st['waited_ms']:.0f} ms) "
+              f"(BOOT_AUDIO_PROC_PREWARM)")
+        return
+    if st.get("thread") is not None and st.get("err"):
+        print(f"  [boot] audio processor background build failed "
+              f"({st['err']}) - building it now")
+    try:
+        _t_ap = time.monotonic()
+        from core import audio_processor as _ap_boot
+        _ap_boot.get_processor()
+        print(f"  [boot] audio processor ready before the camera opens "
+              f"({(time.monotonic() - _t_ap) * 1000:.0f} ms)")
+    except Exception as _ape:
+        print(f"  [boot] audio processor warm-up failed: {_ape}")
 
 
 # ── bridges into optional skill modules (looked up lazily so JARVIS still
@@ -57548,8 +57696,12 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     # BEFORE the skills load: their ambient daemons read it from the start.
     _guest_mode_boot()
 
-    # Load any installed skills now so their actions are available
+    # Load any installed skills now so their actions are available.
+    # BOOT_AUDIO_PROC_PREWARM: the audio processor builds on a thread while
+    # the skills load, and is joined before anything can open a camera.
+    _audio_proc_prewarm_start()
     load_skills()
+    _audio_proc_prewarm_join()
 
     # Skills may have contributed PROMPT_EXAMPLES (gitignored personal skills'
     # routing lines). The system prompt was built BEFORE load_skills, so
@@ -57696,14 +57848,9 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         # any camera open is in flight. On the Dell the boot line's first TTS
         # preset built it while the webcam sat in its first open, and the
         # main thread waited ~3.5 min inside scipy's DLL load.
-        try:
-            _t_ap = time.monotonic()
-            from core import audio_processor as _ap_boot
-            _ap_boot.get_processor()
-            print(f"  [boot] audio processor ready before the camera opens "
-                  f"({(time.monotonic() - _t_ap) * 1000:.0f} ms)")
-        except Exception as _ape:
-            print(f"  [boot] audio processor warm-up failed: {_ape}")
+        # BOOT_AUDIO_PROC_PREWARM: built on a thread during load_skills and
+        # joined right after it; off (or a failed thread) builds it here.
+        _audio_proc_boot_ready()
         ft = threading.Thread(target=_face_tracking_thread_after_boot,
                               daemon=True)
         ft.start()

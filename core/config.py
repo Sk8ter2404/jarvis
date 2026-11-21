@@ -1520,6 +1520,24 @@ BOOT_PARALLEL_LOAD         = False
 # summary runs in the background"). False = made and spoken on the boot
 # thread before "Listening", as before. Changes apply on the next start.
 BOOT_CHANGELOG_BACKGROUND  = True
+# BOOT_AUDIO_PROC_PREWARM (2026-11-21, reliability-11 BOOT-3): the audio
+# processor (noisereduce -> torch + scipy; 7.4 s on the 11-20 boot thread) is
+# built before the face tracker so scipy's DLL load never overlaps a camera's
+# first open (the 11-16 Dell freeze). True (default) = it builds on a daemon
+# thread while the skills load and the boot joins it right after
+# load_skills(), before the camera probe or the face tracker can open a
+# camera; a failed thread falls back to the old synchronous build. Log line
+# "[boot] audio processor ready ... (built on a thread ...)". False = built
+# on the boot thread just before the face tracker, as in v3.0.26.
+# Changes apply on the next start.
+BOOT_AUDIO_PROC_PREWARM    = True
+# BROWSER_AGENT_LAZY_IMPORT (2026-11-21, reliability-11): skills/browser_agent
+# register() imported browser-use (about 1.3 s warm, more under boot
+# contention) only to decide whether to print its "ready" line. True
+# (default) = register() checks that the package is installed without
+# importing it; the actions import it when they run, as they always did.
+# False = the full import at register, as in v3.0.26. Next start.
+BROWSER_AGENT_LAZY_IMPORT  = True
 
 # ─── Where the listening models run (core/listen_devices.py, 2026-10-04) ──
 # PARAKEET_DEVICE / SMART_TURN_DEVICE / VOICE_ID_DEVICE: 'cpu' | 'listen' |
@@ -4415,6 +4433,14 @@ _ENV_ONLY_KEYS = frozenset({"BAMBU_PRINTER_IP", "BAMBU_ACCESS_CODE", "BAMBU_SERI
 #   (needs gmail_credentials.json, the OAuth client file, at the project root).
 #   Moved here from bobert_companion.py so it can be switched in Settings.
 AMAZON_TRACKING_ENABLED = True
+# AMAZON_TRACKER_DEFER_BACKEND_CHECK (2026-11-21, reliability-11 BOOT-1): the
+#   tracker's "is a mailbox signed in" check imports the Google client
+#   libraries (about 14 s cold; 16 s of the 11-20 boot). True (default) = the
+#   check and its "[amazon] order tracker active/idle" line run on the poll
+#   thread after its 45 s initial delay, so skill loading does not wait for
+#   it. False = checked on the boot thread inside register(), as in v3.0.26.
+#   Changes apply on the next start.
+AMAZON_TRACKER_DEFER_BACKEND_CHECK = True
 
 # ─── Game low-power mode (skills/game_mode.py) ─────────────────────────────
 # JARVIS gets out of the way while a game runs: the local brain is repointed at

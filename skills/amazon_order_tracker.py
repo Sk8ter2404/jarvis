@@ -871,10 +871,51 @@ def _any_backend() -> bool:
     return _outlook_configured() or _gmail_configured()
 
 
-def _poll_loop(stop_evt: threading.Event) -> None:
+def _defer_backend_check() -> bool:
+    """AMAZON_TRACKER_DEFER_BACKEND_CHECK, read fresh (monolith first, then
+    core.config, like _read_feature_flag). Default True; never raises."""
+    sentinel = object()
+    val = sentinel
+    try:
+        bc = importlib.import_module("bobert_companion")
+        val = getattr(bc, "AMAZON_TRACKER_DEFER_BACKEND_CHECK", sentinel)
+    except Exception:
+        pass
+    if val is sentinel:
+        try:
+            from core import config as _cfg
+            val = getattr(_cfg, "AMAZON_TRACKER_DEFER_BACKEND_CHECK", True)
+        except Exception:
+            val = True
+    if isinstance(val, str):
+        return val.strip().lower() in ("1", "true", "on", "yes")
+    return bool(val)
+
+
+def _print_backend_status() -> bool:
+    """The one '[amazon] order tracker active/idle' status line. Returns
+    whether a backend is configured. The check can import the Google client
+    libraries (about 14 s cold), so with AMAZON_TRACKER_DEFER_BACKEND_CHECK
+    it runs on the poll thread, never on the boot thread."""
+    if _any_backend():
+        print(f"  [amazon] order tracker active - polling every "
+              f"{POLL_INTERVAL_SECONDS // 60} minutes")
+        return True
+    print(f"  [amazon] order tracker idle: {_backend_problem()}")
+    return False
+
+
+def _poll_loop(stop_evt: threading.Event, report_status: bool = False) -> None:
     if stop_evt.wait(INITIAL_DELAY_SECONDS):
         return
     logged_missing = False
+    if report_status:
+        # Deferred from start_monitor (boot): the status line is printed here,
+        # after the initial delay, and stands in for the "waiting" line.
+        try:
+            logged_missing = not _print_backend_status()
+        except Exception:
+            logging.exception("[amazon] backend status check crashed")
     while not stop_evt.is_set():
         if not _any_backend():
             # Not signed in (yet): idle cheaply and re-check, so a sign-in made
@@ -929,15 +970,23 @@ def start_monitor() -> bool:
     if _poll_thread[0] is not None and _poll_thread[0].is_alive():
         return True
     _stop_evt.clear()
+    # AMAZON_TRACKER_DEFER_BACKEND_CHECK (BOOT-1, 2026-11-21): the backend
+    # check imports googleapiclient/google.auth through
+    # email_triage.is_gmail_available(), 16 s on the 11-20 boot thread
+    # (13.9 s cold in isolation). On: the poll thread prints the status line
+    # after its initial delay. Off: checked here, as in v3.0.26.
+    deferred = _defer_backend_check()
     t = threading.Thread(target=_poll_loop, args=(_stop_evt,),
+                         kwargs={"report_status": deferred},
                          daemon=True, name="amazon-order-tracker")
     t.start()
     _poll_thread[0] = t
-    if _any_backend():
-        print(f"  [amazon] order tracker active - polling every "
-              f"{POLL_INTERVAL_SECONDS // 60} minutes")
+    if deferred:
+        print(f"  [amazon] order tracker started - the mailbox check runs on "
+              f"the poll thread in {INITIAL_DELAY_SECONDS}s "
+              f"(AMAZON_TRACKER_DEFER_BACKEND_CHECK)")
     else:
-        print(f"  [amazon] order tracker idle: {_backend_problem()}")
+        _print_backend_status()
     return True
 
 
