@@ -19887,7 +19887,7 @@ def _report_silent_mic(silent_age: float, now: float) -> bool:
     except Exception:
         named = "your active microphone"
     print(f"  [vad] WARNING: raw mic RMS has been ≈0 for {silent_age:.0f}s "
-          f"while JARVIS is awake on {device or 'the default input'} — likely "
+          f"while JARVIS is listening on {device or 'the default input'} — likely "
           f"silent-mic hardware/driver fault. Check Windows Privacy → "
           f"Microphone, verify the active input device, and try unplug/replug "
           f"if USB. (threshold "
