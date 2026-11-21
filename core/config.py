@@ -1825,6 +1825,15 @@ SMART_TURN_SHADOW_GRACE_S = 120.0
 SMART_TURN_SHADOW_BUDGET_X = 1.5
 SMART_TURN_SHADOW_SLOW_LIMIT = 5
 
+# ─── Shadow summary (n20 shadow F5, 2026-11-21) ───────────────────────────
+#   SHADOW_SUMMARY  one numbers-only "[shadow-summary]" line at shutdown and
+#                   every SHADOW_SUMMARY_EVERY_S, with per-feature counts
+#                   (checks / would-act / latched) for each shadow feature
+#                   whose mode is not 'off', plus owner turns accepted, so
+#                   "never ran" differs from "0 events". False = v3.0.26.
+SHADOW_SUMMARY = True
+SHADOW_SUMMARY_EVERY_S = 1800.0
+
 # ─── Turn checker (core/turn_checker.py, 2026-10-02) ──────────────────────
 # After every LLM turn (spoken or typed) the checker asks whether the reply
 # failed in a way a retry on Claude would fix: it claimed an action that never
