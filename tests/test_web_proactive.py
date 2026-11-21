@@ -94,6 +94,10 @@ NOT_PROACTIVE = {
     "AMBIENT_LEARNING_FORCE_LOCAL": "picks the model ambient learning uses",
     "AMBIENT_MUSIC_REFUSE_WAKE": "a wake-word filter",
     "AMBIENT_STT_YIELD": "scheduling inside ambient listening",
+    "GAME_MODE_AMBIENT_DECODE_PAUSE": "a condition on ambient listening while "
+                                      "game mode is engaged (v3.0.27): it "
+                                      "only withholds decodes, starts "
+                                      "nothing and never speaks",
     "PROCESSING_FILLER_SKIP_PLEASANTRIES": "a condition on the processing "
                                            "filler (its row)",
     "FILLER_DUCK_HOLD": "how long the music stays ducked around the filler "
