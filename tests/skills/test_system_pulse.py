@@ -2619,5 +2619,80 @@ class PythonProcessNamesTests(unittest.TestCase):
         self.assertEqual(out.getvalue().strip(), line.strip())
 
 
+class PulsePythonTargetCwdTests(unittest.TestCase):
+    """MEM-1 (n20, 2026-11-21): live 11-20 a bare 'python peel_v3.py' run
+    from another folder was "my peel v3". A relative script path resolves
+    against the TARGET's cwd; unreadable cwd + relative path = not own."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("system_pulse")
+        self.root = self.mod._PROJECT_DIR
+        self.other = os.path.join(os.path.dirname(self.root) or self.root,
+                                  "other_dir")
+
+    def test_relative_script_uses_the_targets_cwd(self):
+        t = self.mod._python_target
+        argv = ["python", "peel_v3.py"]
+        self.assertEqual(t(argv, self.other), ("peel_v3", False))
+        self.assertEqual(t(argv, None), ("peel_v3", False))   # unreadable
+        self.assertEqual(t(argv, self.root), ("peel_v3", True))
+        self.assertEqual(self.mod._python_role(argv, "", self.other),
+                         "the Python script peel v3")
+
+    def test_absolute_path_under_the_project_is_own(self):
+        t = self.mod._python_target
+        argv = ["python", os.path.join(self.root, "tools", "x_helper.py")]
+        self.assertEqual(t(argv, self.other), ("x_helper", True))
+        self.assertEqual(t(argv, None), ("x_helper", True))
+
+    def test_generic_package_module_checks_a_known_cwd(self):
+        t = self.mod._python_target
+        argv = ["python", "-m", "tools.thing"]
+        self.assertEqual(t(argv, self.other), ("thing", False))
+        self.assertEqual(t(argv, self.root), ("thing", True))
+        self.assertEqual(t(argv, None), ("thing", True))      # as before
+
+    def test_flag_off_is_v3_0_26(self):
+        from unittest import mock as _m
+        with _m.patch.object(self.mod, "MEM_PY_TARGET_CWD", False):
+            stem, _own = self.mod._python_target(["python", "peel_v3.py"],
+                                                 self.other)
+            self.assertEqual(stem, "peel_v3")
+            self.assertEqual(self.mod._python_target(
+                ["python", "-m", "tools.thing"], self.other), ("thing", True))
+
+    def test_cwds_read_from_the_same_handle_and_skip_denied(self):
+        from unittest import mock as _m
+        mod = self.mod
+        if not mod._HAS_PSUTIL:
+            self.skipTest("psutil not installed")
+        asked = []
+
+        class _P:
+            def __init__(self, pid):
+                asked.append(pid)
+                self.pid = pid
+
+            def cmdline(self):
+                return ["python", "peel_v3.py"]
+
+            def cwd(self):
+                if self.pid == 2:
+                    raise mod.psutil.AccessDenied(self.pid)
+                return self.pid == 1 and r"D:\other" or ""
+
+        rows = [(1, "python.exe", 3 * _GB), (2, "python.exe", 2 * _GB)]
+        cwds = {}
+        with _m.patch.object(mod.psutil, "Process", _P):
+            got = mod._python_cmdlines(rows, cwds=cwds)
+        self.assertEqual(sorted(got), [1, 2])
+        self.assertEqual(cwds, {1: r"D:\other"})
+        self.assertEqual(sorted(asked), [1, 2])       # one handle per pid
+        with _m.patch.object(mod, "MEM_PY_TARGET_CWD", False),                 _m.patch.object(mod.psutil, "Process", _P):
+            cwds2 = {}
+            mod._python_cmdlines(rows, cwds=cwds2)
+        self.assertEqual(cwds2, {})
+
+
 if __name__ == "__main__":
     unittest.main()
