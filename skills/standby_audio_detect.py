@@ -348,6 +348,10 @@ def _ensure_whisper_tiny():
         # core/cuda_preinit.py - a no-op once the boot did it).
         from core import cuda_preinit as _cuda_preinit
         _cuda_preinit.before_ctranslate2()
+        # Shared import lock (core/fw_import.py): no import deadlock with the
+        # boot Whisper load or the Smart Turn warmer.
+        from core import fw_import as _fw_import
+        _fw_import.import_faster_whisper()
         from faster_whisper import WhisperModel as _FWM
         # GPU only when explicitly opted in — otherwise skip straight to CPU so
         # we never grab VRAM the local LLM needs (same ctranslate2 CUDA path the
