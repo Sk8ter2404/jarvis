@@ -1811,6 +1811,19 @@ SMART_TURN_THRESHOLD = 0.7
 SMART_TURN_MIN_SILENCE_S = 0.256
 SMART_TURN_MIN_SPEECH_S = 1.0
 SMART_TURN_MODEL = r"C:\JARVIS-models\smart-turn-v3\smart-turn-v3.2-cpu.onnx"
+#   SMART_TURN_SHADOW_GRACE  (n20 2026-11-21) in 'shadow' ONLY: no Smart Turn
+#                     check at all for SMART_TURN_SHADOW_GRACE_S after
+#                     '[boot] ready to listen' (or while the boot warmers or
+#                     the boot Whisper load still run); after it a check is
+#                     slow only over SMART_TURN_SHADOW_BUDGET_X x one 64 ms
+#                     chunk, and SMART_TURN_SHADOW_SLOW_LIMIT in a row latch
+#                     it off. The 11-20 boot latched shadow off 8 s after
+#                     ready on two 65 ms checks: no shadow data all session.
+#                     'on' keeps 64 ms / 2 in a row. False = v3.0.26.
+SMART_TURN_SHADOW_GRACE = True
+SMART_TURN_SHADOW_GRACE_S = 120.0
+SMART_TURN_SHADOW_BUDGET_X = 1.5
+SMART_TURN_SHADOW_SLOW_LIMIT = 5
 
 # ─── Turn checker (core/turn_checker.py, 2026-10-02) ──────────────────────
 # After every LLM turn (spoken or typed) the checker asks whether the reply

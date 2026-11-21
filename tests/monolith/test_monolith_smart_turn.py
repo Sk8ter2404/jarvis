@@ -136,6 +136,12 @@ class _Base(MonolithGlobalsTestCase):
         self._p(bc, "_eot_slow_checks", [0])
         self._p(bc, "_eot_clock", self.tsess.clock)
         self._p(bc, "SMART_TURN_MODE", self.MODE)
+        # These classes pin the v3.0.26 rule (64 ms, 2 in a row, no boot
+        # grace); ShadowBootGraceTests covers SMART_TURN_SHADOW_GRACE.
+        self._p(bc, "SMART_TURN_SHADOW_GRACE", False)
+        self._p(bc, "_eot_counts", {"checks": 0, "slow": 0, "max_ms": 0,
+                                    "grace_skip": 0, "captures": 0,
+                                    "would_fire": 0})
         self.timing = tt.TurnTiming(print_fn=lambda line: None)
         self._p(bc, "_turn_timing", self.timing)
         # Every EotDecider a capture builds.
@@ -1066,6 +1072,117 @@ class OnModeTests(_Base):
         audio, _log = self._capture(_TURN)
         self.assertEqual(len(audio) * 1000 // 16000, _TURN_MS)
         self.assertEqual(self._turn_fields(since)["eot"], "rms")
+
+
+class ShadowBootGraceTests(_Base):
+    """SMART_TURN_SHADOW_GRACE (n20 2026-11-21): in 'shadow' no check runs in
+    the boot grace, and after it a check is slow only over 1.5 x 64 ms and 5
+    in a row latch. 'on' keeps 64 ms / 2 in a row."""
+
+    def setUp(self):
+        super().setUp()
+        import time as _time
+        bc = self.bc
+        self._time = _time
+        self._p(bc, "SMART_TURN_SHADOW_GRACE", True)
+        self._p(bc, "SMART_TURN_SHADOW_GRACE_S", 120.0)
+        self._p(bc, "SMART_TURN_SHADOW_BUDGET_X", 1.5)
+        self._p(bc, "SMART_TURN_SHADOW_SLOW_LIMIT", 5)
+        # Ready to listen 1,000 s ago, no warmer or Whisper load running.
+        self.started = [_time.monotonic() - 1000.0]
+        self._p(bc, "_main_loop_started_at", self.started)
+        self.warmers = [False]
+        self._p(bc, "_boot_warmers_running", self.warmers)
+        self.loading = [False]
+        self._p(bc, "_whisper_bg_loading", lambda: self.loading[0])
+        self.tsess.ps = [0.5]
+
+    def _runs(self, n):
+        """(logs, checks the fake session ran) over n captures of _TURN."""
+        k = len(self.tsess.feeds)
+        logs = "".join(self._capture(_TURN)[1] for _ in range(n))
+        return logs, len(self.tsess.feeds) - k
+
+    def test_two_slow_checks_inside_the_grace_do_not_latch(self):
+        self._warm()
+        self.started[0] = self._time.monotonic()      # ready just now
+        self.tsess.costs = [0.070]
+        logs, ran = self._runs(3)
+        self.assertEqual(self._eot_lines(logs), [])
+        self.assertEqual(ran, 0)                      # skipped, not run
+        self.assertEqual(len(self.made), 3)
+        self.assertEqual(self.bc._eot_state["off"], "")
+        self.assertEqual(self.bc._eot_counts["grace_skip"], 3)
+        self.assertEqual(self.bc._eot_counts["checks"], 0)
+
+    def test_grace_holds_before_ready_and_while_boot_loads_run(self):
+        bc = self.bc
+        self.started[0] = 0.0
+        self.assertTrue(bc._eot_in_boot_grace())
+        self.started[0] = self._time.monotonic() - 1000.0
+        self.assertFalse(bc._eot_in_boot_grace())
+        self.warmers[0] = True
+        self.assertTrue(bc._eot_in_boot_grace())
+        self.warmers[0] = False
+        self.loading[0] = True
+        self.assertTrue(bc._eot_in_boot_grace())
+
+    def test_a_check_inside_the_wider_budget_is_kept(self):
+        self._warm()
+        self.tsess.costs = [0.070]          # over 64 ms, under 96 ms
+        logs, ran = self._runs(3)
+        self.assertEqual(self._eot_lines(logs), [])
+        self.assertGreater(ran, 0)
+        self.assertGreaterEqual(self.bc._eot_counts["checks"], 3)
+        self.assertEqual(self._shadow_lines(logs)[0],
+                         f"[eot-shadow] fire_ms=- p=0.500 resumed=0 "
+                         f"actual_ms={_TURN_MS} pause_ms=0")
+        self.assertEqual(self.bc._eot_counts["slow"], 0)
+
+    def test_slow_slow_fast_slow_slow_does_not_latch(self):
+        self._warm()
+        k = len(self.tsess.feeds)
+        self.tsess.costs = [0.010] * k + [0.100, 0.100, 0.010, 0.100, 0.100,
+                                          0.010]
+        logs, _ran = self._runs(5)
+        self.assertEqual(self._eot_lines(logs), [])
+        self.assertEqual(self.bc._eot_state["off"], "")
+        self.assertEqual(self.bc._eot_counts["slow"], 4)
+
+    def test_five_slow_in_a_row_after_the_grace_latch(self):
+        self._warm()
+        self.tsess.costs = [0.100]
+        logs, _ran = self._runs(6)
+        self.assertEqual(self._eot_lines(logs), [
+            "[eot] smart turn off for this session (too slow: 5 checks in a "
+            "row over one 96 ms capture chunk, the last 100 ms)"])
+        self.assertEqual(len(self.made), 5)
+
+    def test_flag_off_is_the_v3_0_26_rule(self):
+        self._p(self.bc, "SMART_TURN_SHADOW_GRACE", False)
+        self._warm()
+        self.started[0] = 0.0               # grace would hold if it applied
+        self.tsess.costs = [0.070]
+        logs, _ran = self._runs(2)
+        self.assertEqual(self._eot_lines(logs), [
+            "[eot] smart turn off for this session (too slow: 2 checks in a "
+            "row over one 64 ms capture chunk, the last 70 ms)"])
+
+
+class OnModeKeepsTheStrictRuleTests(_Base):
+    MODE = "on"
+
+    def test_on_mode_two_slow_checks_latch_with_the_grace_flag_on(self):
+        bc = self.bc
+        self._p(bc, "SMART_TURN_SHADOW_GRACE", True)
+        self._p(bc, "_main_loop_started_at", [0.0])   # no grace in 'on'
+        self._warm()
+        self.tsess.ps = [0.5]
+        self.tsess.costs = [0.070]
+        logs = "".join(self._capture(_TURN)[1] for _ in range(2))
+        self.assertEqual(self._eot_lines(logs), [
+            "[eot] smart turn off for this session (too slow: 2 checks in a "
+            "row over one 64 ms capture chunk, the last 70 ms)"])
 
 
 if __name__ == "__main__":

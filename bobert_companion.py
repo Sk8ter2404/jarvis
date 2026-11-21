@@ -18286,6 +18286,7 @@ def _tail_probe_start(audio) -> None:
 # "[warm] <name> ok|failed" line; nothing here can block or break boot.
 _boot_warmers: list = []           # [(name, fn)], registration order
 _boot_warmers_started = [False]
+_boot_warmers_running = [False]    # the daemon is still inside its jobs
 
 
 def _register_boot_warmer(name: str, fn) -> None:
@@ -18304,18 +18305,22 @@ def _register_boot_warmer(name: str, fn) -> None:
 
 def _run_boot_warmers_body(jobs) -> None:
     """The daemon's body: each warmer in order, one line each."""
-    for name, fn in jobs:
-        try:
-            t0 = time.perf_counter()
+    _boot_warmers_running[0] = True
+    try:
+        for name, fn in jobs:
             try:
-                fn()
-            except Exception as e:
-                print(f"  [warm] {name} failed ({type(e).__name__}: {e})")
-                continue
-            print(f"  [warm] {name} ok "
-                  f"({int((time.perf_counter() - t0) * 1000)} ms)")
-        except Exception:
-            pass
+                t0 = time.perf_counter()
+                try:
+                    fn()
+                except Exception as e:
+                    print(f"  [warm] {name} failed ({type(e).__name__}: {e})")
+                    continue
+                print(f"  [warm] {name} ok "
+                      f"({int((time.perf_counter() - t0) * 1000)} ms)")
+            except Exception:
+                pass
+    finally:
+        _boot_warmers_running[0] = False
 
 
 def _run_boot_warmers():
@@ -18431,6 +18436,56 @@ _EOT_CHECK_BUDGET_S = _endpointing.CHUNK_S             # 64 ms
 _EOT_SLOW_LIMIT = 2
 _eot_slow_checks = [0]                                 # slow checks in a row
 _eot_clock = time.perf_counter                         # times each check
+# Session counters for the [shadow-summary] line (numbers only): checks run,
+# slow ones, the slowest (ms), checks skipped in the shadow boot grace,
+# captures finished with a decider, and those Smart Turn would have ended.
+_eot_counts = {"checks": 0, "slow": 0, "max_ms": 0, "grace_skip": 0,
+               "captures": 0, "would_fire": 0}
+
+
+def _eot_shadow_grace_on() -> bool:
+    """SMART_TURN_SHADOW_GRACE applies: the flag is on and the mode is
+    'shadow' ('on' keeps its 64 ms / 2-in-a-row rule). Never raises."""
+    try:
+        return (bool(globals().get("SMART_TURN_SHADOW_GRACE", True))
+                and _eot_mode() == "shadow")
+    except Exception:
+        return False
+
+
+def _eot_in_boot_grace(now=None) -> bool:
+    """True while the shadow boot grace holds (n20 2026-11-21): before
+    '[boot] ready to listen', within SMART_TURN_SHADOW_GRACE_S of it, or while
+    the boot warmers or the boot Whisper load still run. Never raises."""
+    try:
+        started = float(_main_loop_started_at[0] or 0.0)
+        if started <= 0.0:
+            return True
+        now = time.monotonic() if now is None else now
+        grace = float(globals().get("SMART_TURN_SHADOW_GRACE_S", 120.0))
+        if now - started < grace:
+            return True
+        if _boot_warmers_running[0] or _whisper_bg_loading():
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _eot_slow_rule():
+    """(budget_s, limit) for a slow check: shadow with the grace flag gets
+    SMART_TURN_SHADOW_BUDGET_X x the chunk and SMART_TURN_SHADOW_SLOW_LIMIT
+    in a row; otherwise _EOT_CHECK_BUDGET_S / _EOT_SLOW_LIMIT. Never
+    raises."""
+    try:
+        if _eot_shadow_grace_on():
+            x = max(1.0, float(globals().get("SMART_TURN_SHADOW_BUDGET_X",
+                                             1.5)))
+            n = max(1, int(globals().get("SMART_TURN_SHADOW_SLOW_LIMIT", 5)))
+            return _EOT_CHECK_BUDGET_S * x, n
+    except Exception:
+        pass
+    return _EOT_CHECK_BUDGET_S, _EOT_SLOW_LIMIT
 # The last owner capture's [eot-shadow] line, held until the main loop
 # accepts its turn (_eot_shadow_flush). Main-loop thread only.
 _eot_shadow_pending = [None]
@@ -18582,18 +18637,32 @@ class _EotCapture:
         chunk, which does so only on the _EOT_SLOW_LIMIT-th in a row. Never
         raises."""
         try:
+            # Shadow boot grace (n20): skip the check outright — running it
+            # and ignoring the time would still load the capture thread in
+            # the boot's most contended window.
+            if _eot_shadow_grace_on() and _eot_in_boot_grace():
+                _eot_counts["grace_skip"] += 1
+                return None
+            budget, limit = _eot_slow_rule()
             t0 = _eot_clock()
             clip, _gain = apply_capture_auto_gain(
                 np.concatenate(self.tail), self.peak,
                 clip_peak=self.clip_peak)
             p = self.turn.predict(clip)
             dt = _eot_clock() - t0
-            if dt > _EOT_CHECK_BUDGET_S:
+            try:
+                _eot_counts["checks"] += 1
+                _eot_counts["max_ms"] = max(_eot_counts["max_ms"],
+                                            int(round(dt * 1000)))
+            except Exception:
+                pass
+            if dt > budget:
+                _eot_counts["slow"] += 1
                 _eot_slow_checks[0] += 1
-                if _eot_slow_checks[0] >= _EOT_SLOW_LIMIT:
+                if _eot_slow_checks[0] >= limit:
                     _eot_latch(f"too slow: {_eot_slow_checks[0]} checks in a "
                                f"row over one "
-                               f"{int(round(_EOT_CHECK_BUDGET_S * 1000))} ms "
+                               f"{int(round(budget * 1000))} ms "
                                f"capture chunk, the last "
                                f"{int(round(dt * 1000))} ms")
                 return None
@@ -18613,6 +18682,12 @@ class _EotCapture:
         try:
             if not self.dead:
                 rec = self.dec.record(eot)
+                try:
+                    _eot_counts["captures"] += 1
+                    if rec.fire_ms is not None:
+                        _eot_counts["would_fire"] += 1
+                except Exception:
+                    pass
                 _eot_shadow_pending[0] = rec.shadow_line()
                 for name, value in rec.stats().items():
                     _tt_note_stat(name, value)
