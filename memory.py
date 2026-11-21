@@ -656,6 +656,21 @@ def _phrase_for(pattern: dict) -> str:
     return ""
 
 
+_APP_USAGE_OFFER_TAIL = "anything you'd like me to peek at?"
+
+
+def offer_has_action(line: str) -> bool:
+    """False for a habit offer whose "yes" has nothing to run: the app-usage
+    line ("You typically check Claude around now, sir - anything you'd like
+    me to peek at?") names no action, so agreeing to it does nothing
+    (n20-F6). Every other offer (play / open / search / screen / timer) maps
+    to one. Never raises (True: unknown lines are left alone)."""
+    try:
+        return _APP_USAGE_OFFER_TAIL not in str(line or "").lower()
+    except Exception:
+        return True
+
+
 def maybe_pattern_offer(min_days: float | None = None) -> str:
     """Return a JARVIS-style proactive offer if a strong pattern matches the
     current time-of-week AND we haven't surfaced it yet today. Otherwise ''.

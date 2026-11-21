@@ -18733,6 +18733,7 @@ _TURN_FLAG_KEYS = (
     "LEARN_PREFILTER",
     "BOOT_PARALLEL_LOAD",
     "BOOT_CHANGELOG_BACKGROUND",
+    "BOOT_PATTERN_VIA_QUEUE",
     "FOLLOWUP_WINDOW_FROM_REPLY_END",
     "SPEECH_HYGIENE",
     "PROMPT_DIRECTIVE_V3",
@@ -22848,6 +22849,47 @@ def _changelog_background_on() -> bool:
         return bool(v)
     except Exception:
         return True
+
+
+def _boot_pattern_via_queue_on() -> bool:
+    """BOOT_PATTERN_VIA_QUEUE, read live. Never raises (True: the default)."""
+    try:
+        v = globals().get("BOOT_PATTERN_VIA_QUEUE", True)
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "on", "yes")
+        return bool(v)
+    except Exception:
+        return True
+
+
+def _boot_pattern_say(line: str, *, offer: bool) -> bool:
+    """Say the boot-time pattern remark (``offer`` False) or habit offer
+    (True). BOOT_PATTERN_VIA_QUEUE on (n20-F6): queue it as source
+    "pattern_offer", so it is spoken only once the loop is listening and the
+    holds (focus, room talk, presence, a game, standby) have let it through,
+    and the drain records an offer in conversation_history when it is SPOKEN.
+    An offer with no action behind a "yes" is not made at all. Off: spoken
+    here at once, as before. Returns True when the line was queued or spoken.
+    Never raises."""
+    try:
+        if not _boot_pattern_via_queue_on():
+            _speak(line)
+            if offer:
+                conversation_history.append(
+                    {"role": "assistant", "content": line})
+            return True
+        if offer and not pattern_memory.offer_has_action(line):
+            print(f"  [pattern_memory] not offered (a 'yes' would run "
+                  f"nothing): {line[:80]}")
+            return False
+        ok = bool(proactive_announce(line, source="pattern_offer",
+                                     offer=bool(offer)))
+        print("  [boot] pattern line queued for when listening is ready"
+              if ok else "  [boot] pattern line not queued")
+        return ok
+    except Exception as e:
+        print(f"  [patterns] could not say the boot pattern line: {e}")
+        return False
 
 
 def _changelog_summary_text(last_ver, cur_ver, entry: str) -> str:
@@ -57693,7 +57735,7 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     if _pattern_remark:
         try:
             print(f"  [patterns] surfacing: {_pattern_remark}")
-            _speak(_pattern_remark)
+            _boot_pattern_say(_pattern_remark, offer=False)
         except Exception as e:
             print(f"  [patterns] speak failed: {e}")
 
@@ -57710,10 +57752,7 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
     if _cmd_offer:
         try:
             print(f"  [pattern_memory] surfacing: {_cmd_offer}")
-            _speak(_cmd_offer)
-            conversation_history.append(
-                {"role": "assistant", "content": _cmd_offer}
-            )
+            _boot_pattern_say(_cmd_offer, offer=True)
         except Exception as e:
             print(f"  [pattern_memory] speak failed: {e}")
 
