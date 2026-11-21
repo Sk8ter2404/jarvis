@@ -12210,6 +12210,13 @@ def _camera_boot_presence(idx) -> "bool | None":
     (unnamed entry, Kinect slot, MF unavailable, name not listed). Opens
     nothing. (2026-09-29)
 
+    FALSE when the camera is NAMED, the Media Foundation list is non-empty and
+    the name is on NEITHER device list (2026-11-21, BOOT-4): the probe itself
+    refuses to open such a camera (_probe_camera_index), so probing and
+    retrying it only burned about 1-1.5 s per boot (plus the settle sleep) on
+    an unplugged webcam. Callers treat False as "absent: keep the named entry,
+    do not probe, retry or rescue it"; None stays "cannot tell".
+
     WHY THE BOOT PROBE NO LONGER STREAM-TESTS A LISTED CAMERA. A stream START
     is what tripped the owner's hub resets (16 of 37 starts of one webcam reset
     the hub within 6 s), and boot used to start every healthy camera twice -
@@ -12233,6 +12240,8 @@ def _camera_boot_presence(idx) -> "bool | None":
             return None
         if any(nm in str(n or "").lower() for n in names):
             return True
+        if _named_camera_listing(nm)[0] == "absent":
+            return False
     except Exception:
         pass
     return None
@@ -12500,18 +12509,26 @@ def probe_cameras_and_update_config() -> tuple[list[int], list[int]]:
     # it "working": the boot log printed "kept without a boot stream test"
     # and then "working ✓" for the same camera, a claim no open ever backed.
     _listed_only: set[int] = set()
+    # Named cameras that are on NEITHER device list (BOOT-4): not probed, not
+    # retried, not rescued - the probe would refuse to open them anyway.
+    _absent_named: set[int] = set()
 
     def _probe_many(indices: list[int]) -> dict[int, bool]:
         results: dict[int, bool] = {}
         threads = []
         def _runner(i):
             try:
-                if _camera_boot_presence(i):
+                _pres = _camera_boot_presence(i)
+                if _pres:
                     print(f"  [cam-probe] index {i}: on the device list - kept "
                           f"without a boot stream test (the face tracker's "
                           f"open is the test)")
                     _listed_only.add(i)
                     results[i] = True
+                    return
+                if _pres is False:
+                    _absent_named.add(i)
+                    results[i] = False
                     return
                 results[i] = _probe_camera_index(i)
             except Exception:
@@ -12561,7 +12578,10 @@ def probe_cameras_and_update_config() -> tuple[list[int], list[int]]:
             # working_configured so Step 2 preserves it; _open_capture re-resolves
             # by name at open) rather than dropping a present camera.
             cam = next((c for c in CAMERAS if c.get("index") == idx), None)
-            if cam is not None and _camera_rescued_by_name(cam, idx):
+            if idx in _absent_named:
+                print(f"  [cam-probe] index {idx}: not on the device list - "
+                      f"kept, reopened by name when it is back")
+            elif cam is not None and _camera_rescued_by_name(cam, idx):
                 working_configured.append(idx)
             else:
                 print(f"  [cam-probe] index {idx}: failed to open")
@@ -51939,15 +51959,25 @@ def _preflight_cameras(timeout_sec: float = 2.0) -> None:
     # summary must not report these as "opens cleanly". See the same set in
     # probe_cameras_and_update_config.
     listed_only: set[int] = set()
+    # Named cameras on NEITHER device list (BOOT-4, 2026-11-21): no probe, no
+    # retry settle, no rescue - the probe refuses to open them anyway.
+    absent_named: set[int] = set()
 
     def _check(i: int):
         try:
-            if _camera_boot_presence(i):
+            _pres = _camera_boot_presence(i)
+            if _pres:
                 print(f"  [preflight] camera index {i}: on the device list - "
                       f"kept without a boot stream test (the face tracker's "
                       f"open is the test)")
                 listed_only.add(i)
                 results[i] = True
+                return
+            if _pres is False:
+                print(f"  [preflight] camera index {i}: not on the device "
+                      f"list - kept, reopened by name when it is back")
+                absent_named.add(i)
+                results[i] = False
                 return
             results[i] = _probe_camera_index(i, timeout_sec=timeout_sec)
         except Exception as e:
@@ -51979,6 +52009,7 @@ def _preflight_cameras(timeout_sec: float = 2.0) -> None:
     # and with a longer timeout, before condemning them. 2026-07-08.
     retry_idx = [cam.get("index") for cam in list(CAMERAS)
                  if cam.get("index") is not None
+                 and cam.get("index") not in absent_named
                  and not results.get(cam.get("index"), False)]
     if retry_idx:
         try:
@@ -52017,6 +52048,8 @@ def _preflight_cameras(timeout_sec: float = 2.0) -> None:
             print(f"  [preflight] camera index {idx}: "
                   + ("on the device list, not stream-tested ✓"
                      if idx in listed_only else "opens cleanly ✓"))
+        elif idx in absent_named:
+            pass            # already said so in _check; the named entry stays
         elif _camera_rescued_by_name(
                 cam, idx, timeout_sec=max(timeout_sec * 2.5, 5.0)):
             # Present at a shuffled live index (name-resolved) — keep it, don't

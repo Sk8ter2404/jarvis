@@ -512,68 +512,92 @@ class DirectShowLookupIsGatedTests(_StormBase):
 class BootDoesNotStreamTestAListedCameraTests(_StormBase):
     """Boot keeps a NAMED camera that is on the device list without starting
     its stream: the face tracker's one open is the test (a stream START is
-    what tripped the hub resets)."""
+    what tripped the hub resets). A named camera on NEITHER list (unplugged)
+    is not probed either: the probe would refuse it, so the old probe, the
+    retry settle and the rescue only cost boot time (BOOT-4, 2026-11-21)."""
 
     def _cams(self):
         return [dict(_CAM_A), dict(_CAM_B, name="synthcam gone")]
 
-    def test_preflight_probes_only_the_camera_it_cannot_see(self):
+    def setUp(self):
+        super().setUp()
+        # "synthcam gone" is on neither list; never reach the real DirectShow
+        # enumeration from a test.
+        _p = mock.patch.object(
+            self.bc, "_named_camera_listing",
+            side_effect=lambda n, **k: (("absent", None)
+                                        if "gone" in str(n) else ("msmf", None)))
+        _p.start()
+        self.addCleanup(_p.stop)
+
+    def test_preflight_never_probes_a_named_camera_that_is_not_listed(self):
         bc = self.bc
         probe = mock.Mock(return_value=True)
-        with mock.patch.object(bc, "CAMERA_PROBE_ENABLED", True), \
-             mock.patch.object(bc, "CAMERAS", self._cams()), \
-             mock.patch.object(bc, "_camera_backend", _FakeBackend(self.clock)), \
-             mock.patch.object(bc, "_probe_camera_index", probe), \
-             contextlib.redirect_stdout(io.StringIO()) as out:
+        rescue = mock.Mock(return_value=False)
+        cams = self._cams()
+        with mock.patch.object(bc, "CAMERA_PROBE_ENABLED", True),              mock.patch.object(bc, "CAMERAS", cams),              mock.patch.object(bc, "_camera_backend", _FakeBackend(self.clock)),              mock.patch.object(bc, "_probe_camera_index", probe),              mock.patch.object(bc, "_camera_rescued_by_name", rescue),              mock.patch("time.sleep") as nap,              contextlib.redirect_stdout(io.StringIO()) as out:
             bc._preflight_cameras(timeout_sec=0.1)
-        self.assertEqual([c.args[0] for c in probe.call_args_list], [42],
-                         "the listed camera was stream-tested at boot")
+        self.assertEqual(probe.call_args_list, [],
+                         "a camera on no device list was probed")
+        rescue.assert_not_called()
+        nap.assert_not_called()          # no retry settle either
         self.assertIn("kept without a boot stream test", out.getvalue())
+        self.assertIn("camera index 42: not on the device list - kept",
+                      out.getvalue())
+        self.assertIn("synthcam gone", [c.get("name") for c in cams],
+                      "a named camera was dropped")
 
     def test_the_boot_probe_does_the_same(self):
         bc = self.bc
         probe = mock.Mock(return_value=True)
-        with mock.patch.object(bc, "CAMERA_PROBE_ENABLED", True), \
-             mock.patch.object(bc, "CAMERAS", self._cams()), \
-             mock.patch.object(bc, "_camera_backend", _FakeBackend(self.clock)), \
-             mock.patch.object(bc, "_probe_camera_index", probe), \
-             contextlib.redirect_stdout(io.StringIO()):
+        rescue = mock.Mock(return_value=False)
+        cams = self._cams()
+        with mock.patch.object(bc, "CAMERA_PROBE_ENABLED", True),              mock.patch.object(bc, "CAMERAS", cams),              mock.patch.object(bc, "_camera_backend", _FakeBackend(self.clock)),              mock.patch.object(bc, "_probe_camera_index", probe),              mock.patch.object(bc, "_camera_rescued_by_name", rescue),              contextlib.redirect_stdout(io.StringIO()) as out:
             working, failed = bc.probe_cameras_and_update_config()
-        self.assertEqual([c.args[0] for c in probe.call_args_list], [42])
-        self.assertCountEqual(working, [41, 42])
+        self.assertEqual(probe.call_args_list, [])
+        rescue.assert_not_called()
+        self.assertEqual(working, [41])
+        self.assertIn("index 42: not on the device list - kept", out.getvalue())
+        self.assertIn("synthcam gone", [c.get("name") for c in cams],
+                      "a named camera was dropped")
+
+    def test_presence_is_false_only_when_a_named_camera_is_on_no_list(self):
+        bc = self.bc
+        with mock.patch.object(bc, "CAMERAS", self._cams()),              mock.patch.object(bc, "_camera_backend", _FakeBackend(self.clock)):
+            self.assertIs(bc._camera_boot_presence(41), True)
+            self.assertIs(bc._camera_boot_presence(42), False)
+            # a DirectShow-only camera (virtual cam) is NOT absent: it is probed
+            with mock.patch.object(bc, "_named_camera_listing",
+                                   return_value=("dshow", 3)):
+                self.assertIsNone(bc._camera_boot_presence(42))
+            # cannot tell -> None, never False
+            with mock.patch.object(bc, "_named_camera_listing",
+                                   return_value=(None, None)):
+                self.assertIsNone(bc._camera_boot_presence(42))
 
     # B088 (2026-10-01): the summary lines claimed a stream test that never
     # ran - "kept without a boot stream test" was followed by "opens cleanly"
     # / "working" for the SAME camera.
     def test_preflight_summary_does_not_claim_an_open_it_never_made(self):
         bc = self.bc
-        with mock.patch.object(bc, "CAMERA_PROBE_ENABLED", True), \
-             mock.patch.object(bc, "CAMERAS", self._cams()), \
-             mock.patch.object(bc, "_camera_backend", _FakeBackend(self.clock)), \
-             mock.patch.object(bc, "_probe_camera_index",
-                               mock.Mock(return_value=True)), \
-             contextlib.redirect_stdout(io.StringIO()) as out:
+        with mock.patch.object(bc, "CAMERA_PROBE_ENABLED", True),              mock.patch.object(bc, "CAMERAS", self._cams()),              mock.patch.object(bc, "_camera_backend", _FakeBackend(self.clock)),              mock.patch.object(bc, "_probe_camera_index",
+                               mock.Mock(return_value=True)),              contextlib.redirect_stdout(io.StringIO()) as out:
             bc._preflight_cameras(timeout_sec=0.1)
         text = out.getvalue()
         self.assertNotIn("camera index 41: opens cleanly", text)
         self.assertIn("camera index 41: on the device list, not stream-tested",
                       text)
-        # The camera that WAS probed keeps the old wording.
-        self.assertIn("camera index 42: opens cleanly", text)
+        self.assertNotIn("camera index 42: opens cleanly", text)
 
     def test_cam_probe_summary_does_not_claim_an_open_it_never_made(self):
         bc = self.bc
-        with mock.patch.object(bc, "CAMERA_PROBE_ENABLED", True), \
-             mock.patch.object(bc, "CAMERAS", self._cams()), \
-             mock.patch.object(bc, "_camera_backend", _FakeBackend(self.clock)), \
-             mock.patch.object(bc, "_probe_camera_index",
-                               mock.Mock(return_value=True)), \
-             contextlib.redirect_stdout(io.StringIO()) as out:
+        with mock.patch.object(bc, "CAMERA_PROBE_ENABLED", True),              mock.patch.object(bc, "CAMERAS", self._cams()),              mock.patch.object(bc, "_camera_backend", _FakeBackend(self.clock)),              mock.patch.object(bc, "_probe_camera_index",
+                               mock.Mock(return_value=True)),              contextlib.redirect_stdout(io.StringIO()) as out:
             bc.probe_cameras_and_update_config()
         text = out.getvalue()
         self.assertNotIn("index 41: working", text)
         self.assertIn("index 41: listed (not stream-tested)", text)
-        self.assertIn("index 42: working", text)
+        self.assertNotIn("index 42: working", text)
 
 
 class KinectServiceLineTests(_StormBase):
