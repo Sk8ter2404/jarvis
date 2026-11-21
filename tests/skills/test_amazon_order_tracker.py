@@ -1179,6 +1179,66 @@ class MonitorLifecycleTests(AmazonTestBase):
         self.assertEqual(self.mod._poll_thread[0].name, "amazon-order-tracker")
         self.assertEqual(len(started), 1)
 
+    # BOOT-1 (2026-11-21): AMAZON_TRACKER_DEFER_BACKEND_CHECK keeps the
+    # Google-client import (14-16 s) off the boot thread.
+    def test_deferred_start_does_not_check_backend(self):
+        started = []
+        boom = mock.MagicMock(side_effect=AssertionError("checked on boot"))
+        with mock.patch.object(self.mod, "_read_feature_flag", return_value=True),              mock.patch.object(self.mod, "_defer_backend_check", return_value=True),              mock.patch.object(self.mod, "_any_backend", boom),              mock.patch.object(self.mod, "_gmail_configured", boom),              mock.patch.object(self.mod, "_backend_problem", boom),              mock.patch.object(self.mod.threading.Thread, "start",
+                               lambda self_t: started.append(self_t)):
+            self.assertTrue(self.mod.start_monitor())
+        self.assertEqual(len(started), 1)
+        boom.assert_not_called()
+        self.assertEqual(started[0]._kwargs, {"report_status": True})
+
+    def test_register_with_defer_never_probes_gmail(self):
+        et = types.SimpleNamespace(
+            is_gmail_available=mock.MagicMock(side_effect=AssertionError("probe")),
+            _outlook_configured=mock.MagicMock(side_effect=AssertionError("probe")))
+        with mock.patch.object(self.mod, "_read_feature_flag", return_value=True),              mock.patch.object(self.mod, "_defer_backend_check", return_value=True),              mock.patch.object(self.mod, "_email_triage", return_value=et),              mock.patch.object(self.mod.threading.Thread, "start", lambda self_t: None):
+            self.mod.register({})
+        et.is_gmail_available.assert_not_called()
+        et._outlook_configured.assert_not_called()
+
+    def test_flag_off_checks_backend_on_the_calling_thread(self):
+        started = []
+        with mock.patch.object(self.mod, "_read_feature_flag", return_value=True),              mock.patch.object(self.mod, "_defer_backend_check", return_value=False),              mock.patch.object(self.mod, "_any_backend", return_value=True) as ab,              mock.patch.object(self.mod.threading.Thread, "start",
+                               lambda self_t: started.append(self_t)):
+            self.assertTrue(self.mod.start_monitor())
+        ab.assert_called_once()
+        self.assertEqual(started[0]._kwargs, {"report_status": False})
+
+    def test_poll_loop_reports_status_after_initial_delay(self):
+        evt = mock.MagicMock()
+        evt.wait.side_effect = [False, True]
+        evt.is_set.return_value = False
+        out = io.StringIO()
+        with mock.patch.object(self.mod, "_any_backend", return_value=False),              mock.patch.object(self.mod, "_backend_problem", return_value="no sign-in"),              contextlib.redirect_stdout(out):
+            self.mod._poll_loop(evt, report_status=True)
+        text = out.getvalue()
+        self.assertIn("order tracker idle: no sign-in", text)
+        # The idle line stands in for the "waiting" line (not printed twice).
+        self.assertNotIn("waiting for a Google sign-in", text)
+
+    def test_poll_loop_status_crash_does_not_kill_loop(self):
+        evt = mock.MagicMock()
+        evt.wait.side_effect = [False, True]
+        evt.is_set.return_value = False
+        with mock.patch.object(self.mod, "_print_backend_status",
+                               side_effect=RuntimeError("boom")),              mock.patch.object(self.mod, "_any_backend", return_value=True),              mock.patch.object(self.mod, "_poll_once") as once:
+            self.mod._poll_loop(evt, report_status=True)
+        once.assert_called_once()
+
+    def test_defer_flag_reads_config_default_true(self):
+        from core import config as cfg
+        self.assertIs(cfg.AMAZON_TRACKER_DEFER_BACKEND_CHECK, True)
+        import sys as _sys
+        with mock.patch.dict(_sys.modules, {"bobert_companion": _fake_bc(
+                AMAZON_TRACKER_DEFER_BACKEND_CHECK="off")}):
+            self.assertFalse(self.mod._defer_backend_check())
+        with mock.patch.dict(_sys.modules, {"bobert_companion": _fake_bc()}):
+            self.assertTrue(self.mod._defer_backend_check())
+
     def test_stop_monitor_idempotent_with_no_thread(self):
         self.mod._poll_thread[0] = None
         self.mod.stop_monitor()   # no raise

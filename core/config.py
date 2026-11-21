@@ -4385,6 +4385,14 @@ _ENV_ONLY_KEYS = frozenset({"BAMBU_PRINTER_IP", "BAMBU_ACCESS_CODE", "BAMBU_SERI
 #   (needs gmail_credentials.json, the OAuth client file, at the project root).
 #   Moved here from bobert_companion.py so it can be switched in Settings.
 AMAZON_TRACKING_ENABLED = True
+# AMAZON_TRACKER_DEFER_BACKEND_CHECK (2026-11-21, reliability-11 BOOT-1): the
+#   tracker's "is a mailbox signed in" check imports the Google client
+#   libraries (about 14 s cold; 16 s of the 11-20 boot). True (default) = the
+#   check and its "[amazon] order tracker active/idle" line run on the poll
+#   thread after its 45 s initial delay, so skill loading does not wait for
+#   it. False = checked on the boot thread inside register(), as in v3.0.26.
+#   Changes apply on the next start.
+AMAZON_TRACKER_DEFER_BACKEND_CHECK = True
 
 # ─── Game low-power mode (skills/game_mode.py) ─────────────────────────────
 # JARVIS gets out of the way while a game runs: the local brain is repointed at
