@@ -324,6 +324,13 @@ class UnrunReadBackTests(_HonestyBase):
                          self.spoken)
         self.assertEqual(self.calls["lamp_off"], [])
         self.assertIn("the retry read-back: not speaking the claim", self.log)
+        # The history the next turn's model reads holds the read-back as it
+        # was said: no withheld claim, no unrun token (f27-a item 3).
+        hist = [m.get("content", "") for m in bc.conversation_history
+                if m.get("role") == "assistant"]
+        self.assertFalse(any("turned off the lamp" in h for h in hist), hist)
+        self.assertFalse(any("lamp_off" in h for h in hist), hist)
+        self.assertIn("It is mild out, sir.", hist)
 
     def test_the_confirmed_read_back_drops_an_unrun_claim(self):
         bc = self.bc

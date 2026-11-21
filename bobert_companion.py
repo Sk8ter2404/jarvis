@@ -55871,9 +55871,6 @@ def _turn_check_escalate(user_text, verdict, failed_texts, barge_seq0,
             back = get_followup_response(info)
             if back:
                 print(f"  JARVIS (retry read-back): {back}")
-                texts.append(back)
-                conversation_history.append({"role": "assistant",
-                                             "content": back})
                 if _ACTION_RE.search(back):
                     print("  [turn-check] the read-back named an action - "
                           "not run (one retry round only)")
@@ -55882,6 +55879,15 @@ def _turn_check_escalate(user_text, verdict, failed_texts, barge_seq0,
                 b_spoken = _drop_unrun_claims(
                     b_spoken, ran_actions=_turn_actions_ran(),
                     user_text=user_text, where="the retry read-back")
+                # The history (and the open-offer slot) get the read-back as
+                # it is SAID: its unrun tokens and a withheld claim never
+                # reached sir, so the next turn's model must not read them as
+                # its own words ("I've turned off the lamp" with nothing run).
+                # Nothing honest left = nothing recorded.
+                if b_spoken:
+                    texts.append(b_spoken)
+                    conversation_history.append({"role": "assistant",
+                                                 "content": b_spoken})
                 if b_spoken and not _turn_check_barged(barge_seq0):
                     _speak(b_spoken)
         # The retry replaced the turn's reply: its offer, if it ends on one,
