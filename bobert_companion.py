@@ -3637,8 +3637,9 @@ def _learn_batcher() -> "_learn_batch_mod.LearnBatcher":
 # ── Owner spoke during a background call (v3.0.27, core/bg_delivery.py) ──
 # v3.0.26 only kept a background call from STARTING while the owner talks.
 # One already running when he speaks now drops its spoken / queued line
-# (proactive remark, screen remark, boot changelog summary, a spoken learn
-# job) instead of saying it over or right after his turn. Data writes are
+# (proactive remark, screen remark, a spoken learn job) instead of saying it
+# over or right after his turn; the one-time boot changelog summary is held
+# until he is quiet instead (_changelog_hold_for_owner). Data writes are
 # never skipped. BG_SKIP_IF_OWNER_SPOKE False = the v3.0.26 behaviour.
 def _bg_skip_on() -> bool:
     """BG_SKIP_IF_OWNER_SPOKE, read live. Never raises."""
@@ -22917,6 +22918,36 @@ def _changelog_summary_text(last_ver, cur_ver, entry: str) -> str:
         return ""
 
 
+_CHANGELOG_HOLD_MAX_S = 600.0     # the longest a held summary waits
+_CHANGELOG_HOLD_POLL_S = 2.0
+
+
+def _changelog_hold_for_owner(mark) -> bool:
+    """The background changelog summary's BG_SKIP_IF_OWNER_SPOKE rule (on
+    its daemon thread): when he spoke during the summary call, wait until
+    the conversation is quiet (_conversation_active() False) for at most
+    _CHANGELOG_HOLD_MAX_S, then let it be queued. The release notes are said
+    once (the version is already stamped), so they are held, not dropped.
+    True when it held. Flag off = no hold (v3.0.26). Never raises."""
+    try:
+        if not _bg_skip_on():
+            return False
+        if not _bg_delivery.owner_spoke_since(
+                mark, active=_bg_owner_active_now()):
+            return False
+        print("  [bg-hold] boot_changelog_summary: the owner spoke during "
+              "the call - held until the conversation is quiet")
+        t0 = time.monotonic()
+        while (_conversation_active()
+               and time.monotonic() - t0 < float(_CHANGELOG_HOLD_MAX_S)):
+            time.sleep(float(_CHANGELOG_HOLD_POLL_S))
+        print(f"  [bg-hold] boot_changelog_summary released after "
+              f"{time.monotonic() - t0:.0f} s")
+        return True
+    except Exception:
+        return False
+
+
 def _changelog_announce(last_ver, cur_ver, entry: str,
                         history: list) -> None:
     """Summarise and speak the release notes. With BOOT_CHANGELOG_BACKGROUND
@@ -22932,9 +22963,11 @@ def _changelog_announce(last_ver, cur_ver, entry: str,
                   f"(latest_entry_len={len(entry)})")
             return
         # v3.0.27: the background summary is not queued behind a turn he
-        # began while it was made (BG_SKIP_IF_OWNER_SPOKE).
-        if background and _bg_skip_delivery("boot_changelog_summary", mark):
-            return
+        # began while it was made (BG_SKIP_IF_OWNER_SPOKE). It is HELD until
+        # he is quiet, never dropped: the version is stamped announced right
+        # after this starts, so a dropped summary would never be said.
+        if background:
+            _changelog_hold_for_owner(mark)
         print(f"  [changelog] announcing v{last_ver}→v{cur_ver}: "
               f"{summary}")
         try:

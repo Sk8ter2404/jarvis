@@ -459,11 +459,13 @@ LEARN_BATCH_MAX_JOBS = 20
 
 # BG_SKIP_IF_OWNER_SPOKE (v3.0.27, core/bg_delivery.py) — a background brain
 # call that ends in something said aloud (a proactive remark, a screen remark,
-# the boot release-notes summary, a spoken learning-batch job) cannot be
-# stopped once it is out. If you speak (or type a command) while it is still
-# running, its line is dropped instead of being said over your turn or right
-# after it ("[bg-skip] <caller>: ..." in the log). Learning records are still
-# written. False = the v3.0.26 behaviour (the line is spoken anyway). Read live.
+# a spoken learning-batch job) cannot be stopped once it is out. If you speak
+# (or type a command) while it is still running, its line is dropped instead
+# of being said over your turn or right after it ("[bg-skip] <caller>: ..." in
+# the log). The boot release-notes summary is said only once, so it is held
+# until the conversation is quiet instead ("[bg-hold] ..."), never dropped.
+# Learning records are still written. False = the v3.0.26 behaviour (the line
+# is spoken anyway). Read live.
 BG_SKIP_IF_OWNER_SPOKE = True
 
 # LEARN_PREFILTER (v3 W09) — which of YOUR turns are sent to the background
