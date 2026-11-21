@@ -23257,17 +23257,19 @@ def _whisper_release_vram(dev_index: int = 0) -> None:
     except Exception:
         pass
     try:
+        # Only a torch that is ALREADY loaded with CUDA ALREADY initialised
+        # holds cached blocks; never import torch or start CUDA here. No
+        # free-VRAM read either: torch.cuda.mem_get_info creates a CUDA
+        # context on the card it asks (tests/test_no_cuda_context_probes).
         _torch = sys.modules.get("torch")
         if _torch is None or not _torch.cuda.is_available():
             return
+        _inited = getattr(_torch.cuda, "is_initialized", None)
+        if callable(_inited) and not _inited():
+            return
         _torch.cuda.empty_cache()
-        try:
-            free_b, total_b = _torch.cuda.mem_get_info(dev_index)
-            print(f"  [whisper] released the failed CUDA load: cuda:{dev_index} "
-                  f"{int(free_b) // (1024 * 1024)} MB free / "
-                  f"{int(total_b) // (1024 * 1024)} MB")
-        except Exception:
-            print("  [whisper] released the failed CUDA load (empty_cache)")
+        print(f"  [whisper] released the failed CUDA load on cuda:{dev_index} "
+              f"(empty_cache)")
     except Exception as e:
         print(f"  [whisper] could not release VRAM after the failed load: {e}")
 
