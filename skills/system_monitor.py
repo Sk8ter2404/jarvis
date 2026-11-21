@@ -72,6 +72,10 @@ _ram_boot_saved: list = [None]
 # The pulse's own RAM-line stamp when this monitor latched behind it (0.0 =
 # none), so a re-arm hands the slot back at the right time.
 _ram_pulse_said_at = [0.0]
+# v3.0.27 (reliability-08, core/voice_server_mem.py): time.time() of the one
+# "voice server over VOICE_SERVER_RSS_WARN_MB" warning (0.0 = none). The
+# tray / HUD publisher shows it like a CPU / RAM alert. Report only.
+_last_voice_mem_alert_at = [0.0]
 
 # ─── naming the CPU culprit (2026-10-02) ─────────────────────────────────
 # The key _top_processes / _window_culprit use for JARVIS's own process.
@@ -250,6 +254,7 @@ def _ram_alert_line(ram_pct: float) -> str:
             log_hogs(ram_pct)
     except Exception:
         pass
+    _log_voice_server_mem()
     try:
         if not bool(_cfg_value("RAM_ALERT_NAME_USERS", False)):
             return old
@@ -259,6 +264,54 @@ def _ram_alert_line(ram_pct: float) -> str:
         return f"{head} {users}" if users else old
     except Exception:
         return old
+
+
+def _voice_mem_monitor():
+    """core.voice_server_mem.MONITOR, or None. Never raises."""
+    try:
+        from core import voice_server_mem as _vsm
+        return _vsm.MONITOR
+    except Exception:
+        return None
+
+
+def _voice_mem_warned(_line: str) -> None:
+    """The one over-the-limit warning fired: stamp it for the tray / HUD
+    alert (the 30 s red, as for a CPU / RAM alert). Never raises."""
+    try:
+        with _alert_lock:
+            _last_voice_mem_alert_at[0] = time.time()
+    except Exception:
+        pass
+
+
+def _voice_mem_tick() -> None:
+    """The monitor loop's voice-server reading (at most once a minute;
+    core/voice_server_mem.py). Report only. Never raises."""
+    mon = _voice_mem_monitor()
+    if mon is None:
+        return
+    try:
+        mon.tick(on_warn=_voice_mem_warned)
+    except Exception:
+        pass
+
+
+def _log_voice_server_mem() -> None:
+    """Next to the RAM alert's '[mem-users]' line: a fresh reading of the
+    clone voice server, '[mem-users] voice server pid P rss X GB' (nothing
+    when no server is known). Never raises."""
+    mon = _voice_mem_monitor()
+    if mon is None:
+        return
+    try:
+        if mon.sample(on_warn=_voice_mem_warned) is None:
+            return
+        text = mon.describe()
+        if text:
+            print(f"  [mem-users] {text}")
+    except Exception:
+        pass
 
 
 def _hold_shared_ram_slot(now: float) -> None:
@@ -737,6 +790,10 @@ def _monitor_loop():
                     _enqueue_speech(_ram_alert_line(ram_pct))
                     with _alert_lock:
                         _last_ram_alert_at[0] = now
+
+            # v3.0.27: the clone voice server's RSS, once a minute (report
+            # only: never restarted or stopped).
+            _voice_mem_tick()
 
         except Exception:
             logging.exception("[sysmon] monitor loop iteration failed")

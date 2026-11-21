@@ -6726,7 +6726,20 @@ def _tray_state_publisher():
                                 if hasattr(sm, "_last_cpu_alert_at") else 0)
                     last_ram = (getattr(sm, "_last_ram_alert_at", [0])[0]
                                 if hasattr(sm, "_last_ram_alert_at") else 0)
-                    most_recent = max(last_cpu or 0, last_ram or 0)
+                    # v3.0.27: the one voice-server-memory warning
+                    # (core/voice_server_mem.py, report only) shows too.
+                    # Read on its own: an odd value never hides a CPU / RAM
+                    # alert.
+                    last_vmem = 0
+                    try:
+                        v = getattr(sm, "_last_voice_mem_alert_at", None)
+                        if isinstance(v, list) and v and isinstance(
+                                v[0], (int, float)):
+                            last_vmem = float(v[0])
+                    except Exception:
+                        last_vmem = 0
+                    most_recent = max(last_cpu or 0, last_ram or 0,
+                                      last_vmem or 0)
                     # Show red for 30s after an alert fires, then clear.
                     if most_recent and (time.time() - most_recent) < 30:
                         alert = True

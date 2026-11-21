@@ -27,6 +27,7 @@ import os
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -2255,6 +2256,46 @@ class TrayStatePublisherTests(_MonolithSec2Base):
             finally:
                 stop.clear()
         self.assertTrue(any(w.get("alert_active") is True for w in writes))
+
+    def _run_with_sm(self, sm):
+        stop = self.bc._tray_publisher_stop
+        stop.clear()
+
+        def _wait(_):
+            stop.set()
+            return True
+
+        writes = []
+        with mock.patch.object(self.bc, "_write_hud_state",
+                               side_effect=lambda **k: writes.append(k)), \
+                mock.patch.dict(self.bc.sys.modules,
+                                {"skill_system_monitor": sm}, clear=False), \
+                mock.patch.object(stop, "wait", side_effect=_wait), \
+                mock.patch.object(self.bc, "_hud_cal_last", [time.time()]):
+            with self.bc._hud_state_lock:
+                self.bc._hud_state_cache["alert_active"] = False
+                self.bc._hud_state_cache["bambu_active"] = False
+            try:
+                self.bc._tray_state_publisher()
+            finally:
+                stop.clear()
+        return writes
+
+    def test_v3027_voice_server_memory_warning_shows_red(self):
+        """reliability-08: the one voice-server-over-the-limit warning
+        (report only) lights the tray / HUD alert like a RAM alert."""
+        sm = types.SimpleNamespace(_last_cpu_alert_at=[0],
+                                   _last_ram_alert_at=[0],
+                                   _last_voice_mem_alert_at=[time.time()])
+        writes = self._run_with_sm(sm)
+        self.assertTrue(any(w.get("alert_active") is True for w in writes))
+
+    def test_v3027_no_voice_warning_stays_clear(self):
+        sm = types.SimpleNamespace(_last_cpu_alert_at=[0],
+                                   _last_ram_alert_at=[0],
+                                   _last_voice_mem_alert_at=[0.0])
+        writes = self._run_with_sm(sm)
+        self.assertFalse(any(w.get("alert_active") is True for w in writes))
 
     def test_publisher_detects_bambu_running(self):
         stop = self.bc._tray_publisher_stop
