@@ -73,6 +73,25 @@ class StubFasterWhisper:
         sys.modules["_fw_race_gate"] = self.ctl
         sys.path.insert(0, self.dir)
         importlib.invalidate_caches()
+        # tools/run_tests_ci_sim.py refuses every FRESH faster_whisper import
+        # at builtins.__import__ (the package is not on the CI runner), so
+        # this on-disk stub never loaded there although the real runner,
+        # which has no such shim, would load it. Route ONLY absolute
+        # faster_whisper imports to importlib.__import__, the pure-Python
+        # twin of the builtin: the same _find_and_load, per-module import
+        # locks and _DeadlockError detection, so the race stays the real one
+        # under both runners. Everything else goes to the import in force.
+        outer = builtins.__import__
+
+        def _imp(name, globals=None, locals=None, fromlist=(), level=0):
+            if level == 0 and (name == "faster_whisper"
+                               or name.startswith("faster_whisper.")):
+                return importlib.__import__(name, globals, locals,
+                                            fromlist, level)
+            return outer(name, globals, locals, fromlist, level)
+        imp_patch = mock.patch.object(builtins, "__import__", _imp)
+        imp_patch.start()
+        test.addCleanup(imp_patch.stop)
 
         def _restore():
             for k in [k for k in sys.modules if k == "faster_whisper"
