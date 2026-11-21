@@ -918,6 +918,81 @@ class SystemMonitorRamEscalationTests(unittest.TestCase):
         self.assertEqual(enq.call_count, 3)
 
 
+class SystemMonitorVoiceServerMemTests(unittest.TestCase):
+    """v3.0.27 reliability-08: the clone voice server's RSS is read from
+    JARVIS's side (core/voice_server_mem.py). The monitor loop ticks it, the
+    RAM alert adds a '[mem-users] voice server ...' line, and the one warning
+    stamps _last_voice_mem_alert_at for the tray / HUD red. Report only:
+    nothing is spoken and the server is never touched."""
+
+    def setUp(self):
+        from core import voice_server_mem as vsm
+        self.vsm = vsm
+        self.mod, _ = load_skill_isolated("system_monitor")
+        self.mod._last_voice_mem_alert_at[0] = 0.0
+        self.logs = []
+
+        class _PS:
+            def __init__(s, table):
+                s.table = table
+
+            def Process(s, pid):        # noqa: N802
+                rss = s.table[pid]
+                return types.SimpleNamespace(
+                    memory_info=lambda: types.SimpleNamespace(
+                        rss=int(rss * 1024 * 1024)))
+
+        self.table = {24620: 3072.0}
+        self.mon = vsm.VoiceServerMem(
+            pid_fn=lambda: 24620, warn_mb=lambda: 6000.0,
+            log=self.logs.append, clock=lambda: 0.0,
+            psutil_mod=_PS(self.table))
+
+    def test_ram_alert_adds_the_voice_server_line(self):
+        import contextlib
+        import io
+        out = io.StringIO()
+        with mock.patch.object(self.vsm, "MONITOR", self.mon), \
+             mock.patch.dict(sys.modules, {"skill_system_pulse": None}), \
+             contextlib.redirect_stdout(out):
+            self.mod._ram_alert_line(91.0)
+        self.assertIn("[mem-users] voice server pid 24620 rss 3.0 GB",
+                      out.getvalue())
+
+    def test_no_server_no_line(self):
+        import contextlib
+        import io
+        mon = self.vsm.VoiceServerMem(pid_fn=lambda: None,
+                                      log=self.logs.append)
+        out = io.StringIO()
+        with mock.patch.object(self.vsm, "MONITOR", mon), \
+             contextlib.redirect_stdout(out):
+            self.mod._log_voice_server_mem()
+        self.assertNotIn("voice server", out.getvalue())
+
+    def test_over_the_limit_stamps_the_tray_alert_once_and_speaks_nothing(self):
+        self.table[24620] = 7000.0
+        with mock.patch.object(self.vsm, "MONITOR", self.mon), \
+             mock.patch.object(self.mod, "_enqueue_speech") as enq:
+            self.mod._voice_mem_tick()
+            first = self.mod._last_voice_mem_alert_at[0]
+            self.assertGreater(first, 0.0)
+            self.mod._last_voice_mem_alert_at[0] = 0.0
+            self.mon._last_at = None
+            self.mod._voice_mem_tick()
+        self.assertEqual(self.mod._last_voice_mem_alert_at[0], 0.0)
+        enq.assert_not_called()
+        self.assertEqual(len([l for l in self.logs if "WARNING" in l]), 1)
+
+    def test_a_broken_monitor_never_breaks_the_loop(self):
+        bad = mock.MagicMock()
+        bad.tick.side_effect = RuntimeError("x")
+        bad.sample.side_effect = RuntimeError("x")
+        with mock.patch.object(self.vsm, "MONITOR", bad):
+            self.mod._voice_mem_tick()
+            self.mod._log_voice_server_mem()
+
+
 class SystemMonitorImportGuardTests(unittest.TestCase):
     def test_path_bootstrap_inserts_project_root(self):
         # Re-exec the source with the project root removed from sys.path so the

@@ -457,6 +457,17 @@ LEARN_BATCH_INTERVAL_S = 300.0
 LEARN_BATCH_QUIET_S = 90.0
 LEARN_BATCH_MAX_JOBS = 20
 
+# BG_SKIP_IF_OWNER_SPOKE (v3.0.27, core/bg_delivery.py) — a background brain
+# call that ends in something said aloud (a proactive remark, a screen remark,
+# a spoken learning-batch job) cannot be stopped once it is out. If you speak
+# (or type a command) while it is still running, its line is dropped instead
+# of being said over your turn or right after it ("[bg-skip] <caller>: ..." in
+# the log). The boot release-notes summary is said only once, so it is held
+# until the conversation is quiet instead ("[bg-hold] ..."), never dropped.
+# Learning records are still written. False = the v3.0.26 behaviour (the line
+# is spoken anyway). Read live.
+BG_SKIP_IF_OWNER_SPOKE = True
+
 # LEARN_PREFILTER (v3 W09) — which of YOUR turns are sent to the background
 # memory extractor at all. Most turns ("open Chrome", "thanks", "what time is
 # it", "pause the music") cannot teach it anything, yet each one used to ride
@@ -1947,6 +1958,14 @@ RAM_ALERT_ESCALATE_ONLY = True
 RAM_REALERT_RISE_PTS    = 3.0
 RAM_REARM_BELOW_PCT     = 85.0
 RAM_ALERT_BOOT_QUIET_S  = 600
+
+# VOICE_SERVER_RSS_WARN_MB (v3.0.27, core/voice_server_mem.py) — JARVIS reads
+# the clone voice server's memory (the process it reports in /health) about
+# once a minute and puts it in the RAM alert's "[mem-users]" log line. When it
+# grows past this many megabytes ONE warning line is logged (and the HUD
+# status strip shows it) per server process. Report only: the server is never
+# restarted or stopped for it. 0 = no warning (the reading is still logged).
+VOICE_SERVER_RSS_WARN_MB = 6000
 # v3.0.10 review (replaying data/self_diagnostic.json, 2026-10-29): the live
 # hourly bump dips to 84.7 % right after it peaks, so the latch re-armed after
 # almost every bump; and from 96.6 % at 20:09 the climb to 99.2 % by 20:19
