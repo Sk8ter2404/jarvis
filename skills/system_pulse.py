@@ -989,14 +989,35 @@ def _is_python_image(name) -> bool:
 _PY_OWN_PACKAGES = frozenset({"skills", "core", "tools", "hud", "audio"})
 
 
-def _python_target(argv) -> tuple:
+# MEM-1 (n20, 2026-11-21): a relative script path is resolved against the
+# TARGET process's working directory, not JARVIS's own - live 11-20 a bare
+# 'python peel_v3.py' run from another folder was reported as "my peel v3".
+# A relative path whose cwd could not be read is not JARVIS's own, and a -m
+# module of a generic package name ('tools') counts as own only when its cwd
+# (when readable) is under _PROJECT_DIR. False = v3.0.26.
+MEM_PY_TARGET_CWD = True
+
+
+def _under_project(path: str) -> bool:
+    try:
+        full = os.path.normcase(os.path.abspath(path))
+        root = os.path.normcase(os.path.abspath(_PROJECT_DIR))
+        return full == root or full.startswith(root + os.sep)
+    except Exception:
+        return False
+
+
+def _python_target(argv, cwd=None) -> tuple:
     """What a Python command line runs, as (stem, own): the script's stem
     ('.../clone_tts_server.py' -> 'clone_tts_server') or the last part of a
     -m module ('tools.settings_window' -> 'settings_window'), and whether it
     is one of JARVIS's own (a script under _PROJECT_DIR, or a module of one
     of its packages). ('', False) for -c code, a bare interpreter or
-    anything unreadable. Never raises."""
+    anything unreadable. `cwd`: the target process's working directory
+    (None = not read / unreadable; see MEM_PY_TARGET_CWD). Never raises."""
     try:
+        use_cwd = bool(MEM_PY_TARGET_CWD)
+        cwd = str(cwd) if (use_cwd and cwd) else None
         args = [str(a) for a in (argv or ())]
         i = 1
         while i < len(args):
@@ -1010,6 +1031,8 @@ def _python_target(argv) -> tuple:
                 mod = a[2:]
             if a.startswith("-m"):
                 own = mod.split(".", 1)[0].strip() in _PY_OWN_PACKAGES
+                if own and cwd is not None and not _under_project(cwd):
+                    own = False
                 return mod.rsplit(".", 1)[-1].strip().lower(), own
             if a in _PY_OPTS_WITH_VALUE:
                 i += 2
@@ -1023,9 +1046,13 @@ def _python_target(argv) -> tuple:
                     stem = stem[:-len(ext)]
                     break
             try:
-                full = os.path.normcase(os.path.abspath(a))
-                root = os.path.normcase(os.path.abspath(_PROJECT_DIR))
-                own = full.startswith(root + os.sep)
+                if use_cwd and not os.path.isabs(a):
+                    own = (cwd is not None
+                           and _under_project(os.path.join(cwd, a)))
+                else:
+                    full = os.path.normcase(os.path.abspath(a))
+                    root = os.path.normcase(os.path.abspath(_PROJECT_DIR))
+                    own = full.startswith(root + os.sep)
             except Exception:
                 own = False
             return stem.strip().lower(), own
@@ -1066,7 +1093,7 @@ def _voice_server_stem() -> str:
         return ""
 
 
-def _python_role(argv, voice_server: str = "") -> str:
+def _python_role(argv, voice_server: str = "", cwd=None) -> str:
     """The spoken name of a Python process from its command line: a JARVIS
     role (_PY_ROLE_NAMES, or the configured voice server's script), "my
     <name>" for any other script of JARVIS's own folder or packages (ovh-f,
@@ -1074,7 +1101,7 @@ def _python_role(argv, voice_server: str = "") -> str:
     else that runs a script, "" when nothing can be read from it. Never
     raises."""
     try:
-        stem, own = _python_target(argv)
+        stem, own = _python_target(argv, cwd)
         if not stem:
             return ""
         if voice_server and stem == voice_server:
@@ -1090,10 +1117,13 @@ def _python_role(argv, voice_server: str = "") -> str:
         return ""
 
 
-def _python_cmdlines(rows, limit: int = MEM_PY_CMDLINE_MAX) -> dict:
+def _python_cmdlines(rows, limit: int = MEM_PY_CMDLINE_MAX,
+                     cwds: "dict | None" = None) -> dict:
     """{pid: argv} for the Python processes in a process table (the
     ``limit`` biggest by working set), read with psutil. A process that is
-    gone or denied is simply absent. Never raises."""
+    gone or denied is simply absent. `cwds` (a dict) also gets {pid: cwd}
+    from the same process handle (MEM-1; absent when denied). Never
+    raises."""
     out: dict = {}
     if not _HAS_PSUTIL:
         return out
@@ -1109,17 +1139,26 @@ def _python_cmdlines(rows, limit: int = MEM_PY_CMDLINE_MAX) -> dict:
         py.sort(reverse=True)
         for _wset, pid in py[:max(0, int(limit))]:
             try:
-                argv = psutil.Process(pid).cmdline()
+                proc = psutil.Process(pid)
+                argv = proc.cmdline()
             except Exception:
                 continue
             if argv:
                 out[pid] = list(argv)
+            if cwds is not None and MEM_PY_TARGET_CWD:
+                try:
+                    cwd = proc.cwd()
+                    if cwd:
+                        cwds[pid] = str(cwd)
+                except Exception:
+                    pass
     except Exception:
         return out
     return out
 
 
-def _mem_app_name(name: str, argv=None, voice_server: str = "") -> str:
+def _mem_app_name(name: str, argv=None, voice_server: str = "",
+                  cwd=None) -> str:
     """The spoken app name for a process image, "" for one to leave out. A
     Python process with a readable command line (``argv``) is named by what
     it runs (_python_role), else it is "Python"."""
@@ -1130,7 +1169,7 @@ def _mem_app_name(name: str, argv=None, voice_server: str = "") -> str:
     if key in _MEM_SKIP:
         return ""
     if argv and key in _PY_IMAGES:
-        role = _python_role(argv, voice_server)
+        role = _python_role(argv, voice_server, cwd)
         if role:
             return role
     if key in _MEM_APP_NAMES:
@@ -1162,8 +1201,10 @@ def _memory_users(procs=None, *, own_pid: int | None = None,
     try:
         rows = _read_process_memory() if procs is None else procs
         own = os.getpid() if own_pid is None else int(own_pid)
+        cwds: dict = {}
         if cmdlines is None:
-            cmdlines = _python_cmdlines(rows) if procs is None else {}
+            cmdlines = (_python_cmdlines(rows, cwds=cwds) if procs is None
+                        else {})
         voice_server = _voice_server_stem() if cmdlines else ""
         totals: dict = {}
         for row in rows or ():
@@ -1172,7 +1213,8 @@ def _memory_users(procs=None, *, own_pid: int | None = None,
             except Exception:
                 continue
             label = (_MEM_SELF_NAME if pid == own else
-                     _mem_app_name(name, cmdlines.get(pid), voice_server))
+                     _mem_app_name(name, cmdlines.get(pid), voice_server,
+                                   cwds.get(pid)))
             if not label or wset <= 0:
                 continue
             totals[label] = totals.get(label, 0.0) + wset
@@ -1251,8 +1293,10 @@ def _memory_hogs_line(ram_pct, procs=None, *, own_pid: int | None = None,
     try:
         rows = _read_process_memory() if procs is None else procs
         own = os.getpid() if own_pid is None else int(own_pid)
+        cwds: dict = {}
         if cmdlines is None:
-            cmdlines = _python_cmdlines(rows) if procs is None else {}
+            cmdlines = (_python_cmdlines(rows, cwds=cwds) if procs is None
+                        else {})
         voice_server = _voice_server_stem() if cmdlines else ""
         ranked = []
         for row in rows or ():
@@ -1268,7 +1312,8 @@ def _memory_hogs_line(ram_pct, procs=None, *, own_pid: int | None = None,
         for wset, pid, name in ranked[:max(0, int(top))]:
             argv = cmdlines.get(pid)
             label = (_MEM_SELF_NAME if pid == own else
-                     _mem_app_name(name, argv, voice_server)) or name
+                     _mem_app_name(name, argv, voice_server,
+                                   cwds.get(pid))) or name
             bits.append(f"pid {pid} {wset / (1024 ** 3):.1f} GB {label} "
                         f"({_short_cmd(name, argv)})")
         if not bits:

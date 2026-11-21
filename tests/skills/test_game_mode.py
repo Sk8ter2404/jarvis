@@ -1258,5 +1258,61 @@ class TestFaceDetectionPauseIsActuallyHeld(_Base):
             "global — swapping the attribute may no longer reach it")
 
 
+
+class TestAmbientDecodePause(_Base):
+    """n20 GAME-2 / shadow F4 (2026-11-21): entering game mode sets
+    ambient_listen's decode-only pause and exiting clears it; no ambient
+    stop function is ever called and no stream is closed."""
+
+    def _ambient(self, paused=False):
+        al = types.ModuleType("skill_ambient_listen")
+        al._p = threading.Event()
+        if paused:
+            al._p.set()
+        al.pause_decode = mock.MagicMock(side_effect=lambda _="": al._p.set())
+        al.resume_decode = mock.MagicMock(
+            side_effect=lambda _="": al._p.clear())
+        al.decode_paused = lambda: al._p.is_set()
+        al.ambient_listen_stop = mock.MagicMock()
+        al.ambient_audio_stop = mock.MagicMock()
+        al._safe_close_stream = mock.MagicMock()
+        patch = mock.patch.dict(sys.modules, {"skill_ambient_listen": al})
+        patch.start()
+        self.addCleanup(patch.stop)
+        return al
+
+    def test_engage_sets_and_exit_clears_the_decode_pause(self):
+        mod, _ = self._load()
+        al = self._ambient()
+        notes, applied = [], {}
+        mod._suspend_luxuries(notes, applied)
+        self.assertTrue(al.decode_paused())
+        self.assertIn("ambient_decode", applied)
+        self.assertIn("ambient_decode: stopped", notes)
+        mod._restore_luxuries(notes, applied)
+        self.assertFalse(al.decode_paused())
+        al.resume_decode.assert_called_once()
+        al.ambient_listen_stop.assert_not_called()
+        al.ambient_audio_stop.assert_not_called()
+        al._safe_close_stream.assert_not_called()
+
+    def test_already_paused_records_no_undo(self):
+        mod, _ = self._load()
+        al = self._ambient(paused=True)
+        notes, applied = [], {}
+        mod._suspend_luxuries(notes, applied)
+        self.assertNotIn("ambient_decode", applied)
+        mod._restore_luxuries(notes, applied)
+        self.assertTrue(al.decode_paused())      # left as he had it
+
+    def test_flag_off_is_v3_0_26(self):
+        mod, _ = self._load(settings={"GAME_MODE_AMBIENT_DECODE_PAUSE": False})
+        al = self._ambient()
+        notes, applied = [], {}
+        mod._suspend_luxuries(notes, applied)
+        al.pause_decode.assert_not_called()
+        self.assertNotIn("ambient_decode", applied)
+
+
 if __name__ == "__main__":
     unittest.main()

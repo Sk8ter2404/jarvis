@@ -900,6 +900,18 @@ class _State:
 
 
 _st = _State()
+
+
+def is_engaged() -> bool:
+    """Public read-only accessor: True while game mode is engaged. Other
+    skills read it through sys.modules (the loader registers this module as
+    'skill_game_mode') so asking never imports anything. Never raises."""
+    try:
+        return bool(_st.active)
+    except Exception:
+        return False
+
+
 _lock = threading.RLock()
 _stop = threading.Event()
 _thread = [None]
@@ -1499,6 +1511,23 @@ def _suspend_luxuries(notes: list, applied: dict) -> None:
 
         _lever(label, _call(off), _call(on), notes, applied,
                _module_state_probe(mod, state_attr, kind))
+
+    # n20 GAME-2 / shadow F4 (2026-11-21): ambient STT and voice-ID kept
+    # decoding game audio (~16 Whisper decodes a minute on the CPU at 91-98 %
+    # RAM). A decode-ONLY pause: skills/ambient_listen skips handing batches
+    # to Whisper / Parakeet / voice-ID while it is set. It never stops the
+    # listener or closes a stream (see "DELIBERATELY NOT TOUCHED" below).
+    # GAME_MODE_AMBIENT_DECODE_PAUSE False = v3.0.26.
+    if bool(_cfg("GAME_MODE_AMBIENT_DECODE_PAUSE", True)):
+        al = sys.modules.get("skill_ambient_listen")
+        pause = getattr(al, "pause_decode", None) if al else None
+        resume = getattr(al, "resume_decode", None) if al else None
+        paused = getattr(al, "decode_paused", None) if al else None
+        _lever("ambient_decode",
+               (lambda: pause("")) if callable(pause) else None,
+               (lambda: resume("")) if callable(resume) else None,
+               notes, applied,
+               (lambda: not paused()) if callable(paused) else None)
 
     # DELIBERATELY NOT TOUCHED:
     #  * Whisper large-v3-turbo stays on the 1650 SUPER (cuda:1) — it costs the

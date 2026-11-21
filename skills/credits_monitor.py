@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import sys
 import threading
 import time
 
@@ -292,9 +293,37 @@ def _check_and_maybe_alert():
     quiet moment BEFORE it takes the check lock and opens the billing page:
     the capture is fresh when the read goes out, and the owner's own "check my
     credits" is never told a check is running while this one only waits."""
+    if _game_mode_hold():
+        print("  [credits] held: game mode - retrying in "
+              f"{int(GAME_MODE_RETRY_SECONDS // 60)} min")
+        return "held"
     with _background_work("credits-monitor"):
         _wait_for_local_quiet()
         _check_and_maybe_alert_now()
+    return "ran"
+
+
+# n20-F3 / GAME-1 (2026-11-21): the hourly check ran mid-game, opened an
+# off-screen Chrome window and cold-loaded the ~7 GB game brain for its
+# vision read while RAM sat at 95-98%. While game mode is engaged the cycle
+# is skipped and retried after GAME_MODE_RETRY_SECONDS instead of the hour.
+# CREDITS_GAME_MODE_HOLD False = v3.0.26 (the check runs regardless).
+CREDITS_GAME_MODE_HOLD = True
+GAME_MODE_RETRY_SECONDS = 12 * 60
+
+
+def _game_mode_hold() -> bool:
+    """True when this cycle must wait: the hold is on and the game_mode
+    skill says it is engaged. Read through sys.modules only (never an
+    import, never the monolith). Never raises."""
+    try:
+        if not CREDITS_GAME_MODE_HOLD:
+            return False
+        gm = sys.modules.get("skill_game_mode")
+        fn = getattr(gm, "is_engaged", None)
+        return bool(fn()) if callable(fn) else False
+    except Exception:
+        return False
 
 
 def _low_step(balance: float) -> int:
@@ -363,8 +392,9 @@ def _background_monitor_loop():  # pragma: no cover - daemon while-True monitor 
     time.sleep(INITIAL_DELAY_SECONDS)
     while True:
         try:
-            _check_and_maybe_alert()
-            time.sleep(CHECK_INTERVAL_SECONDS)
+            outcome = _check_and_maybe_alert()
+            time.sleep(GAME_MODE_RETRY_SECONDS if outcome == "held"
+                       else CHECK_INTERVAL_SECONDS)
         except Exception:
             logging.exception("[credits] monitor loop iteration failed")
             try:

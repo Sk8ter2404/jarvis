@@ -1840,6 +1840,37 @@ SMART_TURN_THRESHOLD = 0.7
 SMART_TURN_MIN_SILENCE_S = 0.256
 SMART_TURN_MIN_SPEECH_S = 1.0
 SMART_TURN_MODEL = r"C:\JARVIS-models\smart-turn-v3\smart-turn-v3.2-cpu.onnx"
+#   SMART_TURN_SHADOW_GRACE  (n20 2026-11-21) in 'shadow' ONLY: no Smart Turn
+#                     check at all for SMART_TURN_SHADOW_GRACE_S after
+#                     '[boot] ready to listen' (or while the boot warmers or
+#                     the boot Whisper load still run); after it a check is
+#                     slow only over SMART_TURN_SHADOW_BUDGET_X x one 64 ms
+#                     chunk, and SMART_TURN_SHADOW_SLOW_LIMIT in a row latch
+#                     it off. The 11-20 boot latched shadow off 8 s after
+#                     ready on two 65 ms checks: no shadow data all session.
+#                     'on' keeps 64 ms / 2 in a row. False = v3.0.26.
+SMART_TURN_SHADOW_GRACE = True
+SMART_TURN_SHADOW_GRACE_S = 120.0
+SMART_TURN_SHADOW_BUDGET_X = 1.5
+SMART_TURN_SHADOW_SLOW_LIMIT = 5
+
+# ─── Shadow summary (n20 shadow F5, 2026-11-21) ───────────────────────────
+#   SHADOW_SUMMARY  one numbers-only "[shadow-summary]" line at shutdown and
+#                   every SHADOW_SUMMARY_EVERY_S, with per-feature counts
+#                   (checks / would-act / latched) for each shadow feature
+#                   whose mode is not 'off', plus owner turns accepted, so
+#                   "never ran" differs from "0 events". False = v3.0.26.
+SHADOW_SUMMARY = True
+SHADOW_SUMMARY_EVERY_S = 1800.0
+
+# ─── Game mode: ambient decode pause (n20 GAME-2 / shadow F4, 2026-11-21) ──
+#   GAME_MODE_AMBIENT_DECODE_PAUSE  while game mode is engaged, skills/
+#                   ambient_listen hands no batch to Whisper / Parakeet /
+#                   voice-ID (the listener and its streams keep running; the
+#                   main loop's wake-word path is untouched), and the music
+#                   gate's ambient decision is 'skip' over music in 'shadow'
+#                   too. False = v3.0.26.
+GAME_MODE_AMBIENT_DECODE_PAUSE = True
 
 # ─── Turn checker (core/turn_checker.py, 2026-10-02) ──────────────────────
 # After every LLM turn (spoken or typed) the checker asks whether the reply

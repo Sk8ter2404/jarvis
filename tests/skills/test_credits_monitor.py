@@ -659,3 +659,66 @@ class CreditsUnchangedLowBalanceTests(unittest.TestCase):
         self.mod._load_alert_cooldowns()
         self.assertEqual(self.mod._last_alert_balance[0], 4.5)
         self._check(4.5).assert_not_called()
+
+
+class CreditsGameModeHoldTests(unittest.TestCase):
+    """n20-F3 / GAME-1 (2026-11-21): no billing-page capture, no vision read
+    and no alert while game mode is engaged; the loop retries in ~12 min."""
+
+    def setUp(self):
+        import sys
+        self.mod, self.actions = load_skill_isolated("credits_monitor")
+        self.gm = types.ModuleType("skill_game_mode")
+        self.engaged = [True]
+        self.gm.is_engaged = lambda: self.engaged[0]
+        patcher = mock.patch.dict(sys.modules, {"skill_game_mode": self.gm})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _cycle(self):
+        bc = _fake_companion()
+        with mock.patch.object(self.mod, "_import_companion", return_value=bc), \
+             mock.patch.object(self.mod, "_save_state"), \
+             mock.patch.object(self.mod, "_enqueue_speech") as enq, \
+             mock.patch.object(self.mod, "_read_credits_via_vision",
+                               wraps=self.mod._read_credits_via_vision) as rd:
+            out = self.mod._check_and_maybe_alert()
+        return out, bc, enq, rd
+
+    def test_engaged_holds_the_whole_cycle(self):
+        out, bc, enq, rd = self._cycle()
+        self.assertEqual(out, "held")
+        rd.assert_not_called()
+        bc._open_url_offscreen_capture.assert_not_called()
+        bc.ask_vision.assert_not_called()
+        enq.assert_not_called()
+
+    def test_not_engaged_runs_as_before(self):
+        self.engaged[0] = False
+        out, bc, _enq, rd = self._cycle()
+        self.assertEqual(out, "ran")
+        rd.assert_called_once()
+        bc._open_url_offscreen_capture.assert_called_once()
+
+    def test_flag_off_is_v3_0_26(self):
+        with mock.patch.object(self.mod, "CREDITS_GAME_MODE_HOLD", False):
+            out, bc, _enq, rd = self._cycle()
+        self.assertEqual(out, "ran")
+        rd.assert_called_once()
+
+    def test_no_game_mode_module_runs(self):
+        import sys
+        with mock.patch.dict(sys.modules):
+            sys.modules.pop("skill_game_mode", None)
+            self.assertFalse(self.mod._game_mode_hold())
+
+    def test_retry_is_ten_to_fifteen_minutes(self):
+        self.assertTrue(600 <= self.mod.GAME_MODE_RETRY_SECONDS <= 900)
+
+
+class GameModeIsEngagedAccessorTests(unittest.TestCase):
+    def test_accessor_reads_state(self):
+        mod, _actions = load_skill_isolated("game_mode")
+        self.assertFalse(mod.is_engaged())
+        with mock.patch.object(mod._st, "active", True):
+            self.assertTrue(mod.is_engaged())

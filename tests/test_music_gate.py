@@ -212,5 +212,23 @@ class CounterTests(unittest.TestCase):
         self.assertNotIn("nonsense", self.c.snapshot())
 
 
+
+class AmbientGameModeTests(unittest.TestCase):
+    """n20 shadow F4 (2026-11-21): game audio is never transcribed while game
+    mode is engaged, in 'shadow' too; callers without the keyword unchanged."""
+
+    def test_game_mode_keyword(self):
+        self.assertEqual(mg.ambient_decision("shadow", True, game_mode=True),
+                         "skip")
+        self.assertEqual(mg.ambient_decision("on", True, game_mode=True),
+                         "skip")
+        self.assertEqual(mg.ambient_decision("shadow", False, game_mode=True),
+                         "")
+        self.assertEqual(mg.ambient_decision("off", True, game_mode=True), "")
+        self.assertEqual(mg.ambient_decision("shadow", True), "shadow")
+        self.assertEqual(mg.ambient_decision("shadow", True, game_mode=False),
+                         "shadow")
+
+
 if __name__ == "__main__":
     unittest.main()

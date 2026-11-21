@@ -3662,5 +3662,46 @@ class SttYieldTests(_TmpDirMixin, unittest.TestCase):
                                   ("line 11",), ()))
 
 
+
+class AmbientDecodePauseTests(unittest.TestCase):
+    """n20 GAME-2 (2026-11-21): the decode-only pause game mode sets. It is
+    a flag, never a stream close or a listener stop."""
+
+    def setUp(self):
+        self.mod, self.actions = load_skill_isolated("ambient_listen")
+        self.addCleanup(self.mod._decode_paused.clear)
+
+    def test_pause_and_resume_toggle_the_flag_and_count(self):
+        mod = self.mod
+        self.assertFalse(mod.decode_paused())
+        self.assertFalse(mod._decode_pause_holds())
+        mod.pause_decode("")
+        self.assertTrue(mod.decode_paused())
+        self.assertTrue(mod._decode_pause_holds())
+        self.assertTrue(mod._decode_pause_holds())
+        self.assertEqual(mod._decode_pause_skipped[0], 2)
+        with mock.patch("builtins.print"):
+            mod.resume_decode("")
+        self.assertFalse(mod.decode_paused())
+        self.assertEqual(mod._decode_pause_skipped[0], 0)
+
+    def test_pause_never_stops_the_listener(self):
+        mod = self.mod
+        with mock.patch.object(mod, "ambient_listen_stop", create=True) as s1,                 mock.patch.object(mod, "ambient_audio_stop", create=True) as s2,                 mock.patch.object(mod, "_safe_close_stream") as close:
+            mod.pause_decode("")
+            with mock.patch("builtins.print"):
+                mod.resume_decode("")
+        s1.assert_not_called()
+        s2.assert_not_called()
+        close.assert_not_called()
+
+    def test_every_decode_site_checks_the_pause(self):
+        import inspect
+        src = inspect.getsource(self.mod)
+        # The mic worker's _keep_batch / _keep_main and the loopback
+        # worker's _keep_batch each return before any decode.
+        self.assertEqual(src.count("if _decode_pause_holds():"), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

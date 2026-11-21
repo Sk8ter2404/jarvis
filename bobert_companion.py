@@ -3158,9 +3158,11 @@ def _learn_prefilter_allows(turn: tuple) -> bool:
             else {}
         ok, why = _learn_prefilter_mod.decide(
             turn[0], turn[1], origin.get("ran") or ())
+        _shadow_count("learn-prefilter", "judged")
         if ok:
             return True
         if mode == "shadow":
+            _shadow_count("learn-prefilter", "would")
             print(f"  [learn-prefilter] would skip ({why})")
             return True
         print(f"  [learn-prefilter] skipped ({why})")
@@ -4021,10 +4023,12 @@ def _ambient_owner_fragment_skip(snippet: str) -> bool:
         mode = _learn_prefilter_mode()
         if mode == "off":
             return False
+        _shadow_count("learn-prefilter", "judged")
         if (len(snippet) >= _AMBIENT_LEARN_MIN_CHARS
                 and len(snippet.split()) >= _AMBIENT_LEARN_MIN_WORDS):
             return False
         if mode == "shadow":
+            _shadow_count("learn-prefilter", "would")
             print("  [learn-prefilter] would skip (ambient fragment)")
             return False
         print("  [ambient-learn] skipped: low-information fragment "
@@ -18386,6 +18390,7 @@ def _tail_probe_start(audio) -> None:
 # "[warm] <name> ok|failed" line; nothing here can block or break boot.
 _boot_warmers: list = []           # [(name, fn)], registration order
 _boot_warmers_started = [False]
+_boot_warmers_running = [False]    # the daemon is still inside its jobs
 
 
 def _register_boot_warmer(name: str, fn) -> None:
@@ -18404,18 +18409,22 @@ def _register_boot_warmer(name: str, fn) -> None:
 
 def _run_boot_warmers_body(jobs) -> None:
     """The daemon's body: each warmer in order, one line each."""
-    for name, fn in jobs:
-        try:
-            t0 = time.perf_counter()
+    _boot_warmers_running[0] = True
+    try:
+        for name, fn in jobs:
             try:
-                fn()
-            except Exception as e:
-                print(f"  [warm] {name} failed ({type(e).__name__}: {e})")
-                continue
-            print(f"  [warm] {name} ok "
-                  f"({int((time.perf_counter() - t0) * 1000)} ms)")
-        except Exception:
-            pass
+                t0 = time.perf_counter()
+                try:
+                    fn()
+                except Exception as e:
+                    print(f"  [warm] {name} failed ({type(e).__name__}: {e})")
+                    continue
+                print(f"  [warm] {name} ok "
+                      f"({int((time.perf_counter() - t0) * 1000)} ms)")
+            except Exception:
+                pass
+    finally:
+        _boot_warmers_running[0] = False
 
 
 def _run_boot_warmers():
@@ -18531,6 +18540,56 @@ _EOT_CHECK_BUDGET_S = _endpointing.CHUNK_S             # 64 ms
 _EOT_SLOW_LIMIT = 2
 _eot_slow_checks = [0]                                 # slow checks in a row
 _eot_clock = time.perf_counter                         # times each check
+# Session counters for the [shadow-summary] line (numbers only): checks run,
+# slow ones, the slowest (ms), checks skipped in the shadow boot grace,
+# captures finished with a decider, and those Smart Turn would have ended.
+_eot_counts = {"checks": 0, "slow": 0, "max_ms": 0, "grace_skip": 0,
+               "captures": 0, "would_fire": 0}
+
+
+def _eot_shadow_grace_on() -> bool:
+    """SMART_TURN_SHADOW_GRACE applies: the flag is on and the mode is
+    'shadow' ('on' keeps its 64 ms / 2-in-a-row rule). Never raises."""
+    try:
+        return (bool(globals().get("SMART_TURN_SHADOW_GRACE", True))
+                and _eot_mode() == "shadow")
+    except Exception:
+        return False
+
+
+def _eot_in_boot_grace(now=None) -> bool:
+    """True while the shadow boot grace holds (n20 2026-11-21): before
+    '[boot] ready to listen', within SMART_TURN_SHADOW_GRACE_S of it, or while
+    the boot warmers or the boot Whisper load still run. Never raises."""
+    try:
+        started = float(_main_loop_started_at[0] or 0.0)
+        if started <= 0.0:
+            return True
+        now = time.monotonic() if now is None else now
+        grace = float(globals().get("SMART_TURN_SHADOW_GRACE_S", 120.0))
+        if now - started < grace:
+            return True
+        if _boot_warmers_running[0] or _whisper_bg_loading():
+            return True
+        return False
+    except Exception:
+        return False
+
+
+def _eot_slow_rule():
+    """(budget_s, limit) for a slow check: shadow with the grace flag gets
+    SMART_TURN_SHADOW_BUDGET_X x the chunk and SMART_TURN_SHADOW_SLOW_LIMIT
+    in a row; otherwise _EOT_CHECK_BUDGET_S / _EOT_SLOW_LIMIT. Never
+    raises."""
+    try:
+        if _eot_shadow_grace_on():
+            x = max(1.0, float(globals().get("SMART_TURN_SHADOW_BUDGET_X",
+                                             1.5)))
+            n = max(1, int(globals().get("SMART_TURN_SHADOW_SLOW_LIMIT", 5)))
+            return _EOT_CHECK_BUDGET_S * x, n
+    except Exception:
+        pass
+    return _EOT_CHECK_BUDGET_S, _EOT_SLOW_LIMIT
 # The last owner capture's [eot-shadow] line, held until the main loop
 # accepts its turn (_eot_shadow_flush). Main-loop thread only.
 _eot_shadow_pending = [None]
@@ -18682,18 +18741,32 @@ class _EotCapture:
         chunk, which does so only on the _EOT_SLOW_LIMIT-th in a row. Never
         raises."""
         try:
+            # Shadow boot grace (n20): skip the check outright — running it
+            # and ignoring the time would still load the capture thread in
+            # the boot's most contended window.
+            if _eot_shadow_grace_on() and _eot_in_boot_grace():
+                _eot_counts["grace_skip"] += 1
+                return None
+            budget, limit = _eot_slow_rule()
             t0 = _eot_clock()
             clip, _gain = apply_capture_auto_gain(
                 np.concatenate(self.tail), self.peak,
                 clip_peak=self.clip_peak)
             p = self.turn.predict(clip)
             dt = _eot_clock() - t0
-            if dt > _EOT_CHECK_BUDGET_S:
+            try:
+                _eot_counts["checks"] += 1
+                _eot_counts["max_ms"] = max(_eot_counts["max_ms"],
+                                            int(round(dt * 1000)))
+            except Exception:
+                pass
+            if dt > budget:
+                _eot_counts["slow"] += 1
                 _eot_slow_checks[0] += 1
-                if _eot_slow_checks[0] >= _EOT_SLOW_LIMIT:
+                if _eot_slow_checks[0] >= limit:
                     _eot_latch(f"too slow: {_eot_slow_checks[0]} checks in a "
                                f"row over one "
-                               f"{int(round(_EOT_CHECK_BUDGET_S * 1000))} ms "
+                               f"{int(round(budget * 1000))} ms "
                                f"capture chunk, the last "
                                f"{int(round(dt * 1000))} ms")
                 return None
@@ -18713,6 +18786,12 @@ class _EotCapture:
         try:
             if not self.dead:
                 rec = self.dec.record(eot)
+                try:
+                    _eot_counts["captures"] += 1
+                    if rec.fire_ms is not None:
+                        _eot_counts["would_fire"] += 1
+                except Exception:
+                    pass
                 _eot_shadow_pending[0] = rec.shadow_line()
                 for name, value in rec.stats().items():
                     _tt_note_stat(name, value)
@@ -18765,12 +18844,143 @@ def _eot_shadow_flush() -> None:
     """Log the accepted owner turn's [eot-shadow] line, once — main() calls
     this right after the turn's "You:" mark. Numbers only. Never raises."""
     try:
+        _shadow_count("turns", "accepted")
         line = _eot_shadow_pending[0]
         _eot_shadow_pending[0] = None
         if line:
             print(f"  {line}")
     except Exception:
         pass
+
+
+# ── Shadow summary (n20 shadow F5, 2026-11-21; SHADOW_SUMMARY) ─────────────
+# The shadow features log only when they WOULD act, so "never consulted" and
+# "consulted, no disagreement" read the same. One "[shadow-summary]" line at
+# shutdown and every SHADOW_SUMMARY_EVERY_S, numbers and labels only, for the
+# features whose mode is not 'off' (instant only in 'shadow'), plus the owner
+# turns accepted so 0 turns reads as 0 turns. Counters are for the session.
+_shadow_tally: dict = {}            # feature -> {counter: n}
+_shadow_tally_lock = threading.Lock()
+
+
+def _shadow_count(feature: str, key: str, n: int = 1) -> None:
+    """Add `n` to one shadow-summary counter. Never raises."""
+    try:
+        with _shadow_tally_lock:
+            d = _shadow_tally.setdefault(str(feature), {})
+            d[str(key)] = d.get(str(key), 0) + int(n)
+    except Exception:
+        pass
+
+
+def _shadow_get(feature: str, key: str) -> int:
+    try:
+        with _shadow_tally_lock:
+            return int(_shadow_tally.get(feature, {}).get(key, 0))
+    except Exception:
+        return 0
+
+
+def _shadow_mode_of(fn_name: str) -> str:
+    """A feature's normalised mode via its own helper, 'off' on any
+    fault. Never raises."""
+    try:
+        fn = globals().get(fn_name)
+        return str(fn()).strip().lower() if callable(fn) else "off"
+    except Exception:
+        return "off"
+
+
+def _shadow_summary_line(label: str = "session") -> "str | None":
+    """The '[shadow-summary] <label>: ...' line, or None when the flag is
+    off. Numbers and fixed labels only — never anything said. Never
+    raises."""
+    try:
+        if not bool(globals().get("SHADOW_SUMMARY", True)):
+            return None
+        parts = [f"turns {_shadow_get('turns', 'accepted')}"]
+        if _eot_mode() != "off":
+            c = dict(_eot_counts)
+            parts.append(
+                f"smart-turn checks {int(c.get('checks', 0))} "
+                f"slow {int(c.get('slow', 0))} "
+                f"grace-skip {int(c.get('grace_skip', 0))} "
+                f"captures {int(c.get('captures', 0))} "
+                f"would-fire {int(c.get('would_fire', 0))} "
+                f"latched {1 if _eot_state.get('off') else 0}")
+        if _shadow_mode_of("_action_fit_mode") != "off":
+            parts.append(f"action-fit checked {_shadow_get('action-fit', 'checked')} "
+                         f"would-block {_shadow_get('action-fit', 'would')}")
+        if _shadow_mode_of("_loop_guard_mode") != "off":
+            parts.append(f"loop-guard chains {_shadow_get('loop-guard', 'chains')} "
+                         f"would-stop {_shadow_get('loop-guard', 'would')}")
+        if _shadow_mode_of("_head_hold_mode") != "off":
+            parts.append(f"head-hold plans {_shadow_get('head-hold', 'plans')} "
+                         f"held {_shadow_get('head-hold', 'would')}")
+        if _shadow_mode_of("_learn_prefilter_mode") != "off":
+            parts.append(f"learn-prefilter judged "
+                         f"{_shadow_get('learn-prefilter', 'judged')} "
+                         f"would-skip {_shadow_get('learn-prefilter', 'would')}")
+        # Read without importing it: not imported = no Kokoro render yet.
+        rc = sys.modules.get("core.tts_render_cache")
+        try:
+            if rc is not None:
+                if str(rc.mode()) != "off":
+                    st = rc.CACHE.stats()
+                    hits, misses = int(st.get("hits", 0)), int(st.get("misses", 0))
+                    parts.append(f"kokoro-cache lookups {hits + misses} "
+                                 f"would-hit {hits}")
+            elif str(globals().get("KOKORO_RENDER_CACHE", "off")).strip() \
+                    .lower() in ("shadow", "on"):
+                parts.append("kokoro-cache lookups 0 would-hit 0")
+        except Exception:
+            pass
+        if _shadow_mode_of("_instant_actions_mode") == "shadow":
+            parts.append(f"instant matched {_shadow_get('instant', 'matched')} "
+                         f"would-run {_shadow_get('instant', 'would')}")
+        return f"[shadow-summary] {label}: " + "; ".join(parts)
+    except Exception:
+        return None
+
+
+def _shadow_summary_emit(label: str = "session") -> None:
+    """Print the summary line (if any). Never raises."""
+    try:
+        line = _shadow_summary_line(label)
+        if line:
+            print(f"  {line}")
+    except Exception:
+        pass
+
+
+_shadow_summary_stop = threading.Event()
+_shadow_summary_started = [False]
+
+
+def _shadow_summary_loop(every_s: float, stop) -> None:
+    while not stop.wait(every_s):
+        _shadow_summary_emit("30 min" if abs(every_s - 1800.0) < 1 else
+                             f"{int(every_s)} s")
+
+
+def _shadow_summary_start():
+    """Start the periodic summary daemon once (at ready to listen). Returns
+    the thread or None. Never raises."""
+    try:
+        if _shadow_summary_started[0] or not bool(
+                globals().get("SHADOW_SUMMARY", True)):
+            return None
+        every = float(globals().get("SHADOW_SUMMARY_EVERY_S", 1800.0))
+        if every <= 0:
+            return None
+        _shadow_summary_started[0] = True
+        th = threading.Thread(target=_shadow_summary_loop,
+                              args=(every, _shadow_summary_stop),
+                              daemon=True, name="shadow-summary")
+        th.start()
+        return th
+    except Exception:
+        return None
 
 
 # The settings later speed-plan releases A/B on the turn lines, printed once
@@ -41446,7 +41656,11 @@ def _music_gate_ambient(audio, sample_rate) -> "dict | None":
             return None
         music = _music_now()
         _music_tick()
-        v = _music_gate.ambient_decision(mode, music)
+        # n20 shadow F4: game audio is never transcribed while game mode is
+        # engaged, in 'shadow' too (GAME_MODE_AMBIENT_DECODE_PAUSE).
+        game = (bool(globals().get("GAME_MODE_AMBIENT_DECODE_PAUSE", True))
+                and _game_mode_active())
+        v = _music_gate.ambient_decision(mode, music, game_mode=game)
         if v == "skip":
             _music_note("skip_ambient")
             return {"verdict": "skip"}
@@ -46249,6 +46463,7 @@ def _head_hold_apply(cleaned: str, results, hold_at, ran_before,
             for (_n, r, _i) in results)
         if not hold_at and not deferred:
             return cleaned
+        _shadow_count("head-hold", "plans")
         held = "" if deferred else str(hold_at[0][1] or "").strip().lower()
         held_failed = True
         if held:
@@ -46268,6 +46483,7 @@ def _head_hold_apply(cleaned: str, results, hold_at, ran_before,
             failed_names=_failed_or_refused_actions(results))
         if not dropped:
             return cleaned
+        _shadow_count("head-hold", "would")
         # The log names the sentence by its place, never its words (the
         # reply itself is in the session log), as result-hold does.
         where = (f"[ACTION: {held}]" if held
@@ -47512,6 +47728,7 @@ def _action_fit_refusal(name: str, arg: str, reply_names=()) -> "str | None":
         user_text = _turn_user_text()
         if not user_text:
             return None
+        _shadow_count("action-fit", "checked")
         robot_on = _action_fit_flag("ACTION_FIT_ROBOT_SPEAK_ENFORCE")
         ack_on = _action_fit_flag("ACTION_FIT_ACK_REPEAT_ENFORCE")
         camera_on = _action_fit_flag("ACTION_FIT_CAMERA_ASK_ENFORCE")
@@ -47552,6 +47769,7 @@ def _action_fit_refusal(name: str, arg: str, reply_names=()) -> "str | None":
                     or (ack_on and rule == _action_fit.RULE_ACK_REPEAT)
                     or (camera_on and rule == _action_fit.RULE_CAMERA_ASK))
         if mode != "on" and not enforced:
+            _shadow_count("action-fit", "would")
             print(f"  [action-fit] would block {shown}: {reason}")
             return None
         print(f"  [action-fit] blocked {shown}: {reason}")
@@ -54792,9 +55010,11 @@ def _instant_action_for(text: str):
         return None
     if hit is None:
         return None
+    _shadow_count("instant", "matched")
     if mode == "on":
         print(f"  [instant] {hit.action} without the brain")
     else:
+        _shadow_count("instant", "would")
         print(f"  [instant] would run {hit.action} without the brain")
     return hit
 
@@ -57128,6 +57348,8 @@ def _run_llm_dispatch_body(text: str) -> str:
     # calls (core.loop_guard); one verdict is logged per turn in shadow.
     _lg_mode = _loop_guard_mode()
     _lg_guard = _loop_guard.LoopGuard() if _lg_mode != "off" else None
+    if _lg_guard is not None:
+        _shadow_count("loop-guard", "chains")
     _lg_seen = 0
     _lg_warned = False
     # The terminal line the chain stopped on, if any (v3.0.26): it is the
@@ -57247,6 +57469,7 @@ def _run_llm_dispatch_body(text: str) -> str:
                 break
             if _lg_reason and not _lg_warned:
                 _lg_warned = True
+                _shadow_count("loop-guard", "would")
                 print(f"  [loop-guard] would stop ({_lg_reason})")
         _chain_seen |= {n for n, _ in informative}
         print(f"  Reading results (depth {depth+1})…")
@@ -58307,6 +58530,7 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
                   f"after the process started")
         except Exception:
             pass
+        _shadow_summary_start()
         _start_boot_reprime()
         # Arm the presence hold on queued proactive speech (starts the
         # physical-input watcher; see _presence_watch_start).
@@ -58766,6 +58990,9 @@ def main():  # pragma: no cover - boot entrypoint + infinite main event loop (si
         _t = threading.Timer(25.0, _hard_exit, kwargs={"clean": True})
         _t.daemon = True
         _t.start()
+        # n20 shadow F5: the session's shadow counters, numbers only.
+        _shadow_summary_stop.set()
+        _shadow_summary_emit("session")
         # Release the web dashboard's socket gracefully — a kernel-stuck
         # terminating process keeps its handles, and the NEXT boot's
         # autostart refuses to co-bind a corpse-held port (2026-07-12).
