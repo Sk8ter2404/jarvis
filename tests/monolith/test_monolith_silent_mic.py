@@ -169,6 +169,28 @@ class RearmAndThrottleTests(_SilentBase):
         self.assertEqual(len(self.said), 1)
 
 
+class WordingTests(_SilentBase):
+
+    def test_the_warning_says_listening_not_awake(self):
+        """livechecks F3 (11-21): the warning fired between two 'Sleeping'
+        lines and said 'awake'. The detector stays active in sleep - the
+        wake word needs the mic - so the text says 'listening' and nothing
+        gates on sleep."""
+        out = []
+        self.bc._standby_mode[0] = True            # asleep: still reported
+        with mock.patch("builtins.print",
+                        side_effect=lambda *a, **k: out.append(
+                            " ".join(str(x) for x in a))):
+            self.assertTrue(self.bc._report_silent_mic(45.0, self.now))
+        text = "\n".join(out)
+        self.assertIn("while JARVIS is listening on", text)
+        self.assertNotIn("awake", text)
+        self.assertEqual(len(self.said), 1,
+                         "the spoken line was gated or dropped")
+        self.assertNotIn("awake", self.said[0][0] if isinstance(
+            self.said[0], (tuple, list)) else str(self.said[0]))
+
+
 class SilenceClockTests(_SilentBase):
 
     def _spy(self):

@@ -1538,6 +1538,18 @@ BOOT_AUDIO_PROC_PREWARM    = True
 # importing it; the actions import it when they run, as they always did.
 # False = the full import at register, as in v3.0.26. Next start.
 BROWSER_AGENT_LAZY_IMPORT  = True
+# BOOT_PATTERN_VIA_QUEUE (2026-11-21, n20-F6): at boot the day/hour pattern remark
+# and the habit offer ("You typically check Claude around now...") used to be
+# spoken straight to the speaker, before listening was ready and with no regard
+# for room talk, presence or a game (live 11-17 19:51:29, into a room of
+# talk, then the question could not be answered because JARVIS boots asleep).
+# True (default) = both go through the proactive speech queue (source
+# "pattern_offer": spoken at the next idle pass, focus mode / the presence and
+# room-talk holds / standby apply, a stale one is dropped quietly), and an
+# offer with no action behind a "yes" (the app-usage "anything you'd like me to
+# peek at?") is not made. False = spoken on the boot thread, as before.
+# Changes apply on the next start.
+BOOT_PATTERN_VIA_QUEUE     = True
 
 # ─── Where the listening models run (core/listen_devices.py, 2026-10-04) ──
 # PARAKEET_DEVICE / SMART_TURN_DEVICE / VOICE_ID_DEVICE: 'cpu' | 'listen' |
